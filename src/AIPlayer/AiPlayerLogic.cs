@@ -1,0 +1,527 @@
+// <copyright file="AiPlayerLogic.cs" company="MUnique">
+// Licensed under the MIT License. See LICENSE file in the project root for full license information.
+// </copyright>
+
+namespace MUnique.OpenMU.AIPlayer;
+
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using MUnique.OpenMU.GameLogic;
+using MUnique.OpenMU.GameLogic.NPC;
+using MUnique.OpenMU.Pathfinding;
+using MUnique.OpenMU.AIPlayer.Scripting;
+
+/// <summary>
+/// Drives an <see cref="AiPlayer"/> with periodic behavior ticks.
+/// Acts as module coordinator:
+///   1. Refreshes <see cref="BehaviorContext.WorldState"/> each tick
+///   2. Delegates to ScriptExecutor (1D) or Heartbeat (Decision mode)
+///   3. Handles non-module periodic tasks (stat allocation)
+/// </summary>
+public sealed class AiPlayerLogic : IDisposable
+{
+    private readonly AiPlayer _player;
+    private readonly IGameAdapter _adapter;
+    private readonly CancellationTokenSource _cts;
+    private readonly Task _loopTask;
+    private readonly BehaviorContext _context;
+    private readonly Scripting.ScriptExecutor? _scriptExecutor;
+    private readonly Decision.HeartbeatService? _heartbeat;
+    private readonly Decision.MissionBoardService? _missionBoard;
+    private readonly bool _stepMode;
+    private int _tickCounter;
+
+    // Non-module periodic task state
+    private DateTime _lastStatTick = DateTime.UtcNow;
+
+    private int SearchRange => this._scriptExecutor?.CurrentParameters?.SearchRange ?? 20;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="AiPlayerLogic"/> class.
+    /// </summary>
+    /// <param name="player">The AI player to control.</param>
+    /// <param name="selector">Optional algorithm selector; uses player's default if omitted.</param>
+    /// <param name="stepMode">When true, the tick loop is disabled and <see cref="TickOnceAsync"/> must be called manually. Used by the debug test client.</param>
+    /// <param name="script">Optional behavior script. When provided, the ScriptExecutor is used instead of the DAG-based module executor (1D mode).</param>
+    public AiPlayerLogic(AiPlayer player, AlgorithmSelector? selector = null, bool stepMode = false, BehaviorScript? script = null)
+    {
+        this._player = player;
+        this._adapter = new GameAdapter(player);
+        this._stepMode = stepMode;
+
+        // Ensure algorithm selector is ready
+        selector?.RegisterAlgorithms();
+
+        // Create shared context
+        this._context = new BehaviorContext(player)
+        {
+            GameAdapter = new GameAdapter(player),
+            NpcService = new NpcInteractionService(player, player.Logger),
+        };
+
+        // Create event-driven AI state machine for async ScriptItem execution
+        var stateMachine = new AIStateMachine.AIStateMachine(player, this._adapter);
+        stateMachine.OnStuckDetected += hb =>
+        {
+            stateMachine.Cancel();
+        };
+        player.StateMachine = stateMachine;
+
+        // Load behavior execution engine: ScriptExecutor (1D) or Heartbeat (Decision)
+        if (script is not null)
+        {
+            // 1D Script-driven mode: priority-chain executor replaces DAG modules
+            ApplyPersonalityToScript(script, player.Personality);
+            this._scriptExecutor = new Scripting.ScriptExecutor(player, this._context, script, player.ScriptPath);
+            player.Logger.LogInformation("[AiPlayerLogic] Script-driven mode: {ScriptId} v{Version}",
+                script.Id, script.Version);
+        }
+        else if (script is null && player.SelectedCharacter is not null)
+        {
+            // Decision mode: Heartbeat + MissionBoard drives behavior autonomously
+            var nativeExec = new NativeExecutionService(player, player.Logger);
+            this._missionBoard = new Decision.MissionBoardService(player, this._adapter, player.Logger);
+            this._heartbeat = new Decision.HeartbeatService(player, this._missionBoard, this._adapter, player.Logger);
+            player.Logger.LogInformation("[AiPlayerLogic] Decision mode: Heartbeat-driven (no script)");
+        }
+
+        // Start the adaptive tick loop
+        this._cts = new CancellationTokenSource();
+        this._loopTask = this.RunLoopAsync();
+    }
+
+    /// <summary>
+    /// Gets or sets the target map number for cross-map navigation.
+    /// When set and the player is not on this map, the AI will find
+    /// and use enter gates to reach it. Cleared on arrival.
+    /// Delegates to the shared <see cref="BehaviorContext"/>.
+    /// </summary>
+    public ushort? TargetMapNumber
+    {
+        get => this._context.TargetMapNumber;
+        set => this._context.TargetMapNumber = value;
+    }
+
+    /// <summary>
+    /// Gets the current tick counter. Increments each time <see cref="TickCoreAsync"/> runs.
+    /// </summary>
+    public int TickCounter => this._tickCounter;
+
+    /// <summary>
+    /// Gets a value indicating whether the background loop task is still running.
+    /// Returns false if the loop has completed, faulted, or was cancelled.
+    /// In step mode, returns false since no loop was started.
+    /// </summary>
+    public bool IsRunning => !this._loopTask.IsCompleted;
+
+    /// <summary>
+    /// Gets a value indicating whether the background loop task has faulted
+    /// (crashed due to an unhandled exception).
+    /// </summary>
+    public bool HasCrashed => this._loopTask.IsFaulted;
+
+    /// <summary>
+    /// Gets the shared behavior context for debug inspection.
+    /// </summary>
+    public BehaviorContext Context => this._context;
+
+    /// <summary>
+    /// Reloads the running script. Safe to call from any thread;
+    /// delegates to ScriptExecutor.ReloadScript which atomically
+    /// queues the replacement for the next tick boundary.
+    /// No-op in DAG module mode (no script executor).
+    /// </summary>
+    public void ReloadScript(Scripting.BehaviorScript script)
+    {
+        if (this._scriptExecutor is not null)
+        {
+            this._scriptExecutor.ReloadScript(script);
+        }
+    }
+
+    /// <summary>
+    /// Gets the HeartbeatService, or null if not in Decision mode.
+    /// </summary>
+    public Decision.HeartbeatService? GetHeartbeat() => this._heartbeat;
+
+    /// <summary>
+    /// Gets the MissionBoardService, or null if not in Decision mode.
+    /// </summary>
+    public Decision.MissionBoardService? GetMissionBoard() => this._missionBoard;
+
+    /// <summary>
+    /// Gets the formatted execution statistics from the ScriptExecutor.
+    /// Returns null if not in script-driven mode (DAG mode) or if the executor is not initialized.
+    /// </summary>
+    public string? GetScriptStats()
+    {
+        return this._scriptExecutor?.GetStats();
+    }
+
+    /// <summary>
+    /// Gets the ScriptExecutor instance, or null if in DAG module mode (no script loaded).
+    /// </summary>
+    public Scripting.ScriptExecutor? GetScriptExecutor() => this._scriptExecutor;
+
+    /// <summary>
+    /// Gets the current behavior description from the ScriptExecutor
+    /// (e.g. "战斗中", "巡逻中"). Null in DAG module mode.
+    /// </summary>
+    public string? CurrentBehavior => this._scriptExecutor?.CurrentBehavior;
+
+    /// <summary>
+    /// Gets the name/id of the currently loaded script from the ScriptExecutor.
+    /// </summary>
+    public string? ScriptName => this._scriptExecutor?.ScriptName;
+
+    /// <summary>
+    /// Gets the current position within the script from the ScriptExecutor
+    /// (paragraph label or last executed node name).
+    /// </summary>
+    public string? ScriptPosition => this._scriptExecutor?.ScriptPosition;
+
+    /// <summary>
+    /// Gets the script lines for debug display.
+    /// </summary>
+    public string[]? ScriptLines => this._scriptExecutor?.ScriptLines;
+
+    /// <summary>
+    /// Gets the current line number within the script for debug display.
+    /// </summary>
+    public int ScriptLineNumber => this._scriptExecutor?.CurrentLineNumber ?? 0;
+
+    /// <summary>
+    /// Executes exactly one tick of AI behavior.
+    /// Only valid when constructed with <c>stepMode: true</c>.
+    /// </summary>
+    public async ValueTask TickOnceAsync()
+    {
+        await this.TickAsync().ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        this._player.StateMachine?.Dispose();
+        this._cts.Cancel();
+        this._cts.Dispose();
+    }
+
+    private async Task RunLoopAsync()
+    {
+        // Step mode: timer loop is disabled, caller drives ticks via TickOnceAsync()
+        if (this._stepMode)
+        {
+            return;
+        }
+
+        try
+        {
+            while (!this._cts.Token.IsCancellationRequested)
+            {
+                // [D2] Adaptive interval: extend to 1000ms when degraded, 400ms normal
+                var interval = 400;
+                await Task.Delay(interval, this._cts.Token).ConfigureAwait(false);
+                await this.TickAsync().ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown via Dispose() — no logging needed
+        }
+        catch (Exception ex)
+        {
+            this._player.Logger.LogError(ex, "[AiPlayerLogic] RunLoop task crashed for {Character}", this._player.SelectedCharacter?.Name);
+        }
+    }
+
+    private async ValueTask TickAsync()
+    {
+        try
+        {
+            await this.TickCoreAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            this._player.Logger.LogError(ex, "AI tick error for {Character}.", this._player.SelectedCharacter?.Name);
+        }
+    }
+
+    private async ValueTask TickCoreAsync()
+    {
+        this._tickCounter++;
+        var logger = this._player.Logger;
+        this._context.BeginTickRecording(this._tickCounter, this._adapter.GetPlayerPosition());
+
+        if (this._adapter.IsPlayerWalking())
+        {
+            this.RecordEndOfTickSnapshot();
+            return;
+        }
+
+        // ScriptExecutor mode: allow NpcDialogOpened so quest accept/submit can interact with NPC dialog
+        // Decision mode (Heartbeat): allow all states, HeartbeatService handles state filtering internally
+        if (this._player.PlayerState.CurrentState != GameLogic.PlayerState.EnteredWorld
+            && !(this._scriptExecutor is not null && this._player.PlayerState.CurrentState == GameLogic.PlayerState.NpcDialogOpened)
+            && this._heartbeat is null)
+        {
+            this.RecordEndOfTickSnapshot();
+            return;
+        }
+
+        // [AIStateMachine] Check if event-driven state machine is running a ScriptItem
+        if (this._player.StateMachine?.IsRunning == true)
+        {
+            var item = this._player.StateMachine.CurrentItem;
+
+            // Generate heartbeat with surrounding monster count (reuse world state or compute)
+            var monsterCount = this._context.WorldState.AttackablesInRange?.OfType<Monster>().Count(m => m.IsAlive) ?? 0;
+            this._player.StateMachine.UpdateHeartbeatAsync(this._adapter, monsterCount);
+
+            if (item?.RequiresTickLoop != true && this._heartbeat is null)
+            {
+                // Exclusive mode (non-Decision): state machine handles execution (e.g. walking to NPC, quest dialog).
+                // Tick loop is skipped — only record heartbeat snapshot.
+                // Decision mode (Heartbeat): ScriptExecutor runs inside BeatAsync, so the tick must continue.
+                this.RecordEndOfTickSnapshot();
+                return;
+            }
+
+            // Cooperative mode: item (e.g. HuntItem) needs tick loop to continue.
+            // Tick proceeds normally; the state machine monitors progress independently.
+        }
+
+        var map = this._adapter.GetCurrentMap();
+        if (map is null)
+        {
+            this.RecordEndOfTickSnapshot();
+            return;
+        }
+
+        logger.LogTrace("AI tick: entering main body, pos={pos}", this._adapter.GetPlayerPosition());
+
+        // Periodic diagnostic summary (every ~10s = 25 ticks)
+        if (this._tickCounter % 25 == 0)
+        {
+            var atkCount = this._context.WorldState.AttackablesInRange?.Count ?? 0;
+            logger.LogInformation("[AI Diag] {Name} tick={Tick}, pos=({X},{Y}), map={Map}, walking={Walking}, targets={Targets}, hp={HP}/{MaxHP}",
+                this._player.SelectedCharacter?.Name ?? "?",
+                this._tickCounter,
+                this._adapter.GetPlayerPosition().X, this._adapter.GetPlayerPosition().Y,
+                map.Definition.Number,
+                this._adapter.IsPlayerWalking(),
+                atkCount,
+                this._adapter.GetCurrentHp(),
+                this._adapter.GetMaxHp());
+        }
+
+        // 1. Refresh world state snapshot for all modules
+        var timing = this._context.Timing;
+        var worldSw = Stopwatch.StartNew();
+
+        this._context.WorldState = new WorldState
+        {
+            CurrentMap = map,
+            PlayerPosition = this._adapter.GetPlayerPosition(),
+            AttackablesInRange = map.GetAttackablesInRange(this._adapter.GetPlayerPosition(), SearchRange),
+            IsAtSafezone = false,
+            OtherPlayersInRange = map.GetAttackablesInRange(this._adapter.GetPlayerPosition(), 100)
+                .OfType<Player>()
+                .Where(p => p != this._player && !IsInSameParty(p))
+                .Take(20)
+                .ToList(),
+        };
+        worldSw.Stop();
+        timing.WorldRefreshUs = worldSw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
+
+        // 2. Execute behavior engine: ScriptExecutor (1D) or Heartbeat (Decision)
+        if (this._scriptExecutor is not null)
+        {
+            // 1D Script-driven mode
+            var scriptSw = Stopwatch.StartNew();
+            var tickResult = await this._scriptExecutor.TickAsync().ConfigureAwait(false);
+            scriptSw.Stop();
+            timing.ScriptExecutionUs = scriptSw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
+            if (tickResult.State == MUnique.OpenMU.AIPlayer.ScriptTaskState.Stuck)
+                this._player.Logger.LogWarning("[AiPlayer] Script watchdog: PC={Pc} stuck", tickResult.PC);
+        }
+        else if (this._heartbeat is not null)
+        {
+            // Decision mode: Heartbeat-driven (no script)
+            await this._heartbeat.BeatAsync().ConfigureAwait(false);
+        }
+
+        // Compute total tick duration
+        timing.TotalUs = timing.WorldRefreshUs + timing.ScriptExecutionUs;
+        this._context.Timing = timing;
+
+        // 3. Non-module periodic tasks — stat allocation
+        var now = DateTime.UtcNow;
+
+        // Stat allocation (every 5 seconds)
+        if (this._lastStatTick.AddSeconds(5) < now)
+        {
+            this._lastStatTick = now;
+            await this.AllocateStatsWithGatingAsync().ConfigureAwait(false);
+        }
+
+        // Record end-of-tick snapshot for debug state API.
+        // Early-return paths (walking, not-entered-world, no-map) each
+        // call this individually.  The main execution path reaches here.
+        this.RecordEndOfTickSnapshot();
+    }
+
+    private async ValueTask AllocateStatsWithGatingAsync()
+    {
+        var character = this._player.SelectedCharacter;
+        if (character is null || character.LevelUpPoints <= 0)
+        {
+            return;
+        }
+
+        var classNumber = character.CharacterClass?.Number ?? 0;
+        var baseClass = StatAllocationStrategy.GetBaseClass(classNumber);
+
+        if (!StatAllocationStrategy.ClassBuilds.TryGetValue(baseClass, out var phases))
+        {
+            return;
+        }
+
+        var level = this._adapter.GetPlayerLevel();
+
+        // Find the ideal phase for the current level
+        (int MinLevel, int MaxLevel, float Str, float Agi, float Vit, float Ene) phase = default;
+        var phaseIndex = -1;
+        for (var i = 0; i < phases.Length; i++)
+        {
+            var p = phases[i];
+            if (level >= p.MinLevel && level <= p.MaxLevel)
+            {
+                phase = p;
+                phaseIndex = i;
+            }
+        }
+
+        if (phaseIndex < 0)
+        {
+            return;
+        }
+
+        // Check if the ideal phase is knowledge-unlocked
+        var phaseKey = $"statbuild.{baseClass}.phase{phaseIndex}";
+        if (this._context.KnowledgeAccess is not null && !this._context.KnowledgeAccess.IsUnlocked(phaseKey))
+        {
+            // Fall back to the best unlocked phase
+            (int MinLevel, int MaxLevel, float Str, float Agi, float Vit, float Ene) fallbackPhase = default;
+            var fallbackIndex = -1;
+            for (var i = 0; i < phases.Length; i++)
+            {
+                if (!this._context.KnowledgeAccess.IsUnlocked($"statbuild.{baseClass}.phase{i}"))
+                {
+                    continue;
+                }
+
+                var p = phases[i];
+                if (level >= p.MinLevel)
+                {
+                    fallbackPhase = p;
+                    fallbackIndex = i;
+                }
+            }
+
+            if (fallbackIndex < 0)
+            {
+                return;
+            }
+
+            phase = fallbackPhase;
+        }
+
+        // Allocate up to 5 points per tick
+        var points = character.LevelUpPoints;
+        var toAllocate = Math.Min(points, 5);
+        if (toAllocate <= 0)
+        {
+            return;
+        }
+
+        var strPoints = (ushort)(toAllocate * phase.Str);
+        var agiPoints = (ushort)(toAllocate * phase.Agi);
+        var vitPoints = (ushort)(toAllocate * phase.Vit);
+        var enePoints = (ushort)(toAllocate * phase.Ene);
+
+        // Distribute remainder to the highest-weight stat
+        var allocated = strPoints + agiPoints + vitPoints + enePoints;
+        if (allocated < toAllocate)
+        {
+            var remaining = (ushort)(toAllocate - allocated);
+            var maxWeight = Math.Max(phase.Str, Math.Max(phase.Agi, Math.Max(phase.Vit, phase.Ene)));
+            if (maxWeight == phase.Str) { strPoints += remaining; }
+            else if (maxWeight == phase.Agi) { agiPoints += remaining; }
+            else if (maxWeight == phase.Vit) { vitPoints += remaining; }
+            else { enePoints += remaining; }
+        }
+
+        var increaseStats = new MUnique.OpenMU.GameLogic.PlayerActions.Character.IncreaseStatsAction();
+        if (strPoints > 0) { await increaseStats.IncreaseStatsAsync(this._player, MUnique.OpenMU.GameLogic.Attributes.Stats.BaseStrength, strPoints).ConfigureAwait(false); }
+
+        if (agiPoints > 0) { await increaseStats.IncreaseStatsAsync(this._player, MUnique.OpenMU.GameLogic.Attributes.Stats.BaseAgility, agiPoints).ConfigureAwait(false); }
+
+        if (vitPoints > 0) { await increaseStats.IncreaseStatsAsync(this._player, MUnique.OpenMU.GameLogic.Attributes.Stats.BaseVitality, vitPoints).ConfigureAwait(false); }
+
+        if (enePoints > 0) { await increaseStats.IncreaseStatsAsync(this._player, MUnique.OpenMU.GameLogic.Attributes.Stats.BaseEnergy, enePoints).ConfigureAwait(false); }
+    }
+
+    private void RecordEndOfTickSnapshot()
+    {
+        this._context.EndTickRecording(
+            (uint)this._adapter.GetCurrentHp(),
+            (uint)this._adapter.GetMaxHp(),
+            (uint)this._adapter.GetCurrentMp(),
+            (uint)this._adapter.GetMaxMp(),
+            this._adapter.GetPlayerLevel(),
+            (ushort)(this._adapter.GetCurrentMap()?.Definition.Number ?? 0));
+    }
+
+    /// <summary>
+    /// Applies the AI character's PersonalityProfile to override script parameters.
+    /// This connects the 8-dimension personality model to runtime behavior without
+    /// requiring separate JSON presets for each personality type.
+    /// </summary>
+    private static void ApplyPersonalityToScript(Scripting.BehaviorScript script, PersonalityProfile personality)
+    {
+        var p = script.Parameters;
+        p.MaxLevelDiff = (int)(15 + personality.RiskTolerance * 50);
+        p.HpThreshold = Math.Clamp((float)(0.50f - personality.RiskTolerance * 0.30f), 0.20f, 0.50f);
+        p.PotionCooldownMs = (int)(1500 + personality.RiskTolerance * 1000);
+        p.PatrolRadius = (int)(45 - personality.Caution * 30);
+        p.SearchRange = (int)(10 + personality.Aggression * 20);
+        p.PickupFilter = personality.Greed >= 0.3f ? "all" : "rare_and_above";
+        p.ReturnWhenInventoryFull = personality.Efficiency > 0.7f;
+    }
+
+    /// <summary>
+    /// 检查另一个玩家是否与当前 AI 在同一队伍中。
+    /// </summary>
+    private bool IsInSameParty(Player other)
+    {
+        var myParty = this._player.Party;
+        if (myParty is null) return false;
+        return myParty.PartyList.Contains(other);
+    }
+
+    /// <summary>
+    /// Gets a recommended hunting map based on the player's experience.
+    /// Simplified to return the current map (hotspot-based recommendations
+    /// have been removed in the cleanup).
+    /// </summary>
+    /// <param name="topN">Ignored in simplified version.</param>
+    /// <returns>The current map number with a default score of 0.</returns>
+    public (ushort MapNumber, double Score) GetRecommendedMap(int topN = 3)
+    {
+        var currentMapNum = (ushort)(this._adapter.GetCurrentMap()?.Definition.Number ?? 0);
+        return (currentMapNum, 0.0);
+    }
+
+}
