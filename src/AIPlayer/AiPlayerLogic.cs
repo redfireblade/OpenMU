@@ -357,13 +357,18 @@ public sealed class AiPlayerLogic : IDisposable
             var tickResult = await this._scriptExecutor.TickAsync().ConfigureAwait(false);
             scriptSw.Stop();
             timing.ScriptExecutionUs = scriptSw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
+            this._context.RecordDecision("script", scriptSw.Elapsed);
             if (tickResult.State == MUnique.OpenMU.AIPlayer.ScriptTaskState.Stuck)
                 this._player.Logger.LogWarning("[AiPlayer] Script watchdog: PC={Pc} stuck", tickResult.PC);
         }
         else if (this._heartbeat is not null)
         {
             // Decision mode: Heartbeat-driven (no script)
+            var hbSw = Stopwatch.StartNew();
             await this._heartbeat.BeatAsync().ConfigureAwait(false);
+            hbSw.Stop();
+            timing.ScriptExecutionUs = hbSw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
+            this._context.RecordDecision("heartbeat", hbSw.Elapsed);
         }
 
         // Compute total tick duration
