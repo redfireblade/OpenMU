@@ -29,12 +29,16 @@ public sealed class CraftingModule : IBehaviorSubModule
     /// <summary>混沌合成 NPC 编号 (Chaos Goblin = 238 / 混沌大师 = 256)。</summary>
     private const short ChaosGoblinNumber = 238;
 
-    /// <summary>合成操作引用的 NPC 窗口类型 → NPC 编号映射。</summary>
+    /// <summary>
+    /// 合成操作引用的 NPC 窗口类型 → NPC 编号映射。
+    /// 门票合成统一由 Chaos Goblin(238) 处理。
+    /// 入场 NPC 和合成 NPC 不同。
+    /// </summary>
     private static readonly Dictionary<string, short> CraftingNpcMap = new()
     {
-        { "ChaosMachine", 238 },        // Chaos Goblin
-        { "DevilSquare", 237 },          // Charon (Devil Square)
-        { "BloodCastle", 229 },          // Blood Castle entrance
+        { "ChaosMachine", 238 },        // Chaos Goblin (所有合成)
+        { "DevilSquare", 237 },          // Charon (Devil Square 入场, 非合成)
+        { "BloodCastle", 229 },          // Blood Castle entrance 入场
         { "Warehouse", 232 },            // Warehouse Keeper
     };
 
@@ -145,24 +149,19 @@ public sealed class CraftingModule : IBehaviorSubModule
 
     /// <summary>
     /// 从 MissionItem ID 或 Category 解析目标 NPC 和合成类型。
-    /// ID 格式: "craft_ticket_DevilSquare_2" → NPC=237(Charon)
+    /// ID 格式: "craft_ticket_DevilSquare_2" → NPC=238(ChaosGoblin, 门票合成)
+    /// "craft_ticket_BloodCastle_2" → NPC=238(ChaosGoblin)
     /// "craft_chaos_upgrade" → NPC=238(ChaosGoblin)
+    /// 所有合成都在混沌哥布林(238)处理。入场NPC(Charon 237/BloodCastle 229)由 EventExecutorModule 处理。
     /// </summary>
     private void ResolveCraftingNpc(MissionItem item)
     {
-        if (item.Id.StartsWith("craft_ticket_DevilSquare", StringComparison.OrdinalIgnoreCase))
+        if (item.Id.StartsWith("craft_ticket_", StringComparison.OrdinalIgnoreCase)
+            || item.Id.StartsWith("craft_chaos_", StringComparison.OrdinalIgnoreCase)
+            || item.Id.StartsWith("craft_equip_", StringComparison.OrdinalIgnoreCase)
+            || item.Id.StartsWith("craft_wing_", StringComparison.OrdinalIgnoreCase))
         {
-            this._targetNpcNumber = 237; // Charon
-        }
-        else if (item.Id.StartsWith("craft_ticket_BloodCastle", StringComparison.OrdinalIgnoreCase))
-        {
-            this._targetNpcNumber = 229; // Blood Castle entrance NPC
-        }
-        else if (item.Id.StartsWith("craft_chaos_", StringComparison.OrdinalIgnoreCase)
-              || item.Id.StartsWith("craft_equip_", StringComparison.OrdinalIgnoreCase)
-              || item.Id.StartsWith("craft_wing_", StringComparison.OrdinalIgnoreCase))
-        {
-            this._targetNpcNumber = 238; // Chaos Goblin
+            this._targetNpcNumber = 238; // Chaos Goblin (所有合成)
         }
         else
         {
@@ -175,16 +174,27 @@ public sealed class CraftingModule : IBehaviorSubModule
     /// <summary>
     /// 从 MissionItem 推导合成类型 ID（mixTypeId）。
     /// 对于混沌合成使用 0（默认），门票合成使用对应的 mixType。
+    /// 门票合成在 Chaos Goblin 的 ItemCraftings 中一般是第一个(Number=0)。
+    /// 混沌武器合成通常是 Number=2。
     /// </summary>
     private byte GetMixTypeId(MissionItem item)
     {
-        // Default mixType 0 for Chaos Goblin (chaos weapon, wing upgrade)
         if (item.Id.StartsWith("craft_ticket_", StringComparison.OrdinalIgnoreCase))
         {
-            return 1; // Ticket crafting typically uses mixType 1
+            return 0; // 门票合成通常是 Chaos Goblin 的第一个合成类型
         }
 
-        return 0;
+        if (item.Id.StartsWith("craft_chaos_", StringComparison.OrdinalIgnoreCase))
+        {
+            return 2; // 混沌武器合成
+        }
+
+        if (item.Id.StartsWith("craft_wing_", StringComparison.OrdinalIgnoreCase))
+        {
+            return 3; // 翅膀合成
+        }
+
+        return 0; // Default
     }
 
     /// <summary>
@@ -206,41 +216,73 @@ public sealed class CraftingModule : IBehaviorSubModule
 
     /// <summary>
     /// 从背包中找到合成材料并移到 TemporaryStorage。
-    /// 针对混沌合成模式：找 Chaos 宝石(12,15) + 其他可能的材料。
-    /// 针对门票合成模式：找对应的门票材料。
+    /// 针对不同合成类型移动对应的材料到混沌合成机。
+    /// 门票合成: 恶魔眼(14,17) + 恶魔钥匙(14,18) + 混沌宝石(12,15)
+    /// 翅膀合成: 洛克之羽(13,11) + 混沌宝石(12,15) + +4以上装备
+    /// 混沌武器: +4以上装备 + 混沌宝石(12,15) 等
+    /// 装备升级: 装备 + 祝福(12,14)/灵魂(12,13)/混沌(12,15)
     /// </summary>
     private async ValueTask<bool> TryMoveCraftingMaterialsAsync()
     {
         var inv = this._player.Inventory;
         if (inv is null) return false;
 
-        // Check if materials already moved or if we need to move them
+        // Check if materials already moved
         var tmp = this._player.TemporaryStorage;
         if (tmp is not null && tmp.Items.Any())
         {
-            return true; // Already have materials in tmp
-        }
-
-        // Primary crafting material: Jewel of Chaos (12,15)
-        var chaosItem = inv.Items.FirstOrDefault(i =>
-            i.Definition?.Group == 12 && i.Definition?.Number == 15);
-        if (chaosItem is null)
-        {
-            this._logger.LogDebug("[Crafting] 背包中无混沌宝石，尝试其他合成材料");
-            // Fallback: try ANY stackable item that could be used in crafting
-            var anyCraftable = inv.Items.FirstOrDefault(i =>
-                i.Definition?.Group is >= 12 and <= 14);
-            if (anyCraftable is null) return false;
-
-            var fromSlot = anyCraftable.ItemSlot;
-            await this._moveItemAction.MoveItemAsync(this._player, fromSlot, Storages.Inventory, 0, Storages.ChaosMachine)
-                .ConfigureAwait(false);
             return true;
         }
 
-        var chaosSlot = chaosItem.ItemSlot;
-        await this._moveItemAction.MoveItemAsync(this._player, chaosSlot, Storages.Inventory, 0, Storages.ChaosMachine)
+        // 门票合成: 恶魔眼 + 恶魔钥匙 + 混沌宝石
+        if (this._targetNpcNumber != ChaosGoblinNumber)
+        {
+            // 门票合成: 混沌宝石(12,15) 是最重要的
+            var moved = await this.TryMoveItemsByGroupAsync(inv, 12, 15).ConfigureAwait(false);
+            if (!moved)
+            {
+                this._logger.LogWarning("[Crafting] 背包中无混沌宝石，合成可能失败");
+                return false;
+            }
+
+            // 如果有其他材料也移过去
+            await this.TryMoveItemsByGroupAsync(inv, 14, 17).ConfigureAwait(false); // 恶魔眼
+            await this.TryMoveItemsByGroupAsync(inv, 14, 18).ConfigureAwait(false); // 恶魔钥匙
+            return true;
+        }
+
+        // 混沌合成 (默认): 混沌宝石(12,15)
+        if (await this.TryMoveItemsByGroupAsync(inv, 12, 15).ConfigureAwait(false))
+        {
+            this._logger.LogInformation("[Crafting] 已移动混沌宝石到 TemporaryStorage");
+            return true;
+        }
+
+        this._logger.LogDebug("[Crafting] 背包中无混沌宝石，尝试其他合成材料");
+        var anyCraftable = inv.Items.FirstOrDefault(i =>
+            i.Definition?.Group is >= 12 and <= 14);
+        if (anyCraftable is null) return false;
+
+        var fromSlot = anyCraftable.ItemSlot;
+        await this._moveItemAction.MoveItemAsync(this._player, fromSlot, Storages.Inventory, 0, Storages.ChaosMachine)
             .ConfigureAwait(false);
         return true;
     }
+
+    /// <summary>
+    /// 按 Group/Number 将指定物品从背包移到混沌合成机的 TemporaryStorage。
+    /// </summary>
+    private async ValueTask<bool> TryMoveItemsByGroupAsync(IInventoryStorage inv, int group, int number)
+    {
+        var item = inv.Items.FirstOrDefault(i =>
+            i.Definition?.Group == group && i.Definition?.Number == number);
+        if (item is null) return false;
+
+        await this._moveItemAction.MoveItemAsync(this._player, item.ItemSlot, Storages.Inventory, 0, Storages.ChaosMachine)
+            .ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>记录实际合成类型，用于材料检查决策。</summary>
+    private int _actualMixTypeId = -1;
 }
