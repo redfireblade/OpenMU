@@ -501,7 +501,7 @@ public sealed class EventExecutorModule : IBehaviorSubModule
 
     /// <summary>
     /// 注入打门票材料任务到看板，并将它设为事件任务的前置依赖。
-    /// 使用 MaterialKnowledgeService 获取每个材料的掉落来源，为缺少的材料创建独立的 material_farm 任务。
+    /// 使用 MaterialKnowledgeService.GetTicketMaterialDropInfo 确定目标怪物、地图和材料等级。
     /// </summary>
     private void EnsureTicketMaterialFarmingMissionExists(MiniGameDefinition miniGameDef, MissionItem eventItem)
     {
@@ -513,45 +513,74 @@ public sealed class EventExecutorModule : IBehaviorSubModule
             return;
         }
 
+        // 获取玩家等级
+        var playerLevel = this._adapter.GetPlayerLevel();
+
+        // 使用 MaterialKnowledgeService 计算最佳材料等级和掉落来源
+        var bestDrop = this._materialKnowledge.GetTicketMaterialDropInfo(miniGameDef.Type, miniGameDef.GameLevel, playerLevel);
+        if (bestDrop is null)
+        {
+            this._logger.LogWarning(
+                "[EventExec] GetTicketMaterialDropInfo 返回 null，无法确定刷取目标 (Type={Type} Lv={GameLevel} PlayerLv={PlayerLv})",
+                miniGameDef.Type,
+                miniGameDef.GameLevel,
+                playerLevel);
+            return;
+        }
+
         // 从材料知识服务获取需要刷的材料列表
         var materials = this._materialKnowledge.GetTicketCraftingMaterials(miniGameDef.Type, miniGameDef.GameLevel);
 
-        // 对于每个缺少的材料，单独创建一个 farming 任务
-        // 只在背包中查找，只创建缺少材料的 farm 任务
+        // 对每个缺少的材料（跳过混沌宝石），创建独立的 farm 任务
         if (materials.Count > 0)
         {
             var dependencies = new List<string>();
 
             foreach (var mat in materials)
             {
-                // 跳过背包中已有的材料
+                // 跳过混沌宝石（全局掉落，不需要专门刷取）
+                if (mat.Group == 12 && mat.Number == 15)
+                {
+                    continue;
+                }
+
+                // 跳过背包中已有的材料（检查对应等级）
                 var inv = this._player.Inventory;
                 var hasMaterial = inv?.Items.Any(i =>
-                    i.Definition?.Group == mat.Group && i.Definition?.Number == mat.Number && i.Durability > 0) == true;
+                    i.Definition?.Group == mat.Group
+                    && i.Definition?.Number == mat.Number
+                    && i.Durability > 0
+                    && i.Level == bestDrop.TargetLevel) == true;
 
                 if (hasMaterial)
                 {
                     continue;
                 }
 
-                // 查找掉落来源
+                // 查找该材料对应等级（bestDrop.TargetLevel）的掉落来源
                 var dropSources = this._materialKnowledge.GetDropSources(mat.Group, mat.Number);
-                if (dropSources.Count == 0)
+                var matchedSource = dropSources.FirstOrDefault(s => s.ItemLevel == bestDrop.TargetLevel);
+                if (matchedSource is null)
                 {
+                    // Fallback: 使用 bestDrop 的怪物和地图
                     this._logger.LogWarning(
-                        "[EventExec] 不知道 {Name}({Group},{Number}) 的掉落来源, 跳过自动刷取",
-                        mat.Name, mat.Group, mat.Number);
-                    continue;
+                        "[EventExec] 材料 {Name}({Group},{Number}) 无 Lv.{Level} 等级匹配的掉落来源，使用 bestDrop 的默认值",
+                        mat.Name, mat.Group, mat.Number, bestDrop.TargetLevel);
                 }
 
-                // 选第一个掉落来源
-                var source = dropSources[0];
+                var source = matchedSource ?? new DropSourceInfo(
+                    MonsterNumber: bestDrop.MonsterNumber,
+                    MonsterName: bestDrop.MonsterName,
+                    MapNumber: bestDrop.MapNumber,
+                    MapName: bestDrop.MapName,
+                    ItemLevel: bestDrop.TargetLevel);
+
                 var matMissionId = $"{missionId}_{mat.Group}_{mat.Number}";
 
                 var farmMission = new MissionItem
                 {
                     Id = matMissionId,
-                    Title = $"刷取{mat.Name}",
+                    Title = $"刷取{mat.Name}+{bestDrop.TargetLevel}",
                     Priority = 11,
                     Type = MissionType.ItemFarm,
                     Category = QuestCategory.AiCustom,
@@ -562,6 +591,7 @@ public sealed class EventExecutorModule : IBehaviorSubModule
                     {
                         { "ItemGroup", mat.Group },
                         { "ItemNumber", mat.Number },
+                        { "TargetLevel", (int)bestDrop.TargetLevel },
                         { "MonsterNumber", source.MonsterNumber },
                         { "MapNumber", (ushort)source.MapNumber },
                         { "RequiredCount", mat.RequiredCount },
@@ -572,9 +602,10 @@ public sealed class EventExecutorModule : IBehaviorSubModule
                 dependencies.Add(matMissionId);
 
                 this._logger.LogInformation(
-                    "[EventExec] 注入打材料任务 {Id} -> {Title} (怪物#{Monster} @地图#{Map})",
+                    "[EventExec] 注入打材料任务 {Id} -> 刷取{Name}+{Level} (怪物#{Monster} @地图#{Map})",
                     matMissionId,
-                    farmMission.Title,
+                    mat.Name,
+                    bestDrop.TargetLevel,
                     source.MonsterNumber,
                     source.MapNumber);
             }
@@ -585,7 +616,7 @@ public sealed class EventExecutorModule : IBehaviorSubModule
             }
             else
             {
-                // 所有材料都有了 → 直接升级为合成任务
+                // 所有材料都有了（包括对应等级）→ 直接升级为合成任务
                 this.EnsureTicketCraftingMissionExists(miniGameDef, eventItem);
             }
         }

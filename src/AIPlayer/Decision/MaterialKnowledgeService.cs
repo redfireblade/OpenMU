@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.DataModel.Configuration.Items;
 using MUnique.OpenMU.GameLogic;
+using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.Interfaces;
 
 /// <summary>
@@ -35,7 +36,9 @@ public sealed class MaterialKnowledgeService
 
     /// <summary>
     /// 获取某种材料被什么怪物在什么地图掉落的信息。
-    /// 通过扫描所有地图的 MonsterSpawns → MonsterDefinition → DropItemGroups → PossibleItems 查找。
+    /// 通过以下方式查找：
+    /// 1. 扫描所有地图的 MonsterSpawns → MonsterDefinition → DropItemGroups → PossibleItems
+    /// 2. 扫描全局 GameConfiguration.DropItemGroups（事件门票物品等，通过 BaseMapInitializer.RegisterDefaultDropItemGroup 注册）
     /// </summary>
     /// <param name="itemGroup">物品组 (Group).</param>
     /// <param name="itemNumber">物品编号 (Number).</param>
@@ -43,9 +46,9 @@ public sealed class MaterialKnowledgeService
     public List<DropSourceInfo> GetDropSources(int itemGroup, int itemNumber)
     {
         var results = new List<DropSourceInfo>();
-        var seen = new HashSet<(short MonsterNumber, ushort MapNumber)>();
+        var seen = new HashSet<(short MonsterNumber, ushort MapNumber, byte ItemLevel)>();
 
-        // 扫描所有地图
+        // 阶段1: 扫描怪物专属 DropItemGroups（已有逻辑保留）
         foreach (var map in this._config.Maps)
         {
             if (map is null)
@@ -62,7 +65,6 @@ public sealed class MaterialKnowledgeService
 
                 var monster = spawn.MonsterDefinition;
 
-                // 查找该怪兽的 DropItemGroups 中是否包含目标物品
                 foreach (var dropGroup in monster.DropItemGroups)
                 {
                     if (dropGroup is null)
@@ -79,30 +81,140 @@ public sealed class MaterialKnowledgeService
 
                         if (itemDef.Group == itemGroup && itemDef.Number == itemNumber)
                         {
-                            var key = (monster.Number, (ushort)map.Number);
+                            var itemLevel = dropGroup.ItemLevel ?? 1;
+                            var key = (monster.Number, (ushort)map.Number, itemLevel);
                             if (seen.Add(key))
                             {
                                 var info = new DropSourceInfo(
                                     MonsterNumber: monster.Number,
                                     MonsterName: (string)monster.Designation,
                                     MapNumber: (ushort)map.Number,
-                                    MapName: (string)map.Name);
+                                    MapName: (string)map.Name,
+                                    ItemLevel: itemLevel);
                                 results.Add(info);
 
                                 this._logger.LogDebug(
-                                    "[MaterialKnowledge] 找到掉落来源: {Monster}({MonsterNum}) @ 地图{MapNum}({MapName}) 掉落 {ItemGroup},{ItemNumber}",
+                                    "[MaterialKnowledge] 找到掉落来源(专属): {Monster}({MonsterNum}) @ 地图{MapNum}({MapName}) 掉落 {ItemGroup},{ItemNumber} Lv.{Level}",
                                     monster.Designation,
                                     monster.Number,
                                     map.Number,
                                     map.Name,
                                     itemGroup,
-                                    itemNumber);
+                                    itemNumber,
+                                    itemLevel);
                             }
 
-                            break; // 找到后无需继续扫描该组的其他物品
+                            break;
                         }
                     }
                 }
+            }
+        }
+
+        // 阶段2: 扫描全局 DropItemGroups（事件门票物品等）
+        // 这些通过 BaseMapInitializer.RegisterDefaultDropItemGroup 注册到 GameConfiguration.DropItemGroups
+        foreach (var dropGroup in this._config.DropItemGroups)
+        {
+            if (dropGroup is null)
+            {
+                continue;
+            }
+
+            foreach (var itemDef in dropGroup.PossibleItems)
+            {
+                if (itemDef is null)
+                {
+                    continue;
+                }
+
+                if (itemDef.Group != itemGroup || itemDef.Number != itemNumber)
+                {
+                    continue;
+                }
+
+                var itemLevel = dropGroup.ItemLevel ?? 1;
+
+                // 如果该 DropItemGroup 有 Monster 限制（特定怪物专属），则按怪物匹配
+                if (dropGroup.Monster is { } specificMonster)
+                {
+                    foreach (var map in this._config.Maps)
+                    {
+                        if (map is null) continue;
+                        foreach (var spawn in map.MonsterSpawns)
+                        {
+                            if (spawn?.MonsterDefinition != specificMonster) continue;
+                            var key = (specificMonster.Number, (ushort)map.Number, itemLevel);
+                            if (!seen.Add(key)) continue;
+
+                            results.Add(new DropSourceInfo(
+                                MonsterNumber: specificMonster.Number,
+                                MonsterName: (string)specificMonster.Designation,
+                                MapNumber: (ushort)map.Number,
+                                MapName: (string)map.Name,
+                                ItemLevel: itemLevel));
+                        }
+                    }
+
+                    break;
+                }
+
+                // 全局掉落：按 MinimumMonsterLevel / MaximumMonsterLevel 匹配
+                var minLevel = dropGroup.MinimumMonsterLevel ?? 0;
+                var maxLevel = dropGroup.MaximumMonsterLevel ?? byte.MaxValue;
+
+                foreach (var map in this._config.Maps)
+                {
+                    if (map is null) continue;
+                    foreach (var spawn in map.MonsterSpawns)
+                    {
+                        if (spawn?.MonsterDefinition is null) continue;
+                        var monster = spawn.MonsterDefinition;
+
+                        // 跳过 NPC（无战斗能力、无等级的怪不参与掉落匹配）
+                        if (monster.Attributes is null || monster.Attributes.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        byte monsterLevel;
+                        try
+                        {
+                            monsterLevel = (byte)monster[Stats.Level];
+                        }
+                        catch
+                        {
+                            // 无 Level 属性的怪物跳过
+                            continue;
+                        }
+
+                        if (monsterLevel >= minLevel && monsterLevel <= maxLevel)
+                        {
+                            var key = (monster.Number, (ushort)map.Number, itemLevel);
+                            if (!seen.Add(key)) continue;
+
+                            results.Add(new DropSourceInfo(
+                                MonsterNumber: monster.Number,
+                                MonsterName: (string)monster.Designation,
+                                MapNumber: (ushort)map.Number,
+                                MapName: (string)map.Name,
+                                ItemLevel: itemLevel));
+
+                            this._logger.LogDebug(
+                                "[MaterialKnowledge] 找到掉落来源(全局): {Monster}({MonsterNum}) Lv.{MonLv} @ 地图{MapNum}({MapName}) 掉落 {ItemGroup},{ItemNumber} Lv.{ItemLv} (MinMonLv={MinLv})",
+                                monster.Designation,
+                                monster.Number,
+                                monsterLevel,
+                                map.Number,
+                                map.Name,
+                                itemGroup,
+                                itemNumber,
+                                itemLevel,
+                                minLevel);
+                        }
+                    }
+                }
+
+                break; // 一个 DropItemGroup 里的 PossibleItems 已经匹配完
             }
         }
 
@@ -295,6 +407,289 @@ public sealed class MaterialKnowledgeService
 
         return null;
     }
+
+    /// <summary>
+    /// 获取指定怪物的等级范围(最小和最大等级相同，因为怪物自身只有一个等级)。
+    /// 通过 MonsterDefinition[Stats.Level] 属性读取。
+    /// </summary>
+    /// <param name="monsterNumber">怪物编号.</param>
+    /// <returns>包含最小和最大等级的元组，如果找不到怪物或无 Level 属性则返回 null.</returns>
+    public (byte MinLevel, byte MaxLevel)? GetMonsterLevelRange(short monsterNumber)
+    {
+        var monster = this._config.Monsters.FirstOrDefault(m => m.Number == monsterNumber);
+        if (monster is null)
+        {
+            this._logger.LogDebug("[MaterialKnowledge] 未找到怪物 #{Monster}", monsterNumber);
+            return null;
+        }
+
+        if (monster.Attributes is null || monster.Attributes.Count == 0)
+        {
+            this._logger.LogDebug("[MaterialKnowledge] 怪物 #{Monster} 无属性定义", monsterNumber);
+            return null;
+        }
+
+        byte level;
+        try
+        {
+            level = (byte)monster[Stats.Level];
+        }
+        catch
+        {
+            this._logger.LogDebug("[MaterialKnowledge] 怪物 #{Monster} 无 Level 属性", monsterNumber);
+            return null;
+        }
+
+        return (level, level);
+    }
+
+    /// <summary>
+    /// 根据玩家等级计算应该刷什么等级的门票材料。
+    /// 选择 MinimumMonsterLevel &lt;= playerLevel 的最高可用材料等级。
+    /// 对于恶魔广场: 扫全局 DropItemGroups 中的 Devil's Eye(14,17)/Devil's Key(14,18)，
+    /// 找到 ItemLevel 对应的 MinimumMonsterLevel，选择符合玩家等级的最高等级。
+    /// </summary>
+    /// <param name="itemGroup">物品组.</param>
+    /// <param name="itemNumber">物品编号.</param>
+    /// <param name="playerLevel">玩家当前等级.</param>
+    /// <returns>最佳材料掉落信息，包含目标等级、怪物编号和地图编号.</returns>
+    public TicketDropInfo? GetBestTicketMaterialDropInfo(int itemGroup, int itemNumber, int playerLevel)
+    {
+        // 收集该物品的所有 DropItemGroup 等级信息
+        var levelInfos = new List<(byte ItemLevel, byte MinMonsterLevel)>();
+        foreach (var dropGroup in this._config.DropItemGroups)
+        {
+            if (dropGroup is null) continue;
+            foreach (var itemDef in dropGroup.PossibleItems)
+            {
+                if (itemDef is null) continue;
+                if (itemDef.Group != itemGroup || itemDef.Number != itemNumber) continue;
+
+                var itemLevel = dropGroup.ItemLevel ?? 1;
+                var minMonsterLevel = dropGroup.MinimumMonsterLevel ?? 0;
+                levelInfos.Add((itemLevel, minMonsterLevel));
+                break;
+            }
+        }
+
+        if (levelInfos.Count == 0)
+        {
+            this._logger.LogWarning("[MaterialKnowledge] 物品 G{Group}N{Number} 无 DropItemGroup 定义", itemGroup, itemNumber);
+            return null;
+        }
+
+        // 选择 MinimumMonsterLevel <= playerLevel 的最高可用等级
+        levelInfos.Sort((a, b) => b.ItemLevel.CompareTo(a.ItemLevel)); // 降序排序，找最高的
+        byte targetLevel = 0;
+        foreach (var (il, mml) in levelInfos)
+        {
+            if (mml <= playerLevel)
+            {
+                targetLevel = il;
+                break;
+            }
+        }
+
+        if (targetLevel == 0)
+        {
+            this._logger.LogWarning(
+                "[MaterialKnowledge] 玩家等级 {Level} 不足以刷任何等级的 G{Group}N{Number} (最低怪物等级={Min})",
+                playerLevel,
+                itemGroup,
+                itemNumber,
+                levelInfos.Min(li => li.MinMonsterLevel));
+            return null;
+        }
+
+        // 找到该目标等级的掉落来源（怪物+地图）
+        var sources = this.GetDropSources(itemGroup, itemNumber);
+        var matched = sources
+            .Where(s => s.ItemLevel == targetLevel)
+            .OrderBy(s => s.MonsterNumber) // 稳定排序，选第一个
+            .FirstOrDefault();
+
+        if (matched is null)
+        {
+            this._logger.LogWarning("[MaterialKnowledge] 找到 G{Group}N{Number} Lv.{Level} 但无对应怪物掉落来源", itemGroup, itemNumber, targetLevel);
+            return null;
+        }
+
+        this._logger.LogInformation(
+            "[MaterialKnowledge] 最佳门票材料: G{Group}N{Number} Lv.{Level} 由 {Monster}(#{MonsterNum}) @ 地图#{MapNum} 掉落",
+            itemGroup,
+            itemNumber,
+            targetLevel,
+            matched.MonsterName,
+            matched.MonsterNumber,
+            matched.MapNumber);
+
+        return new TicketDropInfo(
+            ItemGroup: itemGroup,
+            ItemNumber: itemNumber,
+            TargetLevel: targetLevel,
+            MonsterNumber: matched.MonsterNumber,
+            MapNumber: matched.MapNumber,
+            MonsterName: matched.MonsterName,
+            MapName: matched.MapName);
+    }
+
+    /// <summary>
+    /// 获取指定物品所有可用的材料等级（即 DropItemGroup.ItemLevel 集合）。
+    /// </summary>
+    private HashSet<byte> GetAvailableMaterialLevels(int itemGroup, int itemNumber)
+    {
+        var levels = new HashSet<byte>();
+        foreach (var dropGroup in this._config.DropItemGroups)
+        {
+            if (dropGroup is null) continue;
+            foreach (var itemDef in dropGroup.PossibleItems)
+            {
+                if (itemDef is null) continue;
+                if (itemDef.Group != itemGroup || itemDef.Number != itemNumber) continue;
+                levels.Add(dropGroup.ItemLevel ?? 1);
+                break;
+            }
+        }
+
+        return levels;
+    }
+
+    /// <summary>
+    /// 获取指定物品指定等级的 MinimumMonsterLevel（掉落该材料所需的最低怪物等级）。
+    /// </summary>
+    private byte GetMinMonsterLevelForItemLevel(int itemGroup, int itemNumber, byte itemLevel)
+    {
+        foreach (var dropGroup in this._config.DropItemGroups)
+        {
+            if (dropGroup is null) continue;
+            foreach (var itemDef in dropGroup.PossibleItems)
+            {
+                if (itemDef is null) continue;
+                if (itemDef.Group != itemGroup || itemDef.Number != itemNumber) continue;
+                if ((dropGroup.ItemLevel ?? 1) == itemLevel)
+                {
+                    return dropGroup.MinimumMonsterLevel ?? 0;
+                }
+
+                break;
+            }
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// 获取指定迷你游戏的门票合成材料掉落信息。
+    /// 为门票的第一个材料（恶魔眼/卷轴）和第二个材料（恶魔钥匙/血骨）分别计算最佳材料等级。
+    /// 注意：两个材料的 TargetLevel 必须相同才能合成。
+    /// 搜索范围从门票所需等级向下到1级，选择玩家能刷到的最高等级。
+    /// </summary>
+    /// <param name="miniGameType">迷你游戏类型.</param>
+    /// <param name="gameLevel">游戏等级（对应 MiniGameDefinition.GameLevel）.</param>
+    /// <param name="playerLevel">玩家当前等级.</param>
+    /// <returns>第一个材料的掉落信息（通常作为代表），含 TargetLevel.</returns>
+    public TicketDropInfo? GetTicketMaterialDropInfo(MiniGameType miniGameType, int gameLevel, int playerLevel)
+    {
+        var materials = this.GetTicketCraftingMaterials(miniGameType, gameLevel);
+        if (materials.Count == 0)
+        {
+            return null;
+        }
+
+        // 跳过混沌宝石（12,15）——全局掉落，不按等级
+        var eventMaterials = materials.Where(m => !(m.Group == 12 && m.Number == 15)).ToList();
+        if (eventMaterials.Count == 0)
+        {
+            return null;
+        }
+
+        // 获取门票所需的物品等级（TicketItemLevel），搜索范围上限
+        var miniGameDef = this._config.MiniGameDefinitions
+            .FirstOrDefault(d => d.Type == miniGameType && d.GameLevel == gameLevel);
+        var maxRequiredLevel = (int)(miniGameDef?.TicketItemLevel ?? byte.MaxValue);
+
+        // 从 maxRequiredLevel 向下搜索，找到玩家能刷到的最高等级
+        var firstMaterial = eventMaterials[0];
+        for (byte searchLevel = (byte)Math.Min(maxRequiredLevel, byte.MaxValue); searchLevel >= 1; searchLevel--)
+        {
+            // 检查第一个材料能否达到 searchLevel
+            var firstLevels = this.GetAvailableMaterialLevels(firstMaterial.Group, firstMaterial.Number);
+            if (!firstLevels.Contains(searchLevel))
+            {
+                continue;
+            }
+
+            // 检查该等级的 MinimumMonsterLevel 是否 <= playerLevel
+            var firstMinLevel = this.GetMinMonsterLevelForItemLevel(firstMaterial.Group, firstMaterial.Number, searchLevel);
+            if (firstMinLevel > playerLevel)
+            {
+                continue;
+            }
+
+            // 找到第一个材料的掉落来源
+            var firstSources = this.GetDropSources(firstMaterial.Group, firstMaterial.Number)
+                .Where(s => s.ItemLevel == searchLevel)
+                .ToList();
+            if (firstSources.Count == 0)
+            {
+                continue;
+            }
+
+            // 验证第二个材料也能达到相同等级
+            if (eventMaterials.Count >= 2)
+            {
+                var secondMaterial = eventMaterials[1];
+                var secondLevels = this.GetAvailableMaterialLevels(secondMaterial.Group, secondMaterial.Number);
+                if (!secondLevels.Contains(searchLevel))
+                {
+                    continue;
+                }
+
+                var secondMinLevel = this.GetMinMonsterLevelForItemLevel(secondMaterial.Group, secondMaterial.Number, searchLevel);
+                if (secondMinLevel > playerLevel)
+                {
+                    continue;
+                }
+
+                var secondSources = this.GetDropSources(secondMaterial.Group, secondMaterial.Number)
+                    .Where(s => s.ItemLevel == searchLevel)
+                    .ToList();
+                if (secondSources.Count == 0)
+                {
+                    continue;
+                }
+            }
+
+            // 找到可用等级！用第一个材料的掉落信息
+            var source = firstSources[0];
+            this._logger.LogInformation(
+                "[MaterialKnowledge] 门票材料最佳等级: G{Group}N{Number} Lv.{Level} (MinMonLv={MinLv}) 由 {Monster} @ 地图#{Map} 掉落",
+                firstMaterial.Group,
+                firstMaterial.Number,
+                searchLevel,
+                firstMinLevel,
+                source.MonsterName,
+                source.MapNumber);
+
+            return new TicketDropInfo(
+                ItemGroup: firstMaterial.Group,
+                ItemNumber: firstMaterial.Number,
+                TargetLevel: searchLevel,
+                MonsterNumber: source.MonsterNumber,
+                MapNumber: source.MapNumber,
+                MonsterName: source.MonsterName,
+                MapName: source.MapName);
+        }
+
+        this._logger.LogWarning(
+            "[MaterialKnowledge] 玩家等级 {Level} 不足以刷取 {Type} Lv.{GameLevel} 所需的门票材料 (最高需求等级={MaxLv})",
+            playerLevel,
+            miniGameType,
+            gameLevel,
+            maxRequiredLevel);
+
+        return null;
+    }
 }
 
 /// <summary>
@@ -313,4 +708,17 @@ public record CraftingMaterial(int Group, int Number, string Name, int RequiredC
 /// <param name="MonsterName">怪兽名称.</param>
 /// <param name="MapNumber">地图编号.</param>
 /// <param name="MapName">地图名称.</param>
-public record DropSourceInfo(short MonsterNumber, string MonsterName, ushort MapNumber, string MapName);
+/// <param name="ItemLevel">材料等级（事件门票物品的 DropItemGroup.ItemLevel），默认 1.</param>
+public record DropSourceInfo(short MonsterNumber, string MonsterName, ushort MapNumber, string MapName, byte ItemLevel = 1);
+
+/// <summary>
+/// 门票材料掉落信息 — 告诉 AI 刷哪个怪、在哪刷、刷什么等级的材料。
+/// </summary>
+/// <param name="ItemGroup">物品组.</param>
+/// <param name="ItemNumber">物品编号.</param>
+/// <param name="TargetLevel">要刷的材料等级（对应 DropItemGroup.ItemLevel）.</param>
+/// <param name="MonsterNumber">目标怪物编号.</param>
+/// <param name="MapNumber">目标地图编号.</param>
+/// <param name="MonsterName">目标怪物名称.</param>
+/// <param name="MapName">目标地图名称.</param>
+public record TicketDropInfo(int ItemGroup, int ItemNumber, byte TargetLevel, short MonsterNumber, ushort MapNumber, string MonsterName, string MapName);

@@ -38,7 +38,7 @@ public sealed class MaterialFarmModule : IBehaviorSubModule
     public async ValueTask<StepResult> ExecuteStepAsync(MissionItem item)
     {
         // === 解析 Context 参数 ===
-        if (!TryGetContext(item, out var itemGroup, out var itemNumber, out var monsterNumber, out var mapNumber, out var requiredCount))
+        if (!TryGetContext(item, out var itemGroup, out var itemNumber, out var monsterNumber, out var mapNumber, out var requiredCount, out var targetLevel))
         {
             return StepResult.Failed;
         }
@@ -106,7 +106,7 @@ public sealed class MaterialFarmModule : IBehaviorSubModule
             if (inv is not null)
             {
                 var currentCount = inv.Items.Count(i =>
-                    i.Definition?.Group == itemGroup && i.Definition?.Number == itemNumber);
+                    i.Definition?.Group == itemGroup && i.Definition?.Number == itemNumber && i.Level == targetLevel);
 
                 if (currentCount > this._collectedCount)
                 {
@@ -132,6 +132,7 @@ public sealed class MaterialFarmModule : IBehaviorSubModule
 
     /// <summary>
     /// 从 MissionItem.Context 字典解析目标参数。
+    /// 新增 TargetLevel 参数（材料等级匹配）。
     /// </summary>
     private static bool TryGetContext(
         MissionItem item,
@@ -139,13 +140,15 @@ public sealed class MaterialFarmModule : IBehaviorSubModule
         out int itemNumber,
         out short monsterNumber,
         out ushort mapNumber,
-        out int requiredCount)
+        out int requiredCount,
+        out int targetLevel)
     {
         itemGroup = 0;
         itemNumber = 0;
         monsterNumber = 0;
         mapNumber = 0;
         requiredCount = 1;
+        targetLevel = 0;
 
         if (!item.Context.TryGetValue("ItemGroup", out var groupObj))
         {
@@ -195,6 +198,12 @@ public sealed class MaterialFarmModule : IBehaviorSubModule
         if (item.Context.TryGetValue("RequiredCount", out var countObj) && countObj is int count)
         {
             requiredCount = count;
+        }
+
+        // 解析 TargetLevel（材料等级），可选参数，默认 0（不限制等级）
+        if (item.Context.TryGetValue("TargetLevel", out var levelObj) && levelObj is int level)
+        {
+            targetLevel = level;
         }
 
         return true;

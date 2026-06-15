@@ -142,7 +142,7 @@ public sealed class CraftingModule : IBehaviorSubModule
         }
 
         // 还没放材料 → 从背包中找到合成材料移到 TemporaryStorage
-        var itemsMoved = await this.TryMoveCraftingMaterialsAsync().ConfigureAwait(false);
+        var itemsMoved = await this.TryMoveCraftingMaterialsAsync(item).ConfigureAwait(false);
         if (itemsMoved)
         {
             this._logger.LogInformation("[Crafting] 已移动合成材料到 TemporaryStorage");
@@ -227,12 +227,12 @@ public sealed class CraftingModule : IBehaviorSubModule
     /// <summary>
     /// 从背包中找到合成材料并移到 TemporaryStorage。
     /// 针对不同合成类型移动对应的材料到混沌合成机。
-    /// 门票合成: 恶魔眼(14,17) + 恶魔钥匙(14,18) + 混沌宝石(12,15)
+    /// 门票合成: 恶魔眼(14,17) + 恶魔钥匙(14,18) + 混沌宝石(12,15)，眼和钥匙等级必须匹配
     /// 翅膀合成: 洛克之羽(13,11) + 混沌宝石(12,15) + +4以上装备
     /// 混沌武器: +4以上装备 + 混沌宝石(12,15) 等
     /// 装备升级: 装备 + 祝福(12,14)/灵魂(12,13)/混沌(12,15)
     /// </summary>
-    private async ValueTask<bool> TryMoveCraftingMaterialsAsync()
+    private async ValueTask<bool> TryMoveCraftingMaterialsAsync(MissionItem item)
     {
         var inv = this._player.Inventory;
         if (inv is null) return false;
@@ -244,21 +244,10 @@ public sealed class CraftingModule : IBehaviorSubModule
             return true;
         }
 
-        // 门票合成: 恶魔眼 + 恶魔钥匙 + 混沌宝石
-        if (this._targetNpcNumber != ChaosGoblinNumber)
+        // 判断是否为门票合成任务
+        if (item.Id.StartsWith("craft_ticket_", StringComparison.OrdinalIgnoreCase))
         {
-            // 门票合成: 混沌宝石(12,15) 是最重要的
-            var moved = await this.TryMoveItemsByGroupAsync(inv, 12, 15).ConfigureAwait(false);
-            if (!moved)
-            {
-                this._logger.LogWarning("[Crafting] 背包中无混沌宝石，合成可能失败");
-                return false;
-            }
-
-            // 如果有其他材料也移过去
-            await this.TryMoveItemsByGroupAsync(inv, 14, 17).ConfigureAwait(false); // 恶魔眼
-            await this.TryMoveItemsByGroupAsync(inv, 14, 18).ConfigureAwait(false); // 恶魔钥匙
-            return true;
+            return await this.TryMoveTicketCraftingMaterialsAsync(inv).ConfigureAwait(false);
         }
 
         // 混沌合成 (默认): 混沌宝石(12,15)
@@ -277,6 +266,78 @@ public sealed class CraftingModule : IBehaviorSubModule
         await this._moveItemAction.MoveItemAsync(this._player, fromSlot, Storages.Inventory, 0, Storages.ChaosMachine)
             .ConfigureAwait(false);
         return true;
+    }
+
+    /// <summary>
+    /// 门票合成材料移动逻辑。
+    /// 需要: 混沌宝石(12,15) + 恶魔眼(14,17)某个Level L + 恶魔钥匙(14,18)同Level L。
+    /// 先移动混沌宝石，再找一对相同 Level 的眼+钥匙。
+    /// </summary>
+    private async ValueTask<bool> TryMoveTicketCraftingMaterialsAsync(IInventoryStorage inv)
+    {
+        // 1) 移动混沌宝石 (12,15) — 如果已经有了就跳过
+        var chaosItems = inv.Items.Where(i =>
+            i.Definition?.Group == 12 && i.Definition?.Number == 15 && i.Durability > 0).ToList();
+        if (chaosItems.Count == 0)
+        {
+            this._logger.LogWarning("[Crafting] 门票合成: 背包无混沌宝石");
+            return false;
+        }
+
+        var chaosMoved = false;
+        foreach (var chaos in chaosItems)
+        {
+            if (this._player.TemporaryStorage?.Items.Any(i =>
+                i.Definition?.Group == 12 && i.Definition?.Number == 15) == true)
+            {
+                chaosMoved = true;
+                break;
+            }
+
+            await this._moveItemAction.MoveItemAsync(this._player, chaos.ItemSlot, Storages.Inventory, 0, Storages.ChaosMachine)
+                .ConfigureAwait(false);
+            chaosMoved = true;
+            break; // 移一个就行
+        }
+
+        if (!chaosMoved)
+        {
+            return false;
+        }
+
+        // 2) 找一对相同Level的 Devil's Eye(14,17) + Devil's Key(14,18)
+        var allItems = inv.Items.Where(i => i.Durability > 0).ToList();
+        var eyes = allItems.Where(i => i.Definition?.Group == 14 && i.Definition?.Number == 17).ToList();
+        var keys = allItems.Where(i => i.Definition?.Group == 14 && i.Definition?.Number == 18).ToList();
+
+        if (eyes.Count == 0 || keys.Count == 0)
+        {
+            this._logger.LogWarning("[Crafting] 门票合成: 背包缺少恶魔眼或恶魔钥匙");
+            return false;
+        }
+
+        // 找相同 Level 的一对
+        foreach (var eye in eyes)
+        {
+            var matchingKey = keys.FirstOrDefault(k => k.Level == eye.Level);
+            if (matchingKey is null) continue;
+
+            // 移动恶魔眼
+            this._logger.LogInformation("[Crafting] 门票合成: 移动恶魔眼 Level {Level}", eye.Level);
+            await this._moveItemAction.MoveItemAsync(this._player, eye.ItemSlot, Storages.Inventory, 0, Storages.ChaosMachine)
+                .ConfigureAwait(false);
+
+            // 移动匹配的恶魔钥匙
+            this._logger.LogInformation("[Crafting] 门票合成: 移动恶魔钥匙 Level {Level} (与恶魔眼匹配)", matchingKey.Level);
+            await this._moveItemAction.MoveItemAsync(this._player, matchingKey.ItemSlot, Storages.Inventory, 0, Storages.ChaosMachine)
+                .ConfigureAwait(false);
+
+            return true;
+        }
+
+        // 没有找到匹配 Level 的一对
+        this._logger.LogWarning("[Crafting] 门票合成: 背包中恶魔眼和恶魔钥匙的等级不匹配");
+        return false;
     }
 
     /// <summary>
