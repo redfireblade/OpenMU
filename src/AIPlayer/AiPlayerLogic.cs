@@ -32,6 +32,18 @@ public sealed class AiPlayerLogic : IDisposable
     private readonly bool _stepMode;
     private int _tickCounter;
 
+    /// <summary>断线检测计数 — 连续检测到断线次数。</summary>
+    private int _disconnectStreak;
+
+    /// <summary>重连冷却：上次尝试重连时间。</summary>
+    private DateTime _lastReconnectAttempt = DateTime.MinValue;
+
+    /// <summary>重连冷却间隔。</summary>
+    private static readonly TimeSpan ReconnectCooldown = TimeSpan.FromSeconds(30);
+
+    /// <summary>断线确认阈值（连续检测到断线的 tick 次数，防误判）。</summary>
+    private const int DisconnectConfirmThreshold = 3; // ~1.2秒
+
     // Non-module periodic task state
     private DateTime _lastStatTick = DateTime.UtcNow;
 
@@ -212,6 +224,25 @@ public sealed class AiPlayerLogic : IDisposable
                 // [D2] Adaptive interval: extend to 1000ms when degraded, 400ms normal
                 var interval = 400;
                 await Task.Delay(interval, this._cts.Token).ConfigureAwait(false);
+
+                // 断线检测：在每 tick 前检查连接状态
+                if (!this._player.IsConnected)
+                {
+                    this._disconnectStreak++;
+                    if (this._disconnectStreak >= DisconnectConfirmThreshold
+                        && DateTime.UtcNow - this._lastReconnectAttempt >= ReconnectCooldown)
+                    {
+                        this._lastReconnectAttempt = DateTime.UtcNow;
+                        this._disconnectStreak = 0;
+                        this._player.Logger.LogWarning("[Reconnect] AI角色 {Char} 断线, 尝试重连...",
+                            this._player.SelectedCharacter?.Name);
+                        await this.TryReconnectAsync(this._cts.Token).ConfigureAwait(false);
+                    }
+
+                    continue;
+                }
+
+                this._disconnectStreak = 0;
                 await this.TickAsync().ConfigureAwait(false);
             }
         }
@@ -438,8 +469,39 @@ public sealed class AiPlayerLogic : IDisposable
     }
 
     /// <summary>
-    /// 检查另一个玩家是否与当前 AI 在同一队伍中。
+    /// 断线重连 — 检测到连接断开后尝试重新登录。
+    /// 保存进度 → 断旧连接 → 冷却等待 → 通过 AiPlayerManager 重新加载。
+    /// 在当前版本中，将重连请求委托给 AiPlayerManager（通过 IAiService）。
+    /// 作为兜底，RunLoop 在检测到断线后会等待冷却然后尝试重新初始化。
     /// </summary>
+    private async ValueTask TryReconnectAsync(CancellationToken ct)
+    {
+        var characterName = this._player.SelectedCharacter?.Name;
+        if (string.IsNullOrEmpty(characterName))
+        {
+            return;
+        }
+
+        try
+        {
+            this._player.Logger.LogInformation("[Reconnect] 开始断线重连: {Char}", characterName);
+
+            // 保存当前进度
+            await this._player.SaveProgressAsync().ConfigureAwait(false);
+
+            // 断开旧连接（释放地图资源）
+            await this._player.DisconnectAsync().ConfigureAwait(false);
+
+            // 停止当前循环 — RunLoop 会 catch OperationCanceledException 并退出
+            await this._cts.CancelAsync().ConfigureAwait(false);
+
+            this._player.Logger.LogInformation("[Reconnect] 断线处理完成，上层将重新创建 AI 角色");
+        }
+        catch (Exception ex)
+        {
+            this._player.Logger.LogError(ex, "[Reconnect] 重连失败: {Char}", characterName);
+        }
+    }
     private bool IsInSameParty(Player other)
     {
         var myParty = this._player.Party;

@@ -70,6 +70,7 @@ public sealed class HeartbeatService
     private DateTime? _deathStartTime;
     private int _taskTicks;
     private MissionItem? _lastTask; // 当前任务已执行 tick 数
+    private int _npcDialogTicks;    // NPC 对话已持续 tick 数
 
     // 事件驱动状态标志
     private bool _lowHpFlag;
@@ -227,14 +228,28 @@ public sealed class HeartbeatService
 
         // NPC 对话打开时，如果有活跃的 ScriptExecutor → 放行让脚本执行 quest 操作
         // 否则跳过（无脚本时的 NPC 对话无意义，防止卡死）
+        // 另设超时保护：NPC 对话持续超过 40 tick(~16秒)时自动关闭
         if (this._player.PlayerState.CurrentState == PlayerState.NpcDialogOpened)
         {
+            this._npcDialogTicks++;
+            if (this._npcDialogTicks > 40)
+            {
+                this._logger.LogWarning("[HB] ⏰ NPC 对话超时 ({Ticks}tick)，自动关闭", this._npcDialogTicks);
+                await this.CloseNpcDialogAsync().ConfigureAwait(false);
+                this._npcDialogTicks = 0;
+                return;
+            }
+
             if (this._scriptExecutor is null)
             {
                 this.SetActiveState("NPC对话");
                 return;
             }
             // 有脚本执行器时放行，让 ScriptExecutor 处理 quest accept/submit
+        }
+        else
+        {
+            this._npcDialogTicks = 0;
         }
 
         // === 3) 低血量恢复 ===
@@ -1061,6 +1076,15 @@ public sealed class HeartbeatService
     /// 手动复活 AI 玩家：当游戏引擎自动重生（~3秒）失败时作为 fallback。
     /// 通过 WarpToSafezoneAsync 将玩家传送到安全区，触发游戏引擎的复活流程。
     /// </summary>
+    /// <summary>
+    /// 使用 NPC 对话关闭动作关闭当前对话框。
+    /// </summary>
+    private async ValueTask CloseNpcDialogAsync()
+    {
+        var closeAction = new GameLogic.PlayerActions.CloseNpcDialogAction();
+        await closeAction.CloseNpcDialogAsync(this._player).ConfigureAwait(false);
+    }
+
     private async ValueTask RespawnPlayerAsync()
     {
         try
