@@ -4,6 +4,7 @@
 
 namespace MUnique.OpenMU.AIPlayer.Decision;
 
+using Microsoft.Extensions.Logging;
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.Pathfinding;
@@ -17,6 +18,14 @@ public sealed class SurvivalMode : IBehaviorSubModule
     private readonly AiPlayer _player;
     private readonly IGameAdapter _adapter;
     private readonly ILogger _logger;
+
+    /// <summary>血量药水定义 (Group, Number)。</summary>
+    private static readonly (byte Group, short Number)[] HpPotions =
+    {
+        (14, 3),   // Large Healing
+        (14, 2),   // Medium Healing
+        (14, 1),   // Small Healing
+    };
 
     public string ModuleId => "survival";
 
@@ -37,10 +46,22 @@ public sealed class SurvivalMode : IBehaviorSubModule
         var maxHp = this._adapter.GetMaxHp();
         if (maxHp > 0 && (float)hp / maxHp < 0.4f)
         {
-            // 尝试使用最强可用药水 (slot 2=大红 1=中红 0=小红)
-            for (byte slot = 2; slot >= 0; slot--)
+            // 按药水质量从高到低搜背包（不硬编码格位）
+            var inv = this._player.Inventory;
+            if (inv is not null)
             {
-                await this._adapter.ConsumeItemAsync(slot).ConfigureAwait(false);
+                foreach (var (group, number) in HpPotions)
+                {
+                    try
+                    {
+                        var potion = inv.Items.FirstOrDefault(i =>
+                            i.Definition?.Group == group && i.Definition?.Number == number && i.Durability > 0);
+                        if (potion is null) continue;
+                        await this._adapter.ConsumeItemAsync(potion.ItemSlot).ConfigureAwait(false);
+                        break;
+                    }
+                    catch { /* slot no longer has item, try next */ }
+                }
             }
 
             // 重新读取血量（喝药后可能已恢复）
