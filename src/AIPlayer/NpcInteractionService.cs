@@ -13,6 +13,14 @@ public sealed class NpcInteractionService
 {
     private readonly AiPlayer _player;
     private readonly ILogger _logger;
+    private readonly MUnique.OpenMU.GameLogic.PlayerActions.Items.BuyNpcItemAction _buyAction = new();
+    private readonly MUnique.OpenMU.GameLogic.PlayerActions.CloseNpcDialogAction _closeAction = new();
+
+    /// <summary>商店中药水的物品槽位: 大红=0, 中红=1, 小红=2, 大蓝=3...</summary>
+    private static readonly byte[] PotionStoreSlots = { 0, 1, 2 };
+
+    /// <summary>修理 NPC 编号 (Potion Girl / Merchant)。</summary>
+    private const short RepairNpcNumber = 226; // Potion Girl 默认有修理功能 // 取决于 NPC 商店配置
 
     public NpcInteractionService(AiPlayer player, ILogger logger)
     {
@@ -75,8 +83,77 @@ public sealed class NpcInteractionService
     }
 
     public ValueTask<int> SellItemsAsync(AiPlayer player) => ValueTask.FromResult(0);
-    public ValueTask<bool> RepairAllEquipmentAsync(AiPlayer player) => ValueTask.FromResult(false);
-    public ValueTask<int> BuyPotionsAsync(AiPlayer player) => ValueTask.FromResult(0);
+
+    /// <summary>
+    /// 修理所有装备。需要先打开 NPC 对话（Potion Girl 或任何修理 NPC）。
+    /// </summary>
+    public async ValueTask<bool> RepairAllEquipmentAsync(AiPlayer player)
+    {
+        try
+        {
+            var repairAction = new GameLogic.PlayerActions.Items.ItemRepairAction();
+            // 依次修理所有已装备物品（Slot 0-11）
+            for (byte slot = 0; slot <= 11; slot++)
+            {
+                await repairAction.RepairItemAsync(player, slot).ConfigureAwait(false);
+            }
+            this._logger.LogInformation("[NpcService] ✅ 装备全部修理完成");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning("[NpcService] 装备修理失败: {Msg}", ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 从当前打开的 NPC 商店购买药水。
+    /// 寻找 Potion Girl(226) 或其他有药水的商店 NPC。
+    /// 购买的药水数量由 count 决定。
+    /// </summary>
+    public async ValueTask<int> BuyPotionsAsync(AiPlayer player, int count = 5)
+    {
+        if (player.OpenedNpc is null)
+        {
+            this._logger.LogWarning("[NpcService] 购买药水失败: 未打开 NPC 对话");
+            return 0;
+        }
+
+        var store = player.OpenedNpc.Definition?.MerchantStore;
+        if (store?.Items is null || store.Items.Count == 0)
+        {
+            this._logger.LogWarning("[NpcService] 购买药水失败: NPC #{Npc} 无商店",
+                player.OpenedNpc.Definition?.Number);
+            return 0;
+        }
+
+        var bought = 0;
+        var hpPotionsInStore = store.Items
+            .Where(i => i.Definition?.Group == 14 && i.Definition?.Number is >= 1 and <= 3)
+            .OrderBy(i => i.Definition!.Number) // 小→中→大红
+            .ToList();
+
+        if (hpPotionsInStore.Count == 0)
+        {
+            this._logger.LogDebug("[NpcService] NPC #{Npc} 商店无药水", player.OpenedNpc.Definition?.Number);
+            return 0;
+        }
+
+        foreach (var slot in hpPotionsInStore)
+        {
+            if (bought >= count) break;
+            await this._buyAction.BuyItemAsync(player, (byte)slot.ItemSlot).ConfigureAwait(false);
+            bought++;
+        }
+
+        if (bought > 0)
+        {
+            this._logger.LogInformation("[NpcService] ✅ 购买 {Count} 瓶药水", bought);
+        }
+
+        return bought;
+    }
 
     public async ValueTask CloseDialogAsync(AiPlayer player)
     {

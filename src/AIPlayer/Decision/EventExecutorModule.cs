@@ -141,6 +141,19 @@ public sealed class EventExecutorModule : IBehaviorSubModule
     }
 
     /// <summary>
+    /// 将活动入场事件任务从 HeartbeatService 发送到 EventWatcher 的 EventOpenEvent 链路。
+    /// 检查活动是否已开放（TryCheckMiniGameOpenAsync），未开放时设置 TargetMap 供传送。
+    /// </summary>
+    private async ValueTask<bool> TryEnsureEventOpenAsync(MiniGameType miniGameType, int gameLevel)
+    {
+        var miniGameDef = this.FindMiniGameDefinition(miniGameType, gameLevel);
+        if (miniGameDef is null) return false;
+
+        // 检查活动开放状态
+        return await this.TryCheckMiniGameOpenAsync(miniGameDef).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// 解析事件ID格式 "event_{Type}_{Level}"，例如 "event_BloodCastle_2".
     /// </summary>
     /// <param name="id">事件ID字符串.</param>

@@ -14,11 +14,14 @@ AI角色多任务优先级循环体系已基本建设完成。决策引擎是 6 
 **已完成的全天运行保障**:
 - P0-A: NPC对话超时自动关闭(40tick)
 - P0-B: 断线重连检测(3次确认+30s冷却)
+- P3-A: WarpPlanner 接入决策层(ExecuteCrossMapWarp 多跳路由)
+- P3-B: CraftingModule 泛化(多配方 NPC 支持 + 跨地图 NoTarget 联动)
+- P3-C: CraftingModule 决策联动(NoTarget → TargetMap → 传送 → 继续任务)
 - P0-C: 服务器端到端验证(EventWatcher/EventScanner/自动复活)
 
 ## 下一阶段任务 (按优先级排序)
 
-### ⚠️ 状态: 所有 P0/P1/P2 已完成 — 进入 P3
+### ⚠️ 当前: P0/P1/P2/P3 核心链路已完成 — 可进行全天运行测试
 
 ### P0: 活动入场全链路端到端验证
 

@@ -87,6 +87,34 @@ public sealed class HeartbeatService
     /// <summary>低血量阈值。</summary>
     private const float LowHpThreshold = 0.4f;
 
+    /// <summary>低法力阈值。</summary>
+    private const float LowMpThreshold = 0.25f;
+
+    /// <summary>血量药水定义 (Group, Number, Name)。</summary>
+    private static readonly (byte Group, short Number)[] HpPotions =
+    {
+        (14, 3),   // Large Healing
+        (14, 2),   // Medium Healing
+        (14, 1),   // Small Healing
+    };
+
+    /// <summary>法力药水定义 (Group, Number, Name)。</summary>
+    private static readonly (byte Group, short Number)[] MpPotions =
+    {
+        (14, 6),   // Large Mana
+        (14, 5),   // Medium Mana
+        (14, 4),   // Small Mana
+    };
+
+    /// <summary>药水冷却跟踪。</summary>
+    private DateTime _lastHpPotionTime = DateTime.MinValue;
+
+    /// <summary>法力药水冷却跟踪。</summary>
+    private DateTime _lastMpPotionTime = DateTime.MinValue;
+
+    /// <summary>药水冷却 (2秒)。</summary>
+    private static readonly TimeSpan PotionCooldown = TimeSpan.FromSeconds(2);
+
     /// <summary>AI 事件总线。</summary>
     public AiEventBus EventBus { get; } = new();
 
@@ -225,6 +253,11 @@ public sealed class HeartbeatService
             this._lowHpFlag = false;
             this._logger.LogInformation("[HB] ✅ 角色复活，重置决策状态");
             this.SetActiveState("复活恢复");
+
+            // === 1.5) 复活后补给：买药 + 修装备 ===
+            // 复活后传送回安全区，旁边通常有 Potion Girl(226)
+            // 先尝试补给，不影响下一个 tick 继续执行任务
+            await this.PostRespawnSupplyAsync().ConfigureAwait(false);
         }
 
         // === 2) 行走 / NPC 对话跳过 ===
@@ -256,7 +289,10 @@ public sealed class HeartbeatService
             this._npcDialogTicks = 0;
         }
 
-        // === 3) 低血量恢复 ===
+        // === 3) 低血量恢复 + 嗑药 ===
+        // 先在死亡/行走之前主动嗑药（无论当前什么状态）
+        await this.TryConsumePotionsAsync().ConfigureAwait(false);
+
         if (this._lowHpFlag || (maxHp > 0 && (float)hp / maxHp < LowHpThreshold))
         {
             this._lowHpFlag = false;
@@ -1217,6 +1253,112 @@ public sealed class HeartbeatService
             var warpAction = new GameLogic.PlayerActions.WarpAction();
             await warpAction.WarpToAsync(this._player, step.WarpInfo).ConfigureAwait(false);
             this._context.WarpInProgress = true;
+        }
+    }
+
+    /// <summary>
+    /// 尝试使用背包中的 HP/MP 药水。
+    /// 血量 < LowHpThreshold 时使用 HP 药水；法力 < LowMpThreshold 时使用 MP 药水。
+    /// 带 2 秒冷却防止连续嗑药浪费。
+    /// </summary>
+    private async ValueTask TryConsumePotionsAsync()
+    {
+        try
+        {
+            var inv = this._player.Inventory;
+            if (inv is null) return;
+
+            var maxHp = this._adapter.GetMaxHp();
+            var hp = this._adapter.GetCurrentHp();
+            var maxMp = this._adapter.GetMaxMp();
+            var mp = this._adapter.GetCurrentMp();
+            var now = DateTime.UtcNow;
+
+            // HP 药水
+            if (maxHp > 0 && (float)hp / maxHp < LowHpThreshold
+                && now - this._lastHpPotionTime >= PotionCooldown)
+            {
+                foreach (var (group, number) in HpPotions)
+                {
+                    var potion = inv.Items.FirstOrDefault(i =>
+                        i.Definition?.Group == group && i.Definition?.Number == number && i.Durability > 0);
+                    if (potion is null) continue;
+
+                    await this._adapter.ConsumeItemAsync(potion.ItemSlot).ConfigureAwait(false);
+                    this._lastHpPotionTime = now;
+                    this._logger.LogDebug("[HB] ❤️ 使用 HP 药水 (G{Group}N{Number})", group, number);
+                    break;
+                }
+            }
+
+            // MP 药水
+            if (maxMp > 0 && (float)mp / maxMp < LowMpThreshold
+                && now - this._lastMpPotionTime >= PotionCooldown)
+            {
+                foreach (var (group, number) in MpPotions)
+                {
+                    var potion = inv.Items.FirstOrDefault(i =>
+                        i.Definition?.Group == group && i.Definition?.Number == number && i.Durability > 0);
+                    if (potion is null) continue;
+
+                    await this._adapter.ConsumeItemAsync(potion.ItemSlot).ConfigureAwait(false);
+                    this._lastMpPotionTime = now;
+                    this._logger.LogDebug("[HB] 💙 使用 MP 药水 (G{Group}N{Number})", group, number);
+                    break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning("[HB] 嗑药失败: {Msg}", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 复活后补给：购买药水 + 修理装备。
+    /// 复活后通常在安全区，Potion Girl (NPC #226) 在旁边。
+    /// 自动寻找并交互。
+    /// </summary>
+    private async ValueTask PostRespawnSupplyAsync()
+    {
+        try
+        {
+            var map = this._adapter.GetCurrentMap();
+            if (map is null) return;
+
+            var npc = map.GetNpcsInRange(this._player.Position, 50)
+                .FirstOrDefault(n => n.Definition?.Number == 226
+                                  || n.Definition?.Number == 240
+                                  || n.Definition?.Number == 233);
+            if (npc is null)
+            {
+                this._logger.LogDebug("[HB] 复活补给: 附近无商店NPC");
+                return;
+            }
+
+            if (this._player.Position.EuclideanDistanceTo(npc.Position) > 3f)
+            {
+                await this._adapter.WalkToAsync(
+                    new Point((byte)npc.Position.X, (byte)npc.Position.Y), map).ConfigureAwait(false);
+                return;
+            }
+
+            if (this._player.OpenedNpc != npc)
+            {
+                var talkAction = new GameLogic.PlayerActions.TalkNpcAction();
+                await talkAction.TalkToNpcAsync(this._player, npc).ConfigureAwait(false);
+                return;
+            }
+
+            await this._npcService.RepairAllEquipmentAsync(this._player).ConfigureAwait(false);
+            await this._npcService.BuyPotionsAsync(this._player, 10).ConfigureAwait(false);
+
+            await this.CloseNpcDialogAsync().ConfigureAwait(false);
+            this._logger.LogInformation("[HB] ✅ 复活补给完成 (修理+买药)");
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning("[HB] 复活补给失败: {Msg}", ex.Message);
         }
     }
 
