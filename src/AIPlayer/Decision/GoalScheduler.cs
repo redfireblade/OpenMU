@@ -4,6 +4,8 @@
 
 namespace MUnique.OpenMU.AIPlayer.Decision;
 
+using System.IO;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
@@ -22,6 +24,12 @@ using Microsoft.Extensions.Logging;
 /// 每日激活逻辑:
 ///   登录时/每60秒: 检查所有目标 → 未完成的优先级高的 → 生成 MissionItem 到 BoardState
 ///   目标完成逻辑: 检测触发条件(如等级达到、捡到装备、金币达标)
+///
+/// 持久化:
+///   目标定义(含 lambda)不可序列化，只持久化进度数据：
+///   - 已跳过的 GoalId (连续失败)
+///   - 已完成标记的 GoalId (来自 IsCompleted 检测)
+///   数据保存在 aiplayer_data/goals_{characterId}.json
 /// </summary>
 public sealed class GoalScheduler
 {
@@ -30,6 +38,7 @@ public sealed class GoalScheduler
     private readonly ILogger _logger;
     private readonly Dictionary<string, AiGoal> _goals = new();
     private readonly HashSet<string> _skippedGoalIds = new();
+    private readonly HashSet<string> _completedGoalIds = new();
     private DateTime _lastEvaluation = DateTime.MinValue;
     private static readonly TimeSpan EvaluationInterval = TimeSpan.FromSeconds(60);
 
@@ -46,6 +55,94 @@ public sealed class GoalScheduler
         this._player = player;
         this._adapter = adapter;
         this._logger = logger;
+        this.Load();
+    }
+
+    // ===================== 持久化 =====================
+
+    /// <summary>
+    /// 获取持久化存储路径: aiplayer_data/goals_{characterId}.json
+    /// 使用角色名（短ID）防止跨角色干扰。
+    /// </summary>
+    private string GetSavePath()
+    {
+        var characterId = this._player.SelectedCharacter?.Id.ToString("N")[..8] ?? "default";
+        return Path.Combine("aiplayer_data", $"goals_{characterId}.json");
+    }
+
+    /// <summary>
+    /// 从磁盘加载之前保存的进度数据（跳过/完成标记）。
+    /// 不覆盖 _goals Dictionary（lambda 条件由代码定义）。
+    /// </summary>
+    private void Load()
+    {
+        try
+        {
+            var path = this.GetSavePath();
+            if (!File.Exists(path))
+            {
+                return;
+            }
+
+            var json = File.ReadAllText(path);
+            var data = JsonSerializer.Deserialize<GoalProgressData>(json);
+            if (data is null)
+            {
+                return;
+            }
+
+            this._skippedGoalIds.Clear();
+            foreach (var id in data.SkippedGoalIds)
+            {
+                this._skippedGoalIds.Add(id);
+            }
+
+            this._completedGoalIds.Clear();
+            foreach (var id in data.CompletedGoalIds)
+            {
+                this._completedGoalIds.Add(id);
+            }
+
+            this._logger.LogInformation(
+                "[GoalScheduler] 已加载持久化数据: skipped={Skipped}, completed={Completed}",
+                this._skippedGoalIds.Count,
+                this._completedGoalIds.Count);
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning("[GoalScheduler] 读取持久化数据失败: {Msg}", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 将跳过的/完成的 GoalId 保存到磁盘。
+    /// 每次标记变更后自动调用。
+    /// </summary>
+    private void Save()
+    {
+        try
+        {
+            var path = this.GetSavePath();
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            var data = new GoalProgressData
+            {
+                SkippedGoalIds = this._skippedGoalIds.ToList(),
+                CompletedGoalIds = this._completedGoalIds.ToList(),
+                LastSavedAt = DateTime.UtcNow,
+            };
+
+            var json = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(path, json);
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning("[GoalScheduler] 写入持久化数据失败: {Msg}", ex.Message);
+        }
     }
 
     /// <summary>
@@ -254,6 +351,7 @@ public sealed class GoalScheduler
         // 提取原始 goalId: "goal_quest_class_2" → "quest_class_2"
         var rawId = goalId.StartsWith("goal_") ? goalId[5..] : goalId;
         this._skippedGoalIds.Add(rawId);
+        this.Save();
         this._logger.LogWarning("[GoalScheduler] 目标 {Id} 已标记为跳过（连续失败）", rawId);
     }
 
@@ -303,18 +401,16 @@ public sealed class GoalScheduler
     {
         foreach (var goal in this._goals.Values)
         {
-            if (!goal.IsActive)
+            if (!goal.IsActive || this._completedGoalIds.Contains(goal.Id))
             {
-                // 检查是否已进入激活区间
-                var currentLevel = this._adapter.GetPlayerLevel();
-                foreach (var range in GoalLevelRanges)
-                {
-                    if (currentLevel >= range.Min && currentLevel <= range.Max)
-                    {
-                        // Don't auto-activate; the AddGoalIfRelevant pattern already set IsActive correctly
-                    }
-                }
+                continue;
+            }
 
+            if (goal.IsCompleted(this._player))
+            {
+                this._completedGoalIds.Add(goal.Id);
+                this.Save();
+                this._logger.LogInformation("[GoalScheduler] ✅ 目标已完成: {Id}「{Title}」", goal.Id, goal.Title);
                 continue;
             }
 
@@ -465,4 +561,20 @@ public enum GoalCategory
 
     /// <summary>合成/强化目标 — 如"武器+7"。</summary>
     Craft,
+}
+
+/// <summary>
+/// GoalScheduler 的持久化数据结构。
+/// 只序列化可持久化的进度标记。
+/// </summary>
+public sealed class GoalProgressData
+{
+    /// <summary>连续失败被跳过的 GoalId。</summary>
+    public List<string> SkippedGoalIds { get; init; } = new();
+
+    /// <summary>已完成的目标 Id。</summary>
+    public List<string> CompletedGoalIds { get; init; } = new();
+
+    /// <summary>上次保存时间。</summary>
+    public DateTime LastSavedAt { get; init; }
 }

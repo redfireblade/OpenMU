@@ -21,41 +21,56 @@ public sealed class TransactionMonitor
     private readonly ILogger _logger;
 
     /// <summary>出售关键字。</summary>
-    private static readonly string[] SellKeywords = { "出售", "卖", "出", "甩", "便宜出", "处理" };
+    private static readonly string[] SellKeywords = { "出售", "卖", "出", "甩", "便宜出", "处理", "清仓", "大甩卖", "跳楼价", "特价", "亏本出" };
 
     /// <summary>收购关键字。</summary>
-    private static readonly string[] BuyKeywords = { "收购", "收", "求购", "收个", "无限收" };
+    private static readonly string[] BuyKeywords = { "收购", "收", "求购", "收个", "无限收", "长期收", "高价收", "收套", "收把", "收件" };
 
     /// <summary>确认成交关键字。</summary>
-    private static readonly string[] DealKeywords = { "已出", "已售", "已收", "成交" };
+    private static readonly string[] DealKeywords = { "已出", "已售", "已收", "成交", "出了", "收了", "卖了", "已买" };
+
+    /// <summary>
+    /// 促销模式关键字。
+    /// </summary>
+    private static readonly string[] PromotionKeywords = { "打包", "半价", "买一送一", "套餐", "全套", "带价密", "带价来" };
+
+    /// <summary>
+    /// 货币单位（含俗写/简写）。
+    /// </summary>
+    private static readonly string[] CurrencyUnits = { "祝福", "灵魂", "生命", "创造", "玛雅", "zen", "Z", "RMB", "元", "r", "R", "游戏币", "金币" };
 
     /// <summary>
     /// 出售正则: 出售/卖/出/甩 + 物品名 + 价格 + 货币单位(可选)。
+    /// 支持促销模式: "打包", "半价", "套餐"。
+    /// 支持多货币: 祝福/灵魂/生命/创造/玛雅/zen/RMB/元/游戏币。
+    /// 支持后缀: "万", "k", "K"。
     /// </summary>
     private static readonly Regex SellPattern = new(
-        @"^(出售|卖|出|甩|处理|便宜出)\s*(.+?)\s*(\d+)(?:万|k|K)?\s*(祝福|灵魂|zen|Z|游戏币)?$",
+        @"^(出售|卖|出|甩|处理|便宜出|清仓|大甩卖|跳楼价|特价|亏本出)\s*(.+?)\s*(\d+[.,]?\d*)\s*(万|k|K)?\s*(祝福|灵魂|生命|创造|玛雅|zen|Z|RMB|元|r|R|游戏币|金币)?\s*(打包|半价|套餐|全套)?$",
         RegexOptions.Compiled);
 
     /// <summary>
     /// 收购正则: 收购/收/求购 + 物品名 + 价格。
+    /// 支持套装/多件: "收套+7白金", "收件1级翅膀"。
     /// </summary>
     private static readonly Regex BuyPattern = new(
-        @"^(收购|收|求购|收个|无限收)\s*(.+?)\s*(\d+)(?:万|k|K)?\s*(祝福|灵魂|zen|Z|游戏币)?$",
+        @"^(收购|收|求购|收个|无限收|长期收|高价收|收套|收把|收件)\s*(.+?)\s*(\d+[.,]?\d*)\s*(万|k|K)?\s*(祝福|灵魂|生命|创造|玛雅|zen|Z|RMB|元|r|R|游戏币|金币)?$",
         RegexOptions.Compiled);
 
     /// <summary>
     /// 物品+价格解析: 包含+符号的出售消息或用/分割的报价。
+    /// 带附属性描述: +7幸运卓越传说杖 3 祝福。
     /// </summary>
     private static readonly Regex ItemPricePattern = new(
-        @"([+]\d*\s*\S+|[一-鿿]{2,10})\s*(\d+)(?:万|k|K)?\s*(祝福|灵魂|zen|Z)?",
+        @"([+]\d*\s*\S+(?:[\s\+\/]\S+)*|[一-鿿]{2,20})\s*(\d+[.,]?\d*)\s*(万|k|K)?\s*(祝福|灵魂|生命|创造|玛雅|zen|Z|RMB|元|r|R|游戏币|金币)?",
         RegexOptions.Compiled);
 
     /// <summary>
-    /// 中物品名 → MarketPriceService key 映射表。
+    /// 中物品名 → MarketPriceService key 映射表 (100+ 条目)。
     /// </summary>
     private static readonly Dictionary<string, string> ChineseNameToKey = new()
     {
-        // 宝石类
+        // ===== 宝石类 =====
         { "祝福", "JewelOfBless" },
         { "祝福宝石", "JewelOfBless" },
         { "灵魂", "JewelOfSoul" },
@@ -67,30 +82,173 @@ public sealed class TransactionMonitor
         { "创造宝石", "JewelOfCreation" },
         { "生命", "JewelOfLife" },
         { "生命宝石", "JewelOfLife" },
+        { "守护", "JewelOfGuardian" },
+        { "守护宝石", "JewelOfGuardian" },
+        { "庇护", "JewelOfHarmony" },
+        { "庇护宝石", "JewelOfHarmony" },
+        { "再生", "JewelOfRefine" },
+        { "再生原石", "JewelOfRefine" },
+        { "再生宝石", "JewelOfRefine" },
+        { "高级魔石", "HighGradeStone" },
 
-        // 羽毛类
+        // ===== 羽毛/合成材料 =====
         { "洛克之羽", "FeatherOfLoch" },
         { "羽毛", "FeatherOfLoch" },
         { "神鹰羽毛", "FireHawkFeather" },
         { "大天使之羽", "FeatherOfAngel" },
+        { "天使羽毛", "FeatherOfAngel" },
         { "神鹰火种", "FireHawkSeed" },
+        { "火种", "FireHawkSeed" },
+        { "玛雅之石", "StoneOfMaya" },
 
-        // 入场材料
+        // ===== 入场材料 =====
         { "血骨", "G12N19" },
         { "血骨+0", "G12N19" },
         { "血骨+1", "G12N20" },
+        { "血骨+2", "G12N21" },
+        { "血骨+3", "G12N22" },
         { "天使卷轴", "G12N27" },
         { "天使", "G12N27" },
+        { "大天使卷轴", "G12N27" },
+        { "恶魔之钥", "DevilKey" },
+        { "恶魔眼", "DevilEye" },
+        { "恶魔钥匙", "DevilKey" },
         { "黄金文章", "GoldenText" },
+        { "金文", "GoldenText" },
+        { "银章", "SilverBadge" },
+        { "勋章", "Medal" },
 
-        // 翅膀
+        // ===== 低级装备 =====
+        { "短剑", "ShortSword" },
+        { "波刃剑", "SwordOfAssassin" },
+        { "传说之剑", "LegendarySword" },
+        { "传说杖", "LegendaryStaff" },
+        { "传说", "LegendaryStaff" },
+        { "骷髅杖", "BoneStaff" },
+        { "骷髅", "BoneStaff" },
+        { "复活之杖", "StaffOfResurrection" },
+        { "复活", "StaffOfResurrection" },
+        { "天罚之杖", "StaffOfHeavenlyPunishment" },
+        { "天罚", "StaffOfHeavenlyPunishment" },
+        { "死神之杖", "ScytheOfDeath" },
+        { "死神", "ScytheOfDeath" },
+        { "大天使之杖", "StaffOfArchangel" },
+        { "大天使杖", "StaffOfArchangel" },
+        { "破坏之剑", "SwordOfDestruction" },
+        { "破坏", "SwordOfDestruction" },
+        { "屠龙刀", "DragonBlade" },
+        { "屠龙", "DragonBlade" },
+        { "龙骨", "DragonBoneBlade" },
+        { "龙骨巨晶剑", "DragonBoneBlade" },
+
+        // ===== 高级武器 =====
+        { "暴风锯齿", "StormBlade" },
+        { "暴风", "StormBlade" },
+        { "玄冰", "FrozenBlade" },
+        { "玄冰剑", "FrozenBlade" },
+        { "烈火", "BlazingBlade" },
+        { "烈火刀", "BlazingBlade" },
+        { "帝王之剑", "EmperorSword" },
+        { "帝王", "EmperorSword" },
+        { "圣天使", "HolyAngelWeapon" },
+        { "圣天使武器", "HolyAngelWeapon" },
+        { "暗黑", "DarkWeapon" },
+        { "暗黑武器", "DarkWeapon" },
+
+        // ===== 防具 =====
+        { "龙王", "DragonSet" },
+        { "龙王套", "DragonSet" },
+        { "龙王装", "DragonSet" },
+        { "传说套", "LegendarySet" },
+        { "传说装", "LegendarySet" },
+        { "白金", "PlatinumSet" },
+        { "白金套", "PlatinumSet" },
+        { "白金装", "PlatinumSet" },
+        { "翡翠", "EmeraldSet" },
+        { "翡翠套", "EmeraldSet" },
+        { "翡翠装", "EmeraldSet" },
+        { "魔王", "DemonSet" },
+        { "魔王套", "DemonSet" },
+        { "魔王装", "DemonSet" },
+        { "骷髅套", "BoneSet" },
+        { "骷髅装", "BoneSet" },
+        { "藤蔓", "VineSet" },
+        { "藤蔓套", "VineSet" },
+        { "藤蔓装", "VineSet" },
+        { "天蚕", "SilkSet" },
+        { "天蚕套", "SilkSet" },
+        { "天蚕装", "SilkSet" },
+        { "风装", "WindSet" },
+        { "风套", "WindSet" },
+        { "精灵", "ElfSet" },
+        { "精灵套", "ElfSet" },
+        { "精灵装", "ElfSet" },
+        { "红翼", "RedWingSet" },
+        { "红翼套", "RedWingSet" },
+        { "蓝翼", "BlueWingSet" },
+        { "蓝翼套", "BlueWingSet" },
+        { "圣灵", "HolySpiritSet" },
+        { "圣灵装", "HolySpiritSet" },
+        { "圣灵套", "HolySpiritSet" },
+
+        // ===== 翅膀 =====
         { "1级翅膀", "WingLevel1" },
+        { "1翅", "WingLevel1" },
         { "2级翅膀", "WingLevel2" },
+        { "2翅", "WingLevel2" },
         { "3级翅膀", "WingLevel3" },
+        { "3翅", "WingLevel3" },
+        { "恶魔之翼", "WingLevel2" },
+        { "天使之翼", "WingLevel2" },
+        { "精灵之翼", "WingLevel2" },
+        { "暴风之翼", "WingLevel3" },
+        { "时空之翼", "WingLevel3" },
+        { "幻影之翼", "WingLevel3" },
+        { "暗黑之翼", "WingLevel3" },
+        { "圣灵之翼", "WingLevel3" },
+        { "卓越之翼", "WingLevel3" },
 
-        // 再生
-        { "再生", "JewelOfRefine" },
-        { "再生原石", "JewelOfRefine" },
+        // ===== 卓越装备关键词 =====
+        { "卓越", "ExcellentItem" },
+        { "幸运", "LuckyItem" },
+        { "追月", "MoonlightItem" },
+        { "暗杀", "AssassinItem" },
+        { "巨石", "GiantItem" },
+        { "幻月", "PhantomMoon" },
+
+        // ===== 消耗品 =====
+        { "大红", "BigHP" },
+        { "大瓶红", "BigHP" },
+        { "中红", "MediumHP" },
+        { "小红", "SmallHP" },
+        { "大蓝", "BigMP" },
+        { "大瓶蓝", "BigMP" },
+        { "中蓝", "MediumMP" },
+        { "小蓝", "SmallMP" },
+        { "酒", "Alcohol" },
+        { "苹果", "Apple" },
+        { "回城卷轴", "TownPortalScroll" },
+        { "回城", "TownPortalScroll" },
+        { "移动卷轴", "MoveScroll" },
+        { "移动", "MoveScroll" },
+
+        // ===== 宠物/坐骑 =====
+        { "天鹰", "Eagle" },
+        { "黑马", "DarkHorse" },
+        { "黑王马", "DarkHorse" },
+        { "彩云兽", "CloudBeast" },
+        { "兽角", "BeastHorn" },
+
+        // ===== 通用属性/符咒 =====
+        { "+7", "Plus7Item" },
+        { "+9", "Plus9Item" },
+        { "+11", "Plus11Item" },
+        { "+13", "Plus13Item" },
+        { "+15", "Plus15Item" },
+        { "幸运符", "LuckyCharm" },
+        { "符咒", "Charm" },
+        { "守护符", "GuardCharm" },
+        { "经验符", "ExpCharm" },
     };
 
     /// <summary>

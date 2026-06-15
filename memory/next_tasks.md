@@ -9,7 +9,17 @@
 
 AI角色多任务优先级循环体系已基本建设完成。决策引擎是 6 层架构（Active → Unblock → Failed → GenerateMissions → Pending → Fallback），配合 EventWatcherService 主动广播、EventInterruptService 抢占决策、VaultService 仓库存取、CraftingModule/EventExecutorModule 执行模块。
 
-当前已验证：6层决策循环、事件门票条件任务链、仓库检查、EventWatcher 活动状态检测正确工作（日志确认广播 `NotStarted` 状态）。
+当前已验证：6层决策循环、事件状态扫描（NotStarted正确跳过/不注入）、仓库检查、死循环兜底、DropsInRange管线、ScavengeForCrafting合成扫描。
+
+**已验证的 P0 修复**:
+1. SystemEventScanner 异步状态检测 → 跳过 NotStarted 事件注入
+2. MissionBoardService Phase 2 移除 MiniGame 预注入
+3. 服务器实测：NotStarted 时不触发 EventExec 入场
+4. AI 正常执行狩猎任务而非错误入场
+
+**已完成的 P2**:
+- GoalScheduler 数据持久化（JSON aiplayer_data/goals_{charId}.json，跳过/完成标记）
+- TransactionMonitor 扩展至 100+ 物品名映射、支持 RMB/元/打包价/半价/套装属性
 
 ## 下一阶段任务 (按优先级排序)
 
