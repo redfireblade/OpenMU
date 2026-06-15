@@ -23,10 +23,23 @@ AI角色多任务优先级循环体系已基本建设完成。决策引擎是 6 
 - 装备修理(RepairAllEquipmentAsync)
 - 任务道具合成链路修复(统一ChaosGoblin, 按类型选mixType)
 - 服务器端到端验证(EventWatcher/EventScanner/自动复活)
+- 死亡状态卡死修复(IsAlive+PlayerState.Dead检测绕过)
+- Web UI Decision Log可见决策记录(RecordDecision三条路径全接入)
+- 行走tick不覆盖空白snapshot(保持上一tick决策日志)
+
+## 本会话验证结果 (2026-06-16)
+
+**服务器实测证实:**
+1. ✅ **死亡修复生效** — DecisionTest AI从永久死亡恢复(Tick 1820+, HP 980/980)
+2. ✅ **活动中断链完整** — EventWatcher检测到Chaos Castle 3开放 → EventOpenEvent → OnEventOpen → ShouldInterruptForEvent → Inject farm_ticket任务
+3. ✅ **Web UI Decision Log可见** — quest_executor/heartbeat等决策记录正确显示
+4. ✅ **3个ScriptExec AI正常运行** — 狩猎/嗑药/巡逻/交任务全链路
+5. ✅ **自动嗑药再次确认** — 6次独立嗑药记录(Small+Medium Healing Potion)
+6. ⚠️ **合成端到端未完整测试** — 注入farm_ticket任务成功，但AI缺少合成材料和金币(Chaos Castle入场费15万)
 
 ## 下一阶段任务 (按优先级排序)
 
-### ✅ 所有 P0/P1/P2/P3 核心保障已完成 — 当前无未完成任务
+### ⚠️ 当前: P0/P1/P2/P3 全部完成 — 核心链路已验证
 
 ### P0: 活动入场全链路端到端验证
 
