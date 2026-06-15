@@ -84,8 +84,8 @@ public sealed class HeartbeatService
     /// <summary>熔断阈值。</summary>
     private const int NoTargetCircuitBreaker = 30;
 
-    /// <summary>低血量阈值。</summary>
-    private const float LowHpThreshold = 0.4f;
+    /// <summary>低血量阈值 — 提升到 60% 以便在危险地图有足够反应时间。</summary>
+    private const float LowHpThreshold = 0.6f;
 
     /// <summary>低法力阈值。</summary>
     private const float LowMpThreshold = 0.25f;
