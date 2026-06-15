@@ -226,7 +226,7 @@ public sealed class HeartbeatService
         this.DetectStateChanges(hp, maxHp);
 
         // === 1) 死亡检测 + 自动重生 fallback ===
-        if (hp <= 0)
+        if (hp <= 0 || !this._player.IsAlive)
         {
             this._wasDead = true;
             this._deathStartTime ??= DateTime.UtcNow;
@@ -246,8 +246,22 @@ public sealed class HeartbeatService
 
         this._deathStartTime = null;
 
-        if (this._wasDead)
+        // 强制复活检测：当 HP > 0 但 IsAlive=false 或 PlayerState 卡在 Dead 时
+        // （例如通过 API set-hp 强行补血后，游戏引擎未触发重生流程）
+        if (this._wasDead || !this._player.IsAlive ||
+            this._player.PlayerState.CurrentState == GameLogic.PlayerState.Dead ||
+            this._player.PlayerState.CurrentState.IsDisconnectedOrFinished())
         {
+            this._wasDead = false;
+            this._deathStartTime = null;
+            this._player.IsAlive = true;
+
+            // 尝试恢复 PlayerState
+            if (this._player.PlayerState.CurrentState == GameLogic.PlayerState.Dead ||
+                this._player.PlayerState.CurrentState.IsDisconnectedOrFinished())
+            {
+                await this._player.PlayerState.TryAdvanceToAsync(GameLogic.PlayerState.EnteredWorld).ConfigureAwait(false);
+            }
             this._wasDead = false;
             this._idleTicks = 0;
             this._noTargetStreak = 0;
