@@ -274,9 +274,9 @@ public sealed class AiPlayerLogic : IDisposable
         var logger = this._player.Logger;
         this._context.BeginTickRecording(this._tickCounter, this._adapter.GetPlayerPosition());
 
+        // 行走中的tick不创建新snapshot（保留上一tick的决策日志）
         if (this._adapter.IsPlayerWalking())
         {
-            this.RecordEndOfTickSnapshot();
             return;
         }
 
