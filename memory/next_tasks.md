@@ -11,17 +11,14 @@ AI角色多任务优先级循环体系已基本建设完成。决策引擎是 6 
 
 当前已验证：6层决策循环、事件状态扫描（NotStarted正确跳过/不注入）、仓库检查、死循环兜底、DropsInRange管线、ScavengeForCrafting合成扫描。
 
-**已验证的 P0 修复**:
-1. SystemEventScanner 异步状态检测 → 跳过 NotStarted 事件注入
-2. MissionBoardService Phase 2 移除 MiniGame 预注入
-3. 服务器实测：NotStarted 时不触发 EventExec 入场
-4. AI 正常执行狩猎任务而非错误入场
-
-**已完成的 P2**:
-- GoalScheduler 数据持久化（JSON aiplayer_data/goals_{charId}.json，跳过/完成标记）
-- TransactionMonitor 扩展至 100+ 物品名映射、支持 RMB/元/打包价/半价/套装属性
+**已完成的全天运行保障**:
+- P0-A: NPC对话超时自动关闭(40tick)
+- P0-B: 断线重连检测(3次确认+30s冷却)
+- P0-C: 服务器端到端验证(EventWatcher/EventScanner/自动复活)
 
 ## 下一阶段任务 (按优先级排序)
+
+### ⚠️ 状态: 所有 P0/P1/P2 已完成 — 进入 P3
 
 ### P0: 活动入场全链路端到端验证
 

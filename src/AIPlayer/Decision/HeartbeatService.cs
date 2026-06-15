@@ -58,6 +58,9 @@ public sealed class HeartbeatService
     /// <summary>仓库服务 — 检查/存取仓库物品。</summary>
     private readonly VaultService _vaultService;
 
+    /// <summary>跨地图路由规划器。</summary>
+    private readonly Warp.WarpPlanner _warpPlanner;
+
     /// <summary>看板脚本执行器 — 当前活跃任务的 ScriptExecutor。</summary>
     private ScriptExecutor? _scriptExecutor;
 
@@ -133,6 +136,7 @@ public sealed class HeartbeatService
         this._vaultService = new VaultService(player, logger);
 
         this._npcService = new NpcInteractionService(player, logger);
+        this._warpPlanner = new Warp.WarpPlanner(player.GameContext!.Configuration, logger);
         this._lastKnownHp = adapter.GetCurrentHp();
         this._lastKnownMaxHp = adapter.GetMaxHp();
         this._lastKnownLevel = adapter.GetPlayerLevel();
@@ -272,7 +276,22 @@ public sealed class HeartbeatService
             return;
         }
 
-        // === 5) NoTarget 熔断 ===
+        // === 5) NoTarget 熔断 + 跨地图传送检测 ===
+        // CraftingModule / EventExecutorModule 返回 NoTarget 时标记目标地图，
+        // 决策系统会切换到跨地图传送任务
+        if (this._context.TargetMapNumber.HasValue)
+        {
+            var targetMap = this._context.TargetMapNumber.Value;
+            var arrived = await this.ExecuteCrossMapWarpAsync(targetMap).ConfigureAwait(false);
+            if (!arrived)
+            {
+                this.SetActiveState($"传送至地图 #{targetMap}");
+                return;
+            }
+            this._logger.LogInformation("[HB] ✅ 到达目标地图 #{Map}，继续执行任务", targetMap);
+        }
+
+        if (this._noTargetStreak >= NoTargetCircuitBreaker)
         if (this._noTargetStreak >= NoTargetCircuitBreaker)
         {
             this._logger.LogWarning("[HB] 🔥 NoTarget 熔断: {Streak}次", this._noTargetStreak);
@@ -374,6 +393,15 @@ public sealed class HeartbeatService
                 this.MarkTaskFailed(current, current.FailureRetryable ? failReason : FailureReason.NotRetryable);
                 break;
             case StageResult.NoTarget:
+                // 模块返回 NoTarget 表示需要跨地图移动
+                // CraftingModule 在 NPC 不在当前地图时会返回 NoTarget 并设置 TargetMap
+                // EventExecutorModule 在活动不在当前地图时同样返回 NoTarget
+                if (this._context.TargetMapNumber.HasValue)
+                {
+                    this._logger.LogInformation("[HB] 🗺 {Title} 需要跨地图到 #{Target}，切换到传送", current.Title, this._context.TargetMapNumber.Value);
+                    break; // 让下一 tick 的跨地图检测执行传送
+                }
+
                 this._idleTicks++;
                 this._noTargetStreak++;
                 if (this._idleTicks > 15)
@@ -1083,6 +1111,113 @@ public sealed class HeartbeatService
     {
         var closeAction = new GameLogic.PlayerActions.CloseNpcDialogAction();
         await closeAction.CloseNpcDialogAsync(this._player).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 跨地图移动：使用 WarpPlanner 计算路线并执行多跳传送。
+    /// 如果当前有活跃路由，推进路由步骤。否则用 WarpPlanner 算新路由。
+    /// 路由完成后将 TargetMap 置 null。
+    /// </summary>
+    private async ValueTask<bool> ExecuteCrossMapWarpAsync(ushort targetMap)
+    {
+        var currentMapNum = (ushort)(this._adapter.GetCurrentMap()?.Definition.Number ?? 0);
+        if (currentMapNum == targetMap)
+        {
+            this._context.TargetMapNumber = null;
+            return true;
+        }
+
+        // 如果当前有活跃路由，先推进
+        if (this._context.ActiveWarpRoute is not null)
+        {
+            var stepIdx = this._context.ActiveWarpStepIndex;
+            var steps = this._context.ActiveWarpRoute.Steps;
+
+            if (stepIdx >= steps.Count)
+            {
+                // 路由完成
+                this._context.ActiveWarpRoute = null;
+                this._context.ActiveWarpStepIndex = 0;
+                this._context.TargetMapNumber = null;
+                this._logger.LogInformation("[WarpRoute] ✅ 跨图传送完成（目标地图 #{Map}）", targetMap);
+                return true;
+            }
+
+            // 检查当前是否在地图传送等待中
+            if (this._context.WarpInProgress)
+            {
+                // 等待地图切换完成
+                if (this._adapter.GetCurrentMap() is not null)
+                {
+                    this._context.WarpInProgress = false;
+                    this._context.ActiveWarpStepIndex++;
+                }
+                return false;
+            }
+
+            // 执行下一步
+            await this.ExecuteWarpStepAsync(steps[stepIdx]).ConfigureAwait(false);
+            return false;
+        }
+
+        // 没有活跃路由 → 计算新路由
+        var route = this._warpPlanner.ComputeRoute(
+            (short)currentMapNum,
+            (short)targetMap,
+            this._adapter.GetPlayerLevel(),
+            this._player.Money);
+
+        if (route is null || !route.IsFeasible)
+        {
+            this._logger.LogWarning("[WarpRoute] 无法找到从地图 #{From} 到 #{To} 的可行路线",
+                currentMapNum, targetMap);
+            return false;
+        }
+
+        this._context.ActiveWarpRoute = route;
+        this._context.ActiveWarpStepIndex = 0;
+        this._context.TargetMapNumber = targetMap;
+        this._logger.LogInformation("[WarpRoute] 开始跨图传送: {From}→{To} ({Steps}步, 金币={Gold})",
+            currentMapNum, targetMap, route.Steps.Count, route.TotalGoldCost);
+        return false;
+    }
+
+    /// <summary>
+    /// 执行路由单步（门传送或传送菜单）。
+    /// 复用 ScriptExecutor 的 ExecuteGateStepAsync / ExecuteWarpMenuStepAsync 逻辑。
+    /// </summary>
+    private async ValueTask ExecuteWarpStepAsync(Warp.WarpStep step)
+    {
+        if (step.Method == Warp.WarpEdgeType.Gate)
+        {
+            // 门传送：走到门中心 → 进门
+            var currentMap = this._adapter.GetCurrentMap();
+            if (currentMap is null) return;
+
+            var pos = this._adapter.GetPlayerPosition();
+            var atGate = Math.Abs(pos.X - step.GateCenter.X) <= 3
+                      && Math.Abs(pos.Y - step.GateCenter.Y) <= 3;
+
+            if (!atGate)
+            {
+                await this._adapter.WalkToAsync(step.GateCenter, currentMap).ConfigureAwait(false);
+                return;
+            }
+
+            if (step.EnterGate is not null)
+            {
+                var warpAction = new GameLogic.PlayerActions.WarpGateAction();
+                await warpAction.EnterGateAsync(this._player, step.EnterGate).ConfigureAwait(false);
+                this._context.WarpInProgress = true;
+            }
+        }
+        else if (step.WarpInfo is not null)
+        {
+            // 传送菜单：直接使用 WarpAction
+            var warpAction = new GameLogic.PlayerActions.WarpAction();
+            await warpAction.WarpToAsync(this._player, step.WarpInfo).ConfigureAwait(false);
+            this._context.WarpInProgress = true;
+        }
     }
 
     private async ValueTask RespawnPlayerAsync()
