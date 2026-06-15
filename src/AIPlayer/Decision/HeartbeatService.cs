@@ -12,6 +12,7 @@ using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.GameLogic.PlugIns.PeriodicTasks;
 using MUnique.OpenMU.Pathfinding;
 using MUnique.OpenMU.AIPlayer.Scripting;
+using System.Diagnostics;
 using MUnique.OpenMU.DataModel.Configuration.Quests;
 using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.GameLogic.Views;
@@ -370,6 +371,9 @@ public sealed class HeartbeatService
         this._taskTicks++;
         this.SetActiveState(current.Title);
 
+        // 记录决策日志
+        var decisionSw = Stopwatch.StartNew();
+
         // 任务级超时：一个任务执行太长时间也没推进 → 跳过
         const int maxTaskTicks = 2500; // ~16 分钟 @ 400ms/tick
         if (this._taskTicks > maxTaskTicks)
@@ -411,6 +415,11 @@ public sealed class HeartbeatService
         }
 
         var stageResult = await this.ExecuteCurrentStageAsync(current).ConfigureAwait(false);
+
+        // 记录决策到 BehaviorContext（供 Web UI 调试面板使用）
+        decisionSw.Stop();
+        this._context.RecordDecision(current.Module, decisionSw.Elapsed);
+
         switch (stageResult)
         {
             case StageResult.Completed:
