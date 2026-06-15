@@ -10,6 +10,7 @@ using MUnique.OpenMU.GameLogic.PlayerActions;
 using MUnique.OpenMU.GameLogic.PlayerActions.Items;
 using MUnique.OpenMU.Pathfinding;
 using Microsoft.Extensions.Logging;
+using MUnique.OpenMU.GameLogic.Views.NPC;
 
 /// <summary>
 /// 合成执行模块 — 驱动混沌合成流程。
@@ -128,7 +129,16 @@ public sealed class CraftingModule : IBehaviorSubModule
             var closeAction = new CloseNpcDialogAction();
             await closeAction.CloseNpcDialogAsync(this._player).ConfigureAwait(false);
             this._player.OpenedNpc = null;
-            return StepResult.Completed;
+
+            // 合成后验证：检查背包是否出现了目标物品（门票）
+            if (this.IsCraftingResultPresent(item))
+            {
+                this._logger.LogInformation("[Crafting] ✅ 合成成功！目标物品已出现在背包");
+                return StepResult.Completed;
+            }
+
+            this._logger.LogWarning("[Crafting] ❌ 合成失败（材料消耗但目标物品未出现）");
+            return StepResult.Failed;
         }
 
         // 还没放材料 → 从背包中找到合成材料移到 TemporaryStorage
@@ -281,6 +291,38 @@ public sealed class CraftingModule : IBehaviorSubModule
         await this._moveItemAction.MoveItemAsync(this._player, item.ItemSlot, Storages.Inventory, 0, Storages.ChaosMachine)
             .ConfigureAwait(false);
         return true;
+    }
+
+    /// <summary>
+    /// 合成后验证：检查背包是否有目标物品。
+    /// 从 MissionItem.Context["TicketItemGroup"] 和 ["TicketItemNumber"] 读取。
+    /// 如果 Context 中无定义，则不验证（返回 true 兼容旧版逻辑）。
+    /// </summary>
+    private bool IsCraftingResultPresent(MissionItem item)
+    {
+        if (!item.Context.TryGetValue("TicketItemGroup", out var groupObj) || groupObj is not int ticketGroup)
+        {
+            // 无目标物品定义 → 信任混和结果（旧版行为）
+            this._logger.LogDebug("[Crafting] 任务 {Id} Context 无 TicketItemGroup 定义，跳过验证", item.Id);
+            return true;
+        }
+
+        if (!item.Context.TryGetValue("TicketItemNumber", out var numObj) || numObj is not int ticketNumber)
+        {
+            return true;
+        }
+
+        var inv = this._player.Inventory;
+        if (inv is null) return false;
+
+        var hasTicket = inv.Items.Any(i =>
+            i.Definition?.Group == ticketGroup && i.Definition?.Number == ticketNumber && i.Durability > 0);
+
+        this._logger.LogInformation(
+            "[Crafting] 合成验证: 目标物品 G{Group}N{Number} {Status}",
+            ticketGroup, ticketNumber, hasTicket ? "✅ 存在" : "❌ 不存在");
+
+        return hasTicket;
     }
 
     /// <summary>记录实际合成类型，用于材料检查决策。</summary>

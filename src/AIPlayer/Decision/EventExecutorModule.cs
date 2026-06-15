@@ -41,6 +41,7 @@ public sealed class EventExecutorModule : IBehaviorSubModule
     private readonly ILogger _logger;
     private readonly EnterMiniGameAction _enterAction = new();
     private readonly BoardState _boardState;
+    private readonly MaterialKnowledgeService _materialKnowledge;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="EventExecutorModule"/> class.
@@ -49,12 +50,13 @@ public sealed class EventExecutorModule : IBehaviorSubModule
     /// <param name="adapter">The game adapter.</param>
     /// <param name="boardState">The mission board state for dependency injection.</param>
     /// <param name="logger">The logger.</param>
-    public EventExecutorModule(AiPlayer player, IGameAdapter adapter, BoardState boardState, ILogger logger)
+    public EventExecutorModule(AiPlayer player, IGameAdapter adapter, BoardState boardState, ILogger logger, MaterialKnowledgeService materialKnowledge)
     {
         this._player = player;
         this._adapter = adapter;
         this._boardState = boardState;
         this._logger = logger;
+        this._materialKnowledge = materialKnowledge;
     }
 
     /// <inheritdoc />
@@ -480,6 +482,11 @@ public sealed class EventExecutorModule : IBehaviorSubModule
             Module = "crafting_executor",
             FailureRetryable = true,
             MaxRepeatCount = -1,
+            Context = new Dictionary<string, object>
+            {
+                { "TicketItemGroup", miniGameDef.TicketItem?.Group ?? 0 },
+                { "TicketItemNumber", miniGameDef.TicketItem?.Number ?? 0 },
+            },
         };
 
         this._boardState.Missions.Add(craftingMission);
@@ -494,6 +501,7 @@ public sealed class EventExecutorModule : IBehaviorSubModule
 
     /// <summary>
     /// 注入打门票材料任务到看板，并将它设为事件任务的前置依赖。
+    /// 使用 MaterialKnowledgeService 获取每个材料的掉落来源，为缺少的材料创建独立的 material_farm 任务。
     /// </summary>
     private void EnsureTicketMaterialFarmingMissionExists(MiniGameDefinition miniGameDef, MissionItem eventItem)
     {
@@ -505,25 +513,104 @@ public sealed class EventExecutorModule : IBehaviorSubModule
             return;
         }
 
-        var farmingMission = new MissionItem
+        // 从材料知识服务获取需要刷的材料列表
+        var materials = this._materialKnowledge.GetTicketCraftingMaterials(miniGameDef.Type, miniGameDef.GameLevel);
+
+        // 对于每个缺少的材料，单独创建一个 farming 任务
+        // 只在背包中查找，只创建缺少材料的 farm 任务
+        if (materials.Count > 0)
         {
-            Id = missionId,
-            Title = $"收集{miniGameDef.Name}门票材料",
-            Priority = 11,           // 比合成(12)还高, 先打材料再合成
-            Type = MissionType.Survival,
-            Category = QuestCategory.AiCustom,
-            Module = "survival",
-            FailureRetryable = true,
-            MaxRepeatCount = 3,
-        };
+            var dependencies = new List<string>();
 
-        this._boardState.Missions.Add(farmingMission);
-        this._logger.LogInformation(
-            "[EventExec] 注入打材料任务 {Id} -> {Title}",
-            missionId,
-            farmingMission.Title);
+            foreach (var mat in materials)
+            {
+                // 跳过背包中已有的材料
+                var inv = this._player.Inventory;
+                var hasMaterial = inv?.Items.Any(i =>
+                    i.Definition?.Group == mat.Group && i.Definition?.Number == mat.Number && i.Durability > 0) == true;
 
-        // 设为事件任务的依赖
-        eventItem.Dependencies = new[] { missionId };
+                if (hasMaterial)
+                {
+                    continue;
+                }
+
+                // 查找掉落来源
+                var dropSources = this._materialKnowledge.GetDropSources(mat.Group, mat.Number);
+                if (dropSources.Count == 0)
+                {
+                    this._logger.LogWarning(
+                        "[EventExec] 不知道 {Name}({Group},{Number}) 的掉落来源, 跳过自动刷取",
+                        mat.Name, mat.Group, mat.Number);
+                    continue;
+                }
+
+                // 选第一个掉落来源
+                var source = dropSources[0];
+                var matMissionId = $"{missionId}_{mat.Group}_{mat.Number}";
+
+                var farmMission = new MissionItem
+                {
+                    Id = matMissionId,
+                    Title = $"刷取{mat.Name}",
+                    Priority = 11,
+                    Type = MissionType.ItemFarm,
+                    Category = QuestCategory.AiCustom,
+                    Module = "material_farm",
+                    FailureRetryable = true,
+                    MaxRepeatCount = 5,
+                    Context = new Dictionary<string, object>
+                    {
+                        { "ItemGroup", mat.Group },
+                        { "ItemNumber", mat.Number },
+                        { "MonsterNumber", source.MonsterNumber },
+                        { "MapNumber", (ushort)source.MapNumber },
+                        { "RequiredCount", mat.RequiredCount },
+                    },
+                };
+
+                this._boardState.Missions.Add(farmMission);
+                dependencies.Add(matMissionId);
+
+                this._logger.LogInformation(
+                    "[EventExec] 注入打材料任务 {Id} -> {Title} (怪物#{Monster} @地图#{Map})",
+                    matMissionId,
+                    farmMission.Title,
+                    source.MonsterNumber,
+                    source.MapNumber);
+            }
+
+            if (dependencies.Count > 0)
+            {
+                eventItem.Dependencies = dependencies.ToArray();
+            }
+            else
+            {
+                // 所有材料都有了 → 直接升级为合成任务
+                this.EnsureTicketCraftingMissionExists(miniGameDef, eventItem);
+            }
+        }
+        else
+        {
+            // 不知道需要什么材料 → 用旧的 survival 方式
+            var farmingMission = new MissionItem
+            {
+                Id = missionId,
+                Title = $"收集{miniGameDef.Name}门票材料",
+                Priority = 11,
+                Type = MissionType.Survival,
+                Category = QuestCategory.AiCustom,
+                Module = "survival",
+                FailureRetryable = true,
+                MaxRepeatCount = 3,
+            };
+
+            this._boardState.Missions.Add(farmingMission);
+            this._logger.LogInformation(
+                "[EventExec] 注入打材料(fallback)任务 {Id} -> {Title}",
+                missionId,
+                farmingMission.Title);
+
+            eventItem.Dependencies = new[] { missionId };
+        }
     }
 }

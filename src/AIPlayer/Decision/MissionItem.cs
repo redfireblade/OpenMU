@@ -52,6 +52,9 @@ public sealed class MissionItem
     /// <summary>要监听的事件类型，发生时会触发条件重评。</summary>
     public string[] TriggerEvents { get; set; } = Array.Empty<string>();
 
+    /// <summary>模块自定义上下文数据 (如 material_farm 用到的 ItemGroup/MonsterNumber 等)。</summary>
+    public Dictionary<string, object> Context { get; set; } = new();
+
     /// <summary>脚本引用 — 看板不生成脚本，只引用已存在的脚本。</summary>
     public BehaviorScript? Script { get; set; }
 

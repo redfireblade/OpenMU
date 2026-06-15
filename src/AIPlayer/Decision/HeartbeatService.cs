@@ -49,6 +49,8 @@ public sealed class HeartbeatService
     private CraftingModule _crafting;
     private EventExecutorModule _eventExecutor;
     private ItemPickupManager _itemPickupManager;
+    private MaterialKnowledgeService _materialKnowledge;
+    private MaterialFarmModule _materialFarm;
 
     /// <summary>事件活动广播器 — 监听活动事件开放/关闭状态。</summary>
     private readonly EventWatcherService _eventWatcher;
@@ -149,12 +151,15 @@ public sealed class HeartbeatService
         this._modules["survival"] = this._survival;
 
         this._crafting = new CraftingModule(player, adapter, logger);
-        this._eventExecutor = new EventExecutorModule(player, adapter, this._missionBoard.BoardState, logger);
+        this._materialKnowledge = new MaterialKnowledgeService(player.GameContext!.Configuration, logger);
+        this._eventExecutor = new EventExecutorModule(player, adapter, this._missionBoard.BoardState, logger, this._materialKnowledge);
+        this._materialFarm = new MaterialFarmModule(player, adapter, logger);
         this._missionGenerator = new DynamicMissionGenerator(player, adapter, this._missionBoard.BoardState, logger, this._valueAssessment);
         this._goalScheduler = new GoalScheduler(player, adapter, logger);
         this._missionGenerator.SetGoalScheduler(this._goalScheduler);
         this._modules["crafting_executor"] = this._crafting;
         this._modules["event_executor"] = this._eventExecutor;
+        this._modules["material_farm"] = this._materialFarm;
         this._modules["vault_executor"] = new VaultModule(player, adapter, logger);
         this._itemPickupManager = new ItemPickupManager(player, adapter, context, logger, this._valueAssessment);
         this._modules["item_pickup_manager"] = this._itemPickupManager;
