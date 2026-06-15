@@ -48,7 +48,8 @@ public class NewPlayersInScopePlugIn : JsViewPlugInBase, INewPlayersInScopePlugI
                     return;
                 }
 
-                await this.InvokeAsync(player.CreateMapObject()).ConfigureAwait(false);
+                var mapObj = player.CreateMapObject();
+                await this.InvokeAsync(mapObj).ConfigureAwait(false);
             }
 
             this._playersChangedCallback?.Invoke();

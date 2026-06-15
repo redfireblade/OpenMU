@@ -64,19 +64,32 @@ public abstract class JsViewPlugInBase
             }
             catch (TaskCanceledException)
             {
-                // don't need to handle that.
                 tryAgain = false;
+                this.Logger.LogWarning("JS interop call to {Method} canceled", this.JsMethodName);
             }
             catch (JSException e)
                 when (e.Message.StartsWith("Could not find '") && (e.Message.Contains("' in 'window'.") || e.Message.Contains("' was undefined).")))
             {
-                // In this case, try again in a moment.
+                this.Logger.LogWarning("JS interop: {Method} not found (attempt {Attempt}): {Message}", this.JsMethodName, i + 1, e.Message);
                 await Task.Delay(500, this.CancellationToken).ConfigureAwait(false);
+            }
+            catch (JSException e)
+            {
+                this.Logger.LogWarning("JS interop: {Method} JSException (attempt {Attempt}): {ErrorType}: {Message}", this.JsMethodName, i + 1, e.GetType().Name, e.Message);
+                if (i < maximumRetries - 1)
+                {
+                    await Task.Delay(500, this.CancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    tryAgain = false;
+                    this.Logger.LogWarning("JS interop call to {method} failed after {retries} retries. Params: {args}", this.JsMethodName, maximumRetries, string.Join(';', args));
+                }
             }
             catch (Exception e)
             {
+                this.Logger.LogWarning("JS interop: {Method} unexpected exception (attempt {Attempt}): {ErrorType}: {Message}\n{StackTrace}", this.JsMethodName, i + 1, e.GetType().Name, e.Message, e.StackTrace);
                 tryAgain = false;
-                this.Logger.LogError(e, $"Error in {this.GetType().Name}; params: {string.Join(';', args)}");
             }
         }
     }

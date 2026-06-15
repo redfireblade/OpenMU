@@ -43,11 +43,6 @@ public abstract class PeriodicTaskBasePlugIn<TConfiguration, TState> : IPeriodic
 
         var state = this.GetStateByGameContext(gameContext);
 
-        if (state.NextRunUtc > DateTime.UtcNow)
-        {
-            return;
-        }
-
         var configuration = this.Configuration;
 
         if (configuration is null && this is ISupportDefaultCustomConfiguration defaultConfigSupporter)
@@ -59,6 +54,14 @@ public abstract class PeriodicTaskBasePlugIn<TConfiguration, TState> : IPeriodic
         if (configuration is null)
         {
             logger.LogError("{description} ({gameContext}):no configuration available; can't execute task plugin.", state.Description, gameContext);
+            return;
+        }
+
+        // Force check on first run: if NextRunUtc is still default, allow immediate execution.
+        // This ensures fresh servers start checking timetables right away instead of
+        // waiting for NextRunUtc to expire (which could be set to a future time from a prior session).
+        if (state.NextRunUtc != default && state.NextRunUtc > DateTime.UtcNow)
+        {
             return;
         }
 

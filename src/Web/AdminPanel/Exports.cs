@@ -20,7 +20,7 @@ public static class Exports
     /// </summary>
     private static string Prefix { get; } = $"_content/{typeof(Exports).Namespace}";
 
-    private static IEnumerable<string> AdminPanelScripts => [];
+    private static IEnumerable<string> AdminPanelScripts => new[] { $"{Prefix}/js/aidebug-map.js" };
 
     private static IEnumerable<string> AdminPanelStylesheets => [];
 

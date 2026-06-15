@@ -242,6 +242,7 @@ public sealed class Walker : IDisposable
         catch (Exception ex)
         {
             Debug.Fail(ex.Message, ex.StackTrace);
+            await this.StopAsync().ConfigureAwait(false);
         }
     }
 
@@ -252,7 +253,10 @@ public sealed class Walker : IDisposable
             return;
         }
 
-        var nextStep = this._nextSteps.Dequeue();
+        if (!this._nextSteps.TryDequeue(out var nextStep))
+        {
+            return;
+        }
         this._walkSupporter.Position = nextStep.To;
 
         if (this._walkSupporter is IRotatable rotatable)

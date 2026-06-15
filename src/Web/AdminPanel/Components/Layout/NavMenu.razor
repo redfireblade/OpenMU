@@ -68,6 +68,11 @@
                         }
                     </NavLink>
                 </li>
+                <li>
+                    <NavLink href="aidebug" @onclick="() => NavigationHistory.Clear()">
+                        <span class="oi oi-bug" aria-hidden="true"></span> AI Debug
+                    </NavLink>
+                </li>
             }
             @if (UserService.IsAvailable)
             {

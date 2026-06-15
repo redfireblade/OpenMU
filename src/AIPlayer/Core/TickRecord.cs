@@ -9,6 +9,25 @@ using MUnique.OpenMU.Pathfinding;
 /// <summary>单个模块在单次 Tick 中的决策录制。</summary>
 public sealed record ModuleDecision(string ModuleName, TimeSpan Duration);
 
+/// <summary>AI survival level enum (moved out of deleted SurvivalManager).</summary>
+public enum SurvivalLevel
+{
+    /// <summary>Normal state — no immediate threats.</summary>
+    Normal,
+
+    /// <summary>Low health — potions or retreat may be needed.</summary>
+    LowHealth,
+
+    /// <summary>Danger — critical HP or surrounded.</summary>
+    Danger,
+
+    /// <summary>Critical — near death, emergency retreat.</summary>
+    Critical,
+
+    /// <summary>Emergency — immediate action required.</summary>
+    Emergency,
+}
+
 /// <summary>单次 Tick 的完整快照（用于测试客户端调试）。</summary>
 public sealed record TickSnapshot(
     int TickNumber,
@@ -19,7 +38,7 @@ public sealed record TickSnapshot(
     uint MaxMp,
     int Level,
     ushort MapId,
-    global::MUnique.OpenMU.AIPlayer.SurvivalManager.SurvivalLevel SurvivalLevel,
+    SurvivalLevel SurvivalLevel,
     bool HasTarget,
     bool EmergencyRetreat,
     IReadOnlyList<ModuleDecision> Decisions,

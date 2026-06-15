@@ -60,7 +60,8 @@ public class ObservableGameServerAdapter : Disposable, IObservableGameServer
         }
         else
         {
-            var message = $"map with id {mapId} not found.";
+            var message = $"map with id {mapId} not found. Available maps: {string.Join(", ", maps.Select(m => $"{m.Id}"))}";
+            System.Console.WriteLine($"[ObservableGameServerAdapter] ERROR: {message}");
             throw new ArgumentException(message);
         }
     }

@@ -21,18 +21,18 @@ using MUnique.OpenMU.AIPlayer.Scripting;
 public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
 {
     private readonly ConcurrentDictionary<Guid, AiPlayer> _activePlayers = new();
-    private readonly IGameServerContextResolver _contextResolver;
+    private IGameContext? _gameContext;
     private readonly ILogger<AiPlayerManager> _logger;
     private int _nameCounter;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="AiPlayerManager"/> class.
     /// </summary>
-    /// <param name="contextResolver">The game server context resolver.</param>
+    /// <param name="gameContext">The game context.</param>
     /// <param name="logger">The logger.</param>
-    public AiPlayerManager(IGameServerContextResolver contextResolver, ILogger<AiPlayerManager> logger)
+    public AiPlayerManager(IGameContext gameContext, ILogger<AiPlayerManager> logger)
     {
-        this._contextResolver = contextResolver;
+        this._gameContext = gameContext;
         this._logger = logger;
 
         // Load the knowledge base from the embedded resource at startup.
@@ -40,10 +40,45 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
         KnowledgeLoader.Load();
     }
 
+    /// <summary>
+    /// Initializes a new instance with delayed game context resolution.
+    /// Used when GameServerContainer hasn't fully started yet.
+    /// </summary>
+    public AiPlayerManager(IGameServerContextResolver contextResolver, ILogger<AiPlayerManager> logger)
+    {
+        var gameContext = contextResolver.ResolveContext();
+        if (gameContext is null)
+        {
+            this._delayedContextResolver = contextResolver;
+            this._logger = logger;
+        }
+        else
+        {
+            this._gameContext = gameContext;
+            this._logger = logger;
+        }
+        KnowledgeLoader.Load();
+    }
+
+    private readonly IGameServerContextResolver? _delayedContextResolver;
+    private IGameContext Context
+    {
+        get
+        {
+            if (this._gameContext is null && this._delayedContextResolver is not null)
+            {
+                var ctx = this._delayedContextResolver.ResolveContext();
+                if (ctx is not null)
+                    this._gameContext = ctx;
+            }
+            return this._gameContext ?? throw new InvalidOperationException("IGameContext not available yet.");
+        }
+    }
+
     /// <inheritdoc />
     public async ValueTask<AiPlayerCreateResult> CreateAiPlayerAsync(AiPlayerCreateConfig config)
     {
-        var gameContext = this._contextResolver.ResolveContext();
+        var gameContext = this.Context;
         if (gameContext is null)
         {
             return new AiPlayerCreateResult(false, null, "No game server context available. Server may still be starting.");
@@ -163,7 +198,7 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
     /// <inheritdoc />
     public async ValueTask<AiPlayerCreateResult> LoadAiPlayerAsync(string characterName)
     {
-        var gameContext = this._contextResolver.ResolveContext();
+        var gameContext = this.Context;
         if (gameContext is null)
         {
             return new AiPlayerCreateResult(false, null, "No game server context available. Server may still be starting.");
@@ -449,7 +484,7 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
     private static AiPlayerDebugData BuildDebugData(AiPlayer p, TickSnapshot? snap)
     {
         var pos = snap?.Position ?? p.Position;
-        var sm = p.StateMachine;
+        dynamic? sm = p.StateMachine;
         var heartbeat = sm?.LastHeartbeat;
 
         // Build quest progress string
@@ -565,7 +600,7 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
             (byte)pos.X,
             (byte)pos.Y,
             snap?.TickNumber ?? 0,
-            snap?.SurvivalLevel ?? SurvivalManager.SurvivalLevel.Normal,
+            snap?.SurvivalLevel ?? SurvivalLevel.Normal,
             snap?.HasTarget ?? false,
             snap?.EmergencyRetreat ?? false,
             snap?.Decisions,

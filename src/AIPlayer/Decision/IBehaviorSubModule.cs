@@ -202,6 +202,11 @@ public sealed class QuestExecutor : IBehaviorSubModule
 
         var pos = this._adapter.GetPlayerPosition();
 
+        this._logger.LogInformation("[P0D] TryHuntAsync: quest G{Group}, need monster #{Monster} ({Name}), cur={Cur}/{Req}, pos=({X},{Y}), map={Map}",
+            quest.Group, killReq.MonsterNumber, killReq.MonsterName,
+            killReq.Current, killReq.Required,
+            pos.X, pos.Y, map.Definition.Number);
+
         // 扩大搜索范围: 先近后远扫描 (20→60)
         const int nearRange = 20;
         const int farRange = 60;
@@ -225,6 +230,10 @@ public sealed class QuestExecutor : IBehaviorSubModule
             return StepResult.NoTarget;
         }
 
+        this._logger.LogInformation("[P0D] TryHuntAsync: found monster #{Monster} at ({X},{Y}), dist={Dist:F1}",
+            target.Definition?.Number, target.Position.X, target.Position.Y,
+            pos.EuclideanDistanceTo(target.Position));
+
         var dist = pos.EuclideanDistanceTo(target.Position);
         if (dist > 2.5f)
         {
@@ -233,17 +242,29 @@ public sealed class QuestExecutor : IBehaviorSubModule
             return StepResult.InProgress;
         }
 
-        // 最佳技能或普通攻击
-        var skill = this._player.SkillList?.Skills
-            .OrderByDescending(s => s.Skill?.AttackDamage ?? 0)
-            .FirstOrDefault(s => s.Skill?.SkillType == SkillType.DirectHit);
-        if (skill is not null && skill.Skill is not null)
+        // 最佳技能或普通攻击 — 每 tick 连续攻击最多 10 次或直到目标死亡
+        // 确保低伤害角色也能在合理时间内杀死怪物
+        for (int attempt = 0; attempt < 10 && target.IsAlive; attempt++)
         {
-            await this._adapter.HitWithSkillAsync(target, skill).ConfigureAwait(false);
-        }
-        else
-        {
-            await this._adapter.HitAsync(target, 0, Direction.Undefined).ConfigureAwait(false);
+            var skill = this._player.SkillList?.Skills
+                .OrderByDescending(s => s.Skill?.AttackDamage ?? 0)
+                .FirstOrDefault(s => s.Skill?.SkillType == SkillType.DirectHit);
+            if (skill is not null && skill.Skill is not null)
+            {
+                await this._adapter.HitWithSkillAsync(target, skill).ConfigureAwait(false);
+            }
+            else
+            {
+                await this._adapter.HitAsync(target, 0, Direction.Undefined).ConfigureAwait(false);
+            }
+
+            // 攻击后如果目标死亡，发布事件并跳出循环
+            if (!target.IsAlive)
+            {
+                this._logger.LogInformation("[P0D] multi-hit killed monster #{Monster} after {Attempts} hits",
+                    target is Monster m ? m.Definition?.Number : 0, attempt + 1);
+                break;
+            }
         }
 
         return StepResult.InProgress;

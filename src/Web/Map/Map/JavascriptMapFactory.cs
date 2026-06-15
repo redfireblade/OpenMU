@@ -39,8 +39,9 @@ public sealed class JavascriptMapFactory : IMapFactory
             mapController = new MapController(this._jsRuntime, this._loggerFactory, appId, gameServer, mapId);
             await gameServer.RegisterMapObserverAsync(mapId, mapController).ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
+            await Console.Error.WriteLineAsync($"[JavascriptMapFactory] ERROR in CreateMapAsync: {ex.GetType().Name}: {ex.Message}").ConfigureAwait(false);
             if (mapController != null)
             {
                 await mapController.DisposeAsync().ConfigureAwait(false);

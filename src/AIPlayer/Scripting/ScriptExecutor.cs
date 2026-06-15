@@ -13,9 +13,10 @@ using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.Pathfinding;
 using MUnique.OpenMU.Orchestrator;
-using MUnique.OpenMU.AIPlayer.Map;
 using MUnique.OpenMU.GameLogic.PlayerActions.Quests;
+using MUnique.OpenMU.DataModel.Entities;
 using MUnique.OpenMU.GameLogic.PlayerActions;
+using MUnique.OpenMU.AIPlayer.Warp;
 
 /// <summary>
 /// Priority-chain script executor — the 1D runtime for AI behavior.
@@ -34,6 +35,8 @@ public sealed class ScriptExecutor
     private readonly BehaviorContext _context;
     private readonly ILogger _logger;
 
+    // 日志角色标签 — 在构造时设置，所有日志自动包含角色名
+    private string _charTag;
     // Active script reference — can be atomically replaced via ReloadScript
     private BehaviorScript _script;
 
@@ -45,6 +48,9 @@ public sealed class ScriptExecutor
 
     // Action helpers (reuse existing game action objects)
     private readonly CloseNpcDialogAction _closeNpcDialog = new();
+
+    // NpcInteractionService for merchant/quest NPC interactions
+    private readonly NpcInteractionService _npcService;
 
     // Cached resolved parameters (global merged with per-node overrides)
     private readonly Dictionary<string, ScriptParameters> _nodeParams = new();
@@ -172,6 +178,7 @@ public sealed class ScriptExecutor
 
     // v2.0: Death recovery
     private Point _deathPosition;
+    private DateTime _deathStartTime = DateTime.MinValue; // death timeout timer (UtcNow)
     private bool _justRevived; // true for one tick after HP goes from 0 to >0
 
     // Force-through death tracking: when all terrain-filtered algorithms fail,
@@ -245,8 +252,10 @@ public sealed class ScriptExecutor
         this._script = script;
         this._logger = player.Logger;
 
-        // Store the file path and load readable script lines
-        this.ScriptFilePath = scriptFilePath;
+        // 初始化角色标签，在所有 [ScriptExec] 日志中带上角色标识
+        this._charTag = "[" + (player.SelectedCharacter?.Name ?? "?") + "] ";
+
+        // Store the file path
         if (scriptFilePath is not null)
         {
             try
@@ -256,7 +265,7 @@ public sealed class ScriptExecutor
             }
             catch (Exception ex)
             {
-                this._logger.LogWarning(ex, "[ScriptExec] Failed to format readable lines from {Path}", scriptFilePath);
+                this._logger.LogWarning(ex, "[ScriptExec]" + this._charTag + " Failed to format readable lines from {Path}", scriptFilePath);
                 this.ScriptLines = Array.Empty<string>();
             }
         }
@@ -270,7 +279,7 @@ public sealed class ScriptExecutor
             }
 
             this._currentParagraphIndex = 0;
-            this._logger.LogDebug("[ScriptExec] Paragraph mode activated with {Count} paragraphs", paragraphs.Count);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " Paragraph mode activated with {Count} paragraphs", paragraphs.Count);
 
             // Paragraph mode: resolve node parameters against global defaults
             foreach (var paragraph in paragraphs)
@@ -294,6 +303,7 @@ public sealed class ScriptExecutor
         this._patrolCenter = context.GameAdapter.GetPlayerPosition();
         this._lastPosition = context.GameAdapter.GetPlayerPosition();
         this._nativeExec = new NativeExecutionService(this._player, this._logger);
+        this._npcService = new NpcInteractionService(player, player.Logger);
     }
 
     /// <summary>
@@ -441,7 +451,7 @@ public sealed class ScriptExecutor
             var newScript = this._pendingReload;
             this._pendingReload = null;
             this._logger.LogInformation(
-                "[ScriptExec] Hot-reload: switching to '{ScriptId}' v{Version} (was '{OldId}' v{OldVersion})",
+                "[ScriptExec]" + this._charTag + " Hot-reload: switching to '{ScriptId}' v{Version} (was '{OldId}' v{OldVersion})",
                 newScript.Id, newScript.Version, this._script.Id, this._script.Version);
             this._script = newScript;
 
@@ -457,7 +467,7 @@ public sealed class ScriptExecutor
                 }
 
                 this._currentParagraphIndex = 0;
-                this._logger.LogDebug("[ScriptExec] Hot-reload: paragraph mode with {Count} paragraphs", paragraphs.Count);
+                this._logger.LogDebug("[ScriptExec]" + this._charTag + " Hot-reload: paragraph mode with {Count} paragraphs", paragraphs.Count);
 
                 // Re-resolve node parameters against new script defaults
                 foreach (var paragraph in paragraphs)
@@ -497,7 +507,7 @@ public sealed class ScriptExecutor
             // Use configured stuck detection threshold from ScriptParameters
             if (this._sameTargetTickCount > this._script.Parameters.StuckDetectionTicks)
             {
-                this._logger.LogTrace("[ScriptExec] Target {Id} stuck for {N} ticks — clearing", currentTarget, this._sameTargetTickCount);
+                this._logger.LogTrace("[ScriptExec]" + this._charTag + " Target {Id} stuck for {N} ticks — clearing", currentTarget, this._sameTargetTickCount);
                 if (currentTarget is Monster m)
                 {
                     this._targetBlacklist[m.Id] = this._scriptTickCounter;
@@ -526,7 +536,7 @@ public sealed class ScriptExecutor
                 && this._context.CurrentTarget is not null)
             {
                 this._logger.LogInformation(
-                    "[ScriptExec] Position stuck at ({X},{Y}) for {N} ticks with target — forcing patrol",
+                    "[ScriptExec]" + this._charTag + " Position stuck at ({X},{Y}) for {N} ticks with target — forcing patrol",
                     currentPos.X, currentPos.Y, this._ticksAtSamePosition);
                 this._context.CurrentTarget = null;
                 await RandomPatrolAsync(this._script.Parameters).ConfigureAwait(false);
@@ -583,7 +593,19 @@ public sealed class ScriptExecutor
             this._context.CurrentTarget = null;
         }
 
-        // ===== PC Pipeline (AR-20: fetch-execute-advance) =====
+        // Phase 0: Warp route — exclusively drive route until complete
+        if (this._context.ActiveWarpRoute is not null)
+        {
+            if (!this._context.WarpInProgress)
+            {
+                // Execute next step (walk to gate, enter gate, use warp menu)
+                await this.ExecuteNextWarpStepAsync().ConfigureAwait(false);
+            }
+
+            // Always skip PC fetch while route active (walking or waiting for map change)
+            await this.CheckWarpProgressAsync().ConfigureAwait(false);
+            goto BuildResult;
+        }
 
         // Phase 1: Hard interrupts — checked BEFORE PC fetch (CPU-level priority)
         if (this._context.GameAdapter.GetCurrentHp() <= 0)
@@ -657,14 +679,14 @@ public sealed class ScriptExecutor
                     {
                         RecordBranchHit(node.Name, "if");
                         var label = node.Action.AsSpan(6).Trim().ToString();
-                        this._logger.LogInformation("[PC] Goto @{Label} from PC={Pc} node={Node}",
+                        this._logger.LogInformation("[ScriptExec]" + this._charTag + " Goto @{Label} from PC={Pc} node={Node}",
                             label, this._programCounter, node.Name);
                         ProcessGotoJump(label);
                     }
                     else
                     {
                         // Condition false — skip to next node
-                        this._logger.LogTrace("[PC] Goto skip: PC={Pc} node={Node} cond=false",
+                        this._logger.LogTrace("[ScriptExec]" + this._charTag + " Goto skip: PC={Pc} node={Node} cond=false",
                             this._programCounter, node.Name);
                         this._programCounter++;
                     }
@@ -672,7 +694,7 @@ public sealed class ScriptExecutor
                 else
                 {
                     // Normal action: execute via existing pipeline
-                    this._logger.LogTrace("[PC] tick={Tick} PC={Pc} node={Node} action={Action}",
+                    this._logger.LogTrace("[ScriptExec]" + this._charTag + " tick={Tick} PC={Pc} node={Node} action={Action}",
                         this._scriptTickCounter, this._programCounter, node.Name, node.Action);
 
                     this.CurrentBehavior = node.Name;
@@ -713,7 +735,7 @@ public sealed class ScriptExecutor
             {
                 this._executionState = ScriptTaskState.Stuck;
                 this._logger.LogWarning(
-                    "[PC] Watchdog: PC={Pc} stuck for {N} ticks — state=Stuck",
+                    "[ScriptExec]" + this._charTag + " Watchdog: PC={Pc} stuck for {N} ticks — state=Stuck",
                     this._programCounter, this._ticksAtCurrentPc);
             }
         }
@@ -752,7 +774,7 @@ public sealed class ScriptExecutor
         // Diagnostic: log current paragraph every 25 ticks
         if (this._scriptTickCounter % 25 == 0)
         {
-            this._logger.LogInformation("[ScriptExec] D: paragraph=@{Label} nodes=[{Nodes}] pos=({X},{Y}) map={Map}",
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " D: paragraph=@{Label} nodes=[{Nodes}] pos=({X},{Y}) map={Map}",
                 currentParagraph.Label,
                 string.Join(",", currentParagraph.Nodes.Select(n => n.Name)),
                 this._context.GameAdapter.GetPlayerPosition().X,
@@ -778,7 +800,7 @@ public sealed class ScriptExecutor
                 {
                     RecordBranchHit(node.Name, "if");
                     var label = node.Action.AsSpan(6).Trim().ToString();
-                    this._logger.LogInformation("[ScriptExec] goto @{Label} from @{CurrentLabel} node={Node} cond={Cond}=true",
+                    this._logger.LogInformation("[ScriptExec]" + this._charTag + " goto @{Label} from @{CurrentLabel} node={Node} cond={Cond}=true",
                         label, currentParagraph.Label, node.Name, node.Condition);
                     this._gotoPending = label;
                     this._nodesExecuted++;
@@ -786,7 +808,7 @@ public sealed class ScriptExecutor
                 }
                 else
                 {
-                    this._logger.LogInformation("[ScriptExec] goto @{Label} from @{CurrentLabel} node={Node} cond={Cond}=false",
+                    this._logger.LogInformation("[ScriptExec]" + this._charTag + " goto @{Label} from @{CurrentLabel} node={Node} cond={Cond}=false",
                         node.Action.AsSpan(6).Trim().ToString(), currentParagraph.Label, node.Name, node.Condition);
                 }
 
@@ -805,7 +827,7 @@ public sealed class ScriptExecutor
                             RecordBranchHit(node.Name, $"elif.{i}");
                             var label = elif.Action.AsSpan(6).Trim().ToString();
                             this._gotoPending = label;
-                            this._logger.LogTrace("[ScriptExec] Paragraph goto: @{Label}", label);
+                            this._logger.LogTrace("[ScriptExec]" + this._charTag + " Paragraph goto: @{Label}", label);
                             this._nodesExecuted++;
                             matched = true;
                             goto ProcessGoto;
@@ -824,7 +846,7 @@ public sealed class ScriptExecutor
                     RecordBranchHit(node.Name, "else");
                     var label = node.ElseNode.Action.AsSpan(6).Trim().ToString();
                     this._gotoPending = label;
-                    this._logger.LogTrace("[ScriptExec] Paragraph goto: @{Label}", label);
+                    this._logger.LogTrace("[ScriptExec]" + this._charTag + " Paragraph goto: @{Label}", label);
                     this._nodesExecuted++;
                     goto ProcessGoto;
                 }
@@ -849,24 +871,15 @@ public sealed class ScriptExecutor
         // At end of paragraph chain: process pending goto if set
         if (this._gotoPending is not null)
         {
-            // Record PathOutcome: paragraph switch after walking means the walk from previous
-            // segment ended without completing the goal (task not met) → failure record.
-            if (this._context is { AiMap: not null } && this._context.WorldState.CurrentMap is not null)
-            {
-                var pos = this._context.GameAdapter.GetPlayerPosition();
-                var shadow = this._context.AiMap.GetOrCreateShadowLayer(this._player.AiPlayerId, this._logger);
-                shadow.RecordPathOutcome(pos, pos, false, this._player.AiPlayerId);
-            }
-
             if (this._paragraphTable.TryGetValue(this._gotoPending, out var targetIndex))
             {
                 this._currentParagraphIndex = targetIndex;
-                this._logger.LogInformation("[ScriptExec] >>> Paragraph switch: @{Label} (index {Index}) gotoPending={Goto}",
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " >>> Paragraph switch: @{Label} (index {Index}) gotoPending={Goto}",
                     this._gotoPending, targetIndex, this._gotoPending);
             }
             else
             {
-                this._logger.LogWarning("[ScriptExec] Goto target '@{Label}' not found in paragraph table",
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " Goto target '@{Label}' not found in paragraph table",
                     this._gotoPending);
             }
 
@@ -970,7 +983,7 @@ public sealed class ScriptExecutor
         // Track script name from the active script (id + version)
         this.ScriptName = $"{this._script.Id} v{this._script.Version}";
 
-        this._logger.LogTrace("[ScriptExec] tick={Tick} node={Node} action={Action}",
+        this._logger.LogTrace("[ScriptExec]" + this._charTag + " tick={Tick} node={Node} action={Action}",
             this._scriptTickCounter, nodeName, action);
 
         // Extract the action name without parameters for the switch dispatch.
@@ -1047,6 +1060,14 @@ public sealed class ScriptExecutor
                     WalkToNpcResult.Failed => "cannot reach quest npc — retry",
                     _ => "unknown",
                 };
+                // 更新行为状态供看板/AIODS 读取
+                this.CurrentBehavior = result switch
+                {
+                    WalkToNpcResult.Walking => "走向任务NPC",
+                    WalkToNpcResult.Fallthrough => "任务NPC对话就绪",
+                    WalkToNpcResult.Failed => "无法到达任务NPC",
+                    _ => "任务NPC交互",
+                };
                 return new NodeExecutionResult(
                     status, nodeName, action, true,
                     result == WalkToNpcResult.Fallthrough,  // PcAdvanced: advance only on fallthrough
@@ -1110,8 +1131,11 @@ public sealed class ScriptExecutor
             "walk_route" => "沿路线行走",
             "use_skill" or "use_heal_skill" => "施放技能",
             "travel_to_map" or "warp_to_map" => "传送中",
+            "walk_to_quest_npc" => "走向任务NPC",
+            "start_quest" => "接任务中",
             "accept_quest" => "接任务中",
             "submit_quest" or "complete_quest" => "交任务中",
+            "close_npc_dialog" => "关闭NPC对话",
             _ => nodeName, // fallback to raw node name
         };
 
@@ -1127,37 +1151,84 @@ public sealed class ScriptExecutor
                 await SitAndRegenAsync(p).ConfigureAwait(false);
                 break;
             case "wait_respawn":
-                // v2.0: death recovery — record death position, track revival
+                // v2.0: death recovery — auto-revive after 5s timeout
                 var hp = this._context.GameAdapter.GetCurrentHp();
                 if (hp <= 0)
                 {
-                    this._deathPosition = this._context.GameAdapter.GetPlayerPosition();
-                    this._context.CurrentTarget = null;
-                    this._justRevived = false;
-
-                    // General death tracking: count consecutive deaths since last kill
-                    this._consecutiveDeaths++;
-
-                    // Force-through death tracking
-                    if (this._forceThruActive)
+                    // First tick of death — record death position and start timer
+                    if (this._deathStartTime == DateTime.MinValue)
                     {
-                        this._forceThruDeathCount++;
-                        this._forceThruActive = false;
-                        this._logger!.LogWarning(
-                            "[ForceThru] Died during force-through ({Count}/3) — will give up after 3 deaths",
-                            this._forceThruDeathCount);
+                        this._deathPosition = this._context.GameAdapter.GetPlayerPosition();
+                        this._context.CurrentTarget = null;
+                        this._justRevived = false;
+                        this._deathStartTime = DateTime.UtcNow;
+
+                        // General death tracking: count consecutive deaths since last kill
+                        this._consecutiveDeaths++;
+
+                        // Force-through death tracking
+                        if (this._forceThruActive)
+                        {
+                            this._forceThruDeathCount++;
+                            this._forceThruActive = false;
+                            this._logger!.LogWarning(
+                                "[ForceThru] Died during force-through ({Count}/3) — will give up after 3 deaths",
+                                this._forceThruDeathCount);
+                        }
+                    }
+
+                    // Death > 5 seconds — auto-revive via warp to safezone
+                    if ((DateTime.UtcNow - this._deathStartTime).TotalSeconds >= 5)
+                    {
+                        this._logger.LogWarning(
+                            "[ScriptExec]" + this._charTag + " 💀 Death exceeded 5s — auto-reviving...");
+                        await this._player.WarpToSafezoneAsync().ConfigureAwait(false);
+                        this._logger.LogInformation(
+                            "[ScriptExec]" + this._charTag + " ✅ WarpToSafezoneAsync complete");
+
+                        // Restore HP/MP/AG/SD to full (same pattern as HeartbeatService.RespawnPlayerAsync)
+                        foreach (var regen in Stats.IntervalRegenerationAttributes)
+                        {
+                            this._player.Attributes![regen.CurrentAttribute] =
+                                this._player.Attributes[regen.MaximumAttribute];
+                        }
+                        this._player.IsAlive = true;
+
+                        // If CurrentMap is null after warp, confirm map change
+                        if (this._player.CurrentMap is null)
+                        {
+                            await this._player.ClientReadyAfterMapChangeAsync().ConfigureAwait(false);
+                            this._logger.LogInformation(
+                                "[ScriptExec]" + this._charTag + " ✅ ClientReadyAfterMapChangeAsync complete (auto-revive)");
+                        }
+
+                        this._justRevived = true;
+                        this._deathStartTime = DateTime.MinValue;
+                        this._deathPosition = default;
+                        this._logger.LogWarning(
+                            "[ScriptExec]" + this._charTag + " 💀 Auto-revive complete — HP/MP restored");
                     }
                 }
-                else if (this._deathPosition.X != 0 || this._deathPosition.Y != 0)
+                else
                 {
-                    // HP just went >0 after being 0 — flag just_revived for one tick
-                    this._justRevived = true;
-                    this._logger.LogInformation(
-                        "[ScriptExec] Just revived — consecutive deaths: {Count}" +
-                        (_consecutiveDeaths >= 5 ? " ⚠️ ESCALATING — considering map change" :
-                         _consecutiveDeaths >= 3 ? " ⚠️ Will cycle hotspot" :
-                         _consecutiveDeaths >= 1 ? " — normal retry" : ""),
-                        this._consecutiveDeaths);
+                    // HP > 0 — alive
+                    if (this._deathStartTime != DateTime.MinValue)
+                    {
+                        // Was dead, now alive — game engine revived us
+                        this._justRevived = true;
+                        this._deathStartTime = DateTime.MinValue;
+                        this._logger.LogInformation(
+                            "[ScriptExec]" + this._charTag + " Just revived — consecutive deaths: {Count}" +
+                            (_consecutiveDeaths >= 5 ? " ⚠️ ESCALATING — considering map change" :
+                             _consecutiveDeaths >= 3 ? " ⚠️ Will cycle hotspot" :
+                             _consecutiveDeaths >= 1 ? " — normal retry" : ""),
+                            this._consecutiveDeaths);
+                    }
+                    else if (this._deathPosition.X != 0 || this._deathPosition.Y != 0)
+                    {
+                        // HP recovered without death tracking (reset death position)
+                        this._deathPosition = default;
+                    }
                 }
                 break;
             case "attack_target":
@@ -1206,7 +1277,7 @@ public sealed class ScriptExecutor
                     var activeQuests = this._context.GameAdapter.GetActiveQuests();
                     if (activeQuests.Any(q => q.Group == p.QuestGroup.Value && q.Number == p.QuestNumber.Value))
                     {
-                        this._logger.LogInformation("[ScriptExec] start_quest: G{Group}/N{Number} already active, skipping",
+                        this._logger.LogInformation("[ScriptExec]" + this._charTag + " start_quest: G{Group}/N{Number} already active, skipping",
                             p.QuestGroup.Value, p.QuestNumber.Value);
                         break;
                     }
@@ -1220,7 +1291,7 @@ public sealed class ScriptExecutor
                     var activeQuests = this._context.GameAdapter.GetActiveQuests();
                     if (activeQuests.Any(q => q.Group == p.QuestGroup.Value && q.Number == p.QuestNumber.Value))
                     {
-                        this._logger.LogInformation("[ScriptExec] accept_quest: G{Group}/N{Number} already active, skipping accept",
+                        this._logger.LogInformation("[ScriptExec]" + this._charTag + " accept_quest: G{Group}/N{Number} already active, skipping accept",
                             p.QuestGroup.Value, p.QuestNumber.Value);
                         break;
                     }
@@ -1252,7 +1323,7 @@ public sealed class ScriptExecutor
                     var currentMap = this._context.GameAdapter.GetCurrentMap();
                     if (currentMap?.Definition.Number == p.TargetMapNumber.Value)
                     {
-                        this._logger.LogDebug("[ScriptExec] warp_to_map: already on map {Map}", p.TargetMapNumber);
+                        this._logger.LogDebug("[ScriptExec]" + this._charTag + " warp_to_map: already on map {Map}", p.TargetMapNumber);
                         break;
                     }
                 }
@@ -1263,15 +1334,18 @@ public sealed class ScriptExecutor
             case "relocate_to_hotspot":
                 this._lastActionResult = await RelocateToHotspotAsync(p).ConfigureAwait(false);
                 break;
+            case "warp_to_hunt_map":
+                await WarpToHuntMapAsync(p).ConfigureAwait(false);
+                break;
             case "return_to_death_spot":
                 await ReturnToDeathSpotAsync(p).ConfigureAwait(false);
                 break;
             case "close_npc_dialog":
-                this._logger.LogDebug("[ScriptExec] close_npc_dialog");
+                this._logger.LogDebug("[ScriptExec]" + this._charTag + " close_npc_dialog");
                 await this._closeNpcDialog.CloseNpcDialogAsync(this._player).ConfigureAwait(false);
                 break;
             default:
-                this._logger.LogWarning("[ScriptExec] Unknown action: {Action}", action);
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " Unknown action: {Action}", action);
                 break;
         }
     }
@@ -1314,7 +1388,9 @@ public sealed class ScriptExecutor
             "no_active_quest" => EvaluateNoActiveQuest(p),
             "can_accept_quest" => EvaluateCanAcceptQuest(p),
             "not_at_hotspot" => !IsNearAnyHotspot(p.PatrolRadius),
+            "not_on_hunt_map" => EvaluateNotOnHuntMap(p),
             "has_target" => this._context.CurrentTarget is not null,
+            "quest_completable" => EvaluateQuestCompletable(p),
             _ => false,
         };
     }
@@ -1325,13 +1401,25 @@ public sealed class ScriptExecutor
         var targetNumber = p.QuestNumber;
         if (targetGroup is null || targetNumber is null)
         {
-            this._logger.LogWarning("[ScriptExec] can_accept_quest: Skipped — no questGroup/questNumber parameters set");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " can_accept_quest: Skipped — no questGroup/questNumber parameters set");
             return false;
+        }
+
+        // 自动接取任务（QuestNpcNumber 为 null/0）：无需 NPC 对话，跳过 OpenedNpc 检查
+        if (p.QuestNpcNumber is null || p.QuestNpcNumber.Value == 0)
+        {
+            // GetAvailableQuests() requires OpenedNpc != null, which is false for auto-accept.
+            // Instead, directly check if the quest exists in the game configuration.
+            var questDef = FindQuestDefinition(targetGroup.Value, targetNumber.Value);
+            var autoHasTarget = questDef is not null;
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " can_accept_quest: Auto-accept quest (no NPC), target=G{Group}/N{Number}, found={Found}, questDef={Def}",
+                targetGroup.Value, targetNumber.Value, autoHasTarget, questDef?.Name);
+            return autoHasTarget;
         }
 
         if (this._player.OpenedNpc is null)
         {
-            this._logger.LogInformation("[ScriptExec] can_accept_quest: No opened NPC — returning false");
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " can_accept_quest: No opened NPC — returning false");
             return false;
         }
 
@@ -1339,9 +1427,73 @@ public sealed class ScriptExecutor
         var hasTarget = available.Any(q => q.Group == targetGroup.Value && q.Number == targetNumber.Value);
         var pos = this._player.Position;
 
-        this._logger.LogInformation("[ScriptExec] can_accept_quest: OpenedNpc={NpcId}, target=G{Group}/N{Number}, found={Found}, available={Count}, pos=({X},{Y})",
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " can_accept_quest: OpenedNpc={NpcId}, target=G{Group}/N{Number}, found={Found}, available={Count}, pos=({X},{Y})",
             this._player.OpenedNpc?.Definition?.Number, targetGroup.Value, targetNumber.Value, hasTarget, available.Count, pos.X, pos.Y);
         return hasTarget;
+    }
+
+    /// <summary>Searches all game configuration NPCs for a quest definition matching group/number.</summary>
+    private QuestDefinition? FindQuestDefinition(short group, short number)
+    {
+        var config = this._player.GameContext?.Configuration;
+        if (config is null) return null;
+
+        foreach (var monster in config.Monsters)
+        {
+            if (monster.Quests is null) continue;
+            var quest = monster.Quests.FirstOrDefault(q =>
+                q.Group == group && q.Number == number
+                && (q.QualifiedCharacter is null || Equals(q.QualifiedCharacter, this._player.SelectedCharacter?.CharacterClass)));
+            if (quest is not null)
+                return quest;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 检查任务是否可提交（用于 submit_quest 段落的 check_ready 条件）。
+    /// 与 quest_conditions_met 的区别：本函数不检查 NPC 对话框是否打开，
+    /// 只检查系统中是否有该任务的活跃记录且杀怪条件已满足。
+    /// 这是脚本中 "can I call CompleteQuestAsync now?" 的判断。
+    /// </summary>
+    private bool EvaluateQuestCompletable(ScriptParameters p)
+    {
+        var targetGroup = p.QuestGroup;
+        var targetNumber = p.QuestNumber;
+        if (targetGroup is null || targetNumber is null)
+        {
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " quest_completable: No questGroup/questNumber parameters set");
+            return false;
+        }
+
+        var activeQuests = this._context.GameAdapter.GetActiveQuests();
+        var myQuest = activeQuests.FirstOrDefault(q =>
+            q.Group == targetGroup.Value && q.Number == targetNumber.Value);
+        if (myQuest is null)
+        {
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " quest_completable: G{Group}/N{Number} not active — returning false",
+                targetGroup.Value, targetNumber.Value);
+            return false;
+        }
+
+        // 杀怪要求全部满足？
+        if (myQuest.RequiredKills is { Count: > 0 })
+        {
+            if (myQuest.RequiredKills.All(k => k.Current >= k.Required))
+            {
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " quest_completable: MET for G{Group}/N{Number}!",
+                    myQuest.Group, myQuest.Number);
+                return true;
+            }
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " quest_completable: NOT MET for G{Group}/N{Number} — kills incomplete",
+                myQuest.Group, myQuest.Number);
+            return false;
+        }
+
+        // 无杀怪需求 → 可提交
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " quest_completable: MET for G{Group}/N{Number} — no kill requirements",
+            myQuest.Group, myQuest.Number);
+        return true;
     }
 
     private bool IsNearAnyHotspot(float patrolRadius)
@@ -1374,7 +1526,7 @@ public sealed class ScriptExecutor
         var targetNumber = p.QuestNumber;
         if (targetGroup is null || targetNumber is null)
         {
-            this._logger.LogWarning("[ScriptExec] quest_conditions_met: Skipped — no questGroup/questNumber parameters set");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " quest_conditions_met: Skipped — no questGroup/questNumber parameters set");
             return false;
         }
 
@@ -1383,7 +1535,7 @@ public sealed class ScriptExecutor
             q.Group == targetGroup.Value && q.Number == targetNumber.Value);
         if (myQuest is null)
         {
-            this._logger.LogInformation("[ScriptExec] quest_conditions_met: G{Group}/N{Number} not found among {Count} active quests — returning false",
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " quest_conditions_met: G{Group}/N{Number} not found among {Count} active quests — returning false",
                 targetGroup.Value, targetNumber.Value, activeQuests.Count);
             return false;
         }
@@ -1393,23 +1545,23 @@ public sealed class ScriptExecutor
         {
             foreach (var kill in myQuest.RequiredKills)
             {
-                this._logger.LogInformation("[ScriptExec] quest_conditions_met: G{Group}/N{Number}, monster={Monster}, kill={Current}/{Required}",
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " quest_conditions_met: G{Group}/N{Number}, monster={Monster}, kill={Current}/{Required}",
                     myQuest.Group, myQuest.Number, kill.MonsterName, kill.Current, kill.Required);
             }
 
             if (myQuest.RequiredKills.All(k => k.Current >= k.Required))
             {
-                this._logger.LogInformation("[ScriptExec] quest_conditions_met: MET for G{Group}/N{Number}!", myQuest.Group, myQuest.Number);
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " quest_conditions_met: MET for G{Group}/N{Number}!", myQuest.Group, myQuest.Number);
                 return true;
             }
 
-            this._logger.LogInformation("[ScriptExec] quest_conditions_met: NOT MET for G{Group}/N{Number} — kills incomplete",
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " quest_conditions_met: NOT MET for G{Group}/N{Number} — kills incomplete",
                 myQuest.Group, myQuest.Number);
             return false;
         }
 
         // 无杀怪需求 → 提交条件满足
-        this._logger.LogInformation("[ScriptExec] quest_conditions_met: MET for G{Group}/N{Number} — no kill requirements",
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " quest_conditions_met: MET for G{Group}/N{Number} — no kill requirements",
             myQuest.Group, myQuest.Number);
         return true;
     }
@@ -1420,14 +1572,14 @@ public sealed class ScriptExecutor
         var targetNumber = p.QuestNumber;
         if (targetGroup is null || targetNumber is null)
         {
-            this._logger.LogWarning("[ScriptExec] no_active_quest: No questGroup/questNumber parameters — treating as no active quest for this script (returning true)");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " no_active_quest: No questGroup/questNumber parameters — treating as no active quest for this script (returning true)");
             return true;
         }
 
         var activeQuests = this._context.GameAdapter.GetActiveQuests();
         if (activeQuests.Any(q => q.Group == targetGroup.Value && q.Number == targetNumber.Value))
         {
-            this._logger.LogInformation("[ScriptExec] no_active_quest: G{Group}/N{Number} is active via GetActiveQuests — returning false",
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " no_active_quest: G{Group}/N{Number} is active via GetActiveQuests — returning false",
                 targetGroup.Value, targetNumber.Value);
             return false;
         }
@@ -1443,13 +1595,13 @@ public sealed class ScriptExecutor
                 && qs.ActiveQuest.Number == targetNumber.Value);
             if (hasActiveForTarget)
             {
-                this._logger.LogInformation("[ScriptExec] no_active_quest: FALLBACK — GetActiveQuests filtered, but QuestStates has ActiveQuest for G{Group}/N{Number}, returning false",
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " no_active_quest: FALLBACK — GetActiveQuests filtered, but QuestStates has ActiveQuest for G{Group}/N{Number}, returning false",
                     targetGroup.Value, targetNumber.Value);
                 return false;
             }
         }
 
-        this._logger.LogInformation("[ScriptExec] no_active_quest: G{Group}/N{Number} not active — returning true",
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " no_active_quest: G{Group}/N{Number} not active — returning true",
             targetGroup.Value, targetNumber.Value);
         return true;
     }
@@ -1460,7 +1612,7 @@ public sealed class ScriptExecutor
         var targetNumber = p.QuestNumber;
         if (targetGroup is null || targetNumber is null)
         {
-            this._logger.LogWarning("[ScriptExec] has_active_quest: Skipped — no questGroup/questNumber parameters set");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " has_active_quest: Skipped — no questGroup/questNumber parameters set");
             return false;
         }
 
@@ -1484,13 +1636,13 @@ public sealed class ScriptExecutor
                 && qs.ActiveQuest.Number == targetNumber.Value);
             if (hasFromQuestStates)
             {
-                this._logger.LogInformation("[ScriptExec] has_active_quest: FALLBACK — GetActiveQuests filtered, but QuestStates has ActiveQuest for G{Group}/N{Number}",
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " has_active_quest: FALLBACK — GetActiveQuests filtered, but QuestStates has ActiveQuest for G{Group}/N{Number}",
                     targetGroup.Value, targetNumber.Value);
             }
         }
 
         result = result || hasFromQuestStates;
-        this._logger.LogInformation("[ScriptExec] has_active_quest: G{Group}/N{Number} — count={Count}, qsCount={QsCount}, details=[{Details}], result={Result}, pos=({X},{Y})",
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " has_active_quest: G{Group}/N{Number} — count={Count}, qsCount={QsCount}, details=[{Details}], result={Result}, pos=({X},{Y})",
             targetGroup.Value, targetNumber.Value, activeQuests.Count, qsCount, details, result, pos.X, pos.Y);
         return result;
     }
@@ -1561,7 +1713,7 @@ public sealed class ScriptExecutor
                     await this._context.GameAdapter.ConsumeItemAsync(potion.ItemSlot)
                         .ConfigureAwait(false);
                     this._lastHpPotionTime = DateTime.UtcNow;
-                    this._logger.LogInformation("[ScriptExec] Used HP potion: deficit={Deficit}, item={Item}",
+                    this._logger.LogInformation("[ScriptExec]" + this._charTag + " Used HP potion: deficit={Deficit}, item={Item}",
                         deficit, potion.Definition?.Name);
                     this._hpHysteresisActive = true;
                     return;
@@ -1652,19 +1804,6 @@ public sealed class ScriptExecutor
         var myPos = this._context.WorldState.PlayerPosition;
         var myLevel = this._context.GameAdapter.GetPlayerLevel();
 
-        // Record MonsterObservation for every visible monster to build shadow map density
-        if (this._context.AiMap is not null)
-        {
-            var shadow = this._context.AiMap.GetOrCreateShadowLayer(this._player.AiPlayerId, this._logger);
-            foreach (var a in attackables)
-            {
-                if (a is Monster m && m.IsAlive)
-                {
-                    shadow.RecordMonsterObservation((byte)m.Position.X, (byte)m.Position.Y, (short)m.Definition.Number, this._player.AiPlayerId);
-                }
-            }
-        }
-
         // Purge expired blacklist entries (use configured expiry threshold)
         var expiryTicks = p.BlacklistExpiryTicks;
         var expired = this._targetBlacklist
@@ -1751,8 +1890,21 @@ public sealed class ScriptExecutor
             }
             else
             {
-                this._logger.LogDebug("[FindNearestMonster] No quest-target monsters in view, falling back to {Count} candidates",
-                    candidates.Count);
+                // 有任务需求但周围找不到任务目标怪物
+                // 降级: 攻击最近的任意怪物（非任务怪也行），避免站着被白打
+                this._logger.LogDebug("[FindNearestMonster] No quest target monsters #{Monsters} in range — falling back to non-quest targets ({Total} available)",
+                    string.Join(",", questTargetNumbers), candidates.Count);
+                // 不返回 NoTarget — 用任意怪物维持战斗状态
+                // 如果没有任何怪物，才返回 NoTarget
+                if (candidates.Count == 0)
+                {
+                    this._logger.LogDebug("[FindNearestMonster] No monsters in range at all — returning NoTarget");
+                    this._context.CurrentTarget = null;
+                    this._noMonsterTickCount++;
+                    return false;
+                }
+                // 有非任务怪就用它们
+                this._logger.LogDebug("[FindNearestMonster] Falling back to {Count} non-quest monsters", candidates.Count);
             }
         }
 
@@ -1818,7 +1970,7 @@ public sealed class ScriptExecutor
         if (best is not null)
         {
             this.ResetIdleTimer(); // 找到目标 = 有进展
-            this._logger.LogTrace("[ScriptExec] Found target: {Id} at ({X},{Y}) dist={Dist:F1}",
+            this._logger.LogTrace("[ScriptExec]" + this._charTag + " Found target: {Id} at ({X},{Y}) dist={Dist:F1}",
                 best, best.Position.X, best.Position.Y,
                 (float)myPos.EuclideanDistanceTo(best.Position));
             return true;
@@ -1846,7 +1998,7 @@ public sealed class ScriptExecutor
 
         // Use NativeExecutionService for all attacks — this triggers proper damage pipeline
         // and quest kill count tracking, unlike the old GameAdapter/PacketInjector path.
-        if (p.SkillPriority is { Count: > 0 } && this._context.SkillService is not null)
+        if (p.SkillPriority is { Count: > 0 })
         {
             var skillList = this._player.SkillList;
             if (skillList is not null)
@@ -1860,17 +2012,6 @@ public sealed class ScriptExecutor
                     await this._nativeExec.SkillAttackAsync(target, skillEntry).ConfigureAwait(false);
                     return;
                 }
-            }
-        }
-
-        // Auto-skill selection (fallback)
-        if (p.SkillPriority is null or { Count: 0 } && this._context.SkillService is not null)
-        {
-            var skill = this._context.SkillService.SelectAttackSkill(target);
-            if (skill is not null)
-            {
-                await this._nativeExec.SkillAttackAsync(target, skill).ConfigureAwait(false);
-                return;
             }
         }
 
@@ -1889,7 +2030,7 @@ public sealed class ScriptExecutor
         // 目标已死亡 — 清除 target，容许巡逻
         if (target is Monster m && !m.IsAlive)
         {
-            this._logger.LogDebug("[ScriptExec] WalkToTargetAsync: target {Id} is dead, clearing", target);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " WalkToTargetAsync: target {Id} is dead, clearing", target);
             this._context.CurrentTarget = null;
             return;
         }
@@ -1912,7 +2053,7 @@ public sealed class ScriptExecutor
             this._targetBlacklist[monster2.Id] = this._scriptTickCounter;
         }
 
-        this._logger.LogTrace("[ScriptExec] Walk to target ({X},{Y}) failed — blacklisting and clearing target", target.Position.X, target.Position.Y);
+        this._logger.LogTrace("[ScriptExec]" + this._charTag + " Walk to target ({X},{Y}) failed — blacklisting and clearing target", target.Position.X, target.Position.Y);
         this._context.CurrentTarget = null;
     }
 
@@ -1927,7 +2068,7 @@ public sealed class ScriptExecutor
         // 目标已死亡 — 清除 target，容许巡逻
         if (target is Monster m && !m.IsAlive)
         {
-            this._logger.LogDebug("[ScriptExec] ApproachTargetAsync: target {Id} is dead, clearing", target);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " ApproachTargetAsync: target {Id} is dead, clearing", target);
             this._context.CurrentTarget = null;
             return;
         }
@@ -1947,16 +2088,16 @@ public sealed class ScriptExecutor
         }
 
         // Walk toward target, but stop 1 tile before attack range
-        this._logger.LogDebug("[ScriptExec] ApproachTarget: TryWalkToAsync to target at ({X},{Y})", target.Position.X, target.Position.Y);
+        this._logger.LogDebug("[ScriptExec]" + this._charTag + " ApproachTarget: TryWalkToAsync to target at ({X},{Y})", target.Position.X, target.Position.Y);
         var walkResult = await TryWalkToAsync(target.Position, map).ConfigureAwait(false);
         if (walkResult)
         {
-            this._logger.LogDebug("[ScriptExec] ApproachTarget: TryWalkToAsync succeeded to ({X},{Y})", target.Position.X, target.Position.Y);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " ApproachTarget: TryWalkToAsync succeeded to ({X},{Y})", target.Position.X, target.Position.Y);
             this.ResetIdleTimer(); // 走路成功 = 有进展
             return;
         }
 
-        this._logger.LogDebug("[ScriptExec] ApproachTarget: TryWalkToAsync failed to ({X},{Y})", target.Position.X, target.Position.Y);
+        this._logger.LogDebug("[ScriptExec]" + this._charTag + " ApproachTarget: TryWalkToAsync failed to ({X},{Y})", target.Position.X, target.Position.Y);
 
         // Pathfinding failed — target is unreachable. Blacklist it so
         // find_target doesn't immediately re-select it, then clear.
@@ -1965,7 +2106,7 @@ public sealed class ScriptExecutor
             this._targetBlacklist[monster3.Id] = this._scriptTickCounter;
         }
 
-        this._logger.LogTrace("[ScriptExec] Approach to target ({X},{Y}) failed — blacklisting and clearing target", target.Position.X, target.Position.Y);
+        this._logger.LogTrace("[ScriptExec]" + this._charTag + " Approach to target ({X},{Y}) failed — blacklisting and clearing target", target.Position.X, target.Position.Y);
         this._context.CurrentTarget = null;
     }
 
@@ -1983,6 +2124,13 @@ public sealed class ScriptExecutor
             return;
         }
 
+        // 如果在热点附近，不做巡逻（等待怪物刷出）
+        if (IsNearAnyHotspot(p.PatrolRadius))
+        {
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " At hotspot — skipping patrol to wait for monster spawns");
+            return;
+        }
+
         // Periodically shift patrol center
         this._patrolTickCounter++;
         if (this._patrolTickCounter > p.PatrolCenterResetTicks)
@@ -1991,7 +2139,7 @@ public sealed class ScriptExecutor
             this._patrolCenter = this._context.GameAdapter.GetPlayerPosition();
         }
 
-        this._logger.LogDebug("[ScriptExec] RandomPatrolAsync: starting patrol (center={CX},{CY}, radius={R})", this._patrolCenter.X, this._patrolCenter.Y, p.PatrolRadius);
+        this._logger.LogDebug("[ScriptExec]" + this._charTag + " RandomPatrolAsync: starting patrol (center={CX},{CY}, radius={R})", this._patrolCenter.X, this._patrolCenter.Y, p.PatrolRadius);
 
         const int maxAttempts = 10;
         for (var attempt = 0; attempt < maxAttempts; attempt++)
@@ -2010,12 +2158,12 @@ public sealed class ScriptExecutor
             var target = new Point((byte)tx, (byte)ty);
             if (await TryWalkToAsync(target, map).ConfigureAwait(false))
             {
-                this._logger.LogDebug("[ScriptExec] RandomPatrolAsync: walked to ({TX},{TY})", target.X, target.Y);
+                this._logger.LogDebug("[ScriptExec]" + this._charTag + " RandomPatrolAsync: walked to ({TX},{TY})", target.X, target.Y);
                 return;
             }
         }
 
-        this._logger.LogDebug("[ScriptExec] RandomPatrolAsync: all {N} attempts failed, using short-range fallback", maxAttempts);
+        this._logger.LogDebug("[ScriptExec]" + this._charTag + " RandomPatrolAsync: all {N} attempts failed, using short-range fallback", maxAttempts);
 
         // Short-range fallback (bypass A*, walk directly to nearby walkable tile)
         await ShortRangeFallbackAsync(map).ConfigureAwait(false);
@@ -2033,13 +2181,13 @@ public sealed class ScriptExecutor
         // Reset force-through flag — only set to true if Phase 2 (original grid) is used
         this._forceThruActive = false;
 
-        this._logger.LogDebug("[ScriptExec] TryWalkToAsync: pos=({PX},{PY}) target=({TX},{TY}), grid[start]={SV}, grid[end]={EV}",
+        this._logger.LogDebug("[ScriptExec]" + this._charTag + " TryWalkToAsync: pos=({PX},{PY}) target=({TX},{TY}), grid[start]={SV}, grid[end]={EV}",
             pos.X, pos.Y, target.X, target.Y, sv, ev);
 
         var selector = this._player.AlgorithmSelector;
         if (selector is null || selector.Count == 0)
         {
-            this._logger.LogWarning("[ScriptExec] TryWalkToAsync: No algorithm selector available!");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " TryWalkToAsync: No algorithm selector available!");
             return false;
         }
 
@@ -2055,15 +2203,7 @@ public sealed class ScriptExecutor
             // Shadow Map Layer: merge monster density, failure records, etc. into AIgrid
             // before A* pathfinding so the path naturally avoids dangerous areas.
             byte[,] searchGrid;
-            if (this._context.AiMap is not null)
-            {
-                var shadow = this._context.AiMap.GetOrCreateShadowLayer(this._player.AiPlayerId, this._logger);
-                searchGrid = ShadowGridCostMerger.MergeGrid(map.Terrain.AIgrid, shadow, pos, target, this._player.AiPlayerId);
-            }
-            else
-            {
-                searchGrid = map.Terrain.AIgrid;
-            }
+            searchGrid = map.Terrain.AIgrid;
 
             // Monster Danger Filter: mark tiles near monsters that exceed the AI's
             // capability as impassable (127), so A* routes around them.
@@ -2095,7 +2235,7 @@ public sealed class ScriptExecutor
                         {
                             var tx = mx + dx;
                             var ty = my + dy;
-                            if (tx >= 0 && tx < ShadowMapLayer.MapSize && ty >= 0 && ty < ShadowMapLayer.MapSize)
+                            if (tx >= 0 && tx < 256 && ty >= 0 && ty < 256)
                             {
                                 searchGrid[tx, ty] = 127;
                             }
@@ -2118,7 +2258,7 @@ public sealed class ScriptExecutor
                     break;
                 }
 
-                this._logger!.LogDebug("[ScriptExec] TryWalkToAsync: {Algo} FAILED from ({PX},{PY}) to ({TX},{TY})",
+                this._logger!.LogDebug("[ScriptExec]" + this._charTag + " TryWalkToAsync: {Algo} FAILED from ({PX},{PY}) to ({TX},{TY})",
                     algo.Name, pos.X, pos.Y, target.X, target.Y);
             }
 
@@ -2131,27 +2271,6 @@ public sealed class ScriptExecutor
                     this._logger!.LogWarning(
                         "[ForceThru] Skipping force-through after {Count} deaths — marking ({TX},{TY}) as DangerZone",
                         this._forceThruDeathCount, target.X, target.Y);
-
-                    if (this._context.AiMap is not null)
-                    {
-                        var shadow = this._context.AiMap.GetOrCreateShadowLayer(
-                            this._player.AiPlayerId, this._logger);
-                        var now = DateTime.UtcNow;
-                        var dangerEntry = new ShadowEntry
-                        {
-                            Id = Guid.NewGuid(),
-                            X = (byte)target.X,
-                            Y = (byte)target.Y,
-                            Type = ShadowEntryType.DangerZone,
-                            SubType = 5, // danger level 5 (max)
-                            Visibility = ShadowVisibility.AIOnly,
-                            OwnerId = this._player.AiPlayerId,
-                            CreatedAt = now,
-                            ExpiresAt = now.AddMinutes(10),
-                            References = Array.Empty<Guid>(),
-                        };
-                        shadow.AddEntry((byte)target.X, (byte)target.Y, dangerEntry);
-                    }
                 }
                 else
                 {
@@ -2178,7 +2297,7 @@ public sealed class ScriptExecutor
             if (path is null || path.Count == 0)
             {
                 this._logger!.LogInformation(
-                    "[ScriptExec] TryWalkToAsync: ALL {Count} algorithms + force-through failed from ({PX},{PY}) to ({TX},{TY}), trying incremental step...",
+                    "[ScriptExec]" + this._charTag + " TryWalkToAsync: ALL {Count} algorithms + force-through failed from ({PX},{PY}) to ({TX},{TY}), trying incremental step...",
                     algorithms.Count, pos.X, pos.Y, target.X, target.Y);
 
                 // Phase 3: Greedy incremental walk toward target
@@ -2195,7 +2314,7 @@ public sealed class ScriptExecutor
             }
 
             this._logger!.LogInformation(
-                "[ScriptExec] TryWalkToAsync: {Algo} OK — {Count} steps from ({PX},{PY}) to ({TX},{TY})",
+                "[ScriptExec]" + this._charTag + " TryWalkToAsync: {Algo} OK — {Count} steps from ({PX},{PY}) to ({TX},{TY})",
                 usedAlgorithm!.Name, path.Count, pos.X, pos.Y, target.X, target.Y);
 
             // Walk the found path (max 16 steps per call to bound execution time)
@@ -2212,18 +2331,11 @@ public sealed class ScriptExecutor
             var targetNode = path[Math.Min(path.Count - 1, maxSteps - 1)];
             await this._context.GameAdapter.WalkDirectAsync(new Point(targetNode.X, targetNode.Y), steps).ConfigureAwait(false);
 
-            // Record PathTrail in shadow map layer for future path planning reference
-            if (this._context.AiMap is not null)
-            {
-                var shadow = this._context.AiMap.GetOrCreateShadowLayer(this._player.AiPlayerId, this._logger);
-                shadow.RecordPathTrail(pos, target, path.Count, this._player.AiPlayerId);
-            }
-
             return true;
         }
         catch (Exception ex)
         {
-            this._logger.LogWarning(ex, "[ScriptExec] TryWalkToAsync: pathfinding threw from ({PX},{PY}) to ({TX},{TY})", pos.X, pos.Y, target.X, target.Y);
+            this._logger.LogWarning(ex, "[ScriptExec]" + this._charTag + " TryWalkToAsync: pathfinding threw from ({PX},{PY}) to ({TX},{TY})", pos.X, pos.Y, target.X, target.Y);
             return false;
         }
     }
@@ -2276,7 +2388,7 @@ public sealed class ScriptExecutor
 
         if (!found)
         {
-            this._logger.LogWarning("[ScriptExec] TryWalkOneStepTowardAsync: no walkable neighbor toward ({TX},{TY}) from ({PX},{PY})",
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " TryWalkOneStepTowardAsync: no walkable neighbor toward ({TX},{TY}) from ({PX},{PY})",
                 target.X, target.Y, pos.X, pos.Y);
             return false;
         }
@@ -2284,7 +2396,7 @@ public sealed class ScriptExecutor
         var targetPoint = bestStep.To;
         await this._context.GameAdapter.WalkDirectAsync(targetPoint, new[] { bestStep }).ConfigureAwait(false);
 
-        this._logger.LogDebug("[ScriptExec] TryWalkOneStepTowardAsync: step ({PX},{PY})→({NX},{NY}) toward ({TX},{TY})",
+        this._logger.LogDebug("[ScriptExec]" + this._charTag + " TryWalkOneStepTowardAsync: step ({PX},{PY})→({NX},{NY}) toward ({TX},{TY})",
             pos.X, pos.Y, targetPoint.X, targetPoint.Y, target.X, target.Y);
         return true;
     }
@@ -2322,29 +2434,29 @@ public sealed class ScriptExecutor
 
     private async ValueTask<bool> ReturnAndSellAsync(ScriptParameters p)
     {
-        this._logger.LogInformation("[ScriptExec] >>> ReturnAndSellAsync ENTERED at tick={Tick}, pos=({X},{Y})",
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " >>> ReturnAndSellAsync ENTERED at tick={Tick}, pos=({X},{Y})",
             this._scriptTickCounter, this._context.GameAdapter.GetPlayerPosition().X, this._context.GameAdapter.GetPlayerPosition().Y);
 
-        var npcService = this._context.NpcService;
+        var npcService = this._npcService;
         if (npcService is null)
         {
-            this._logger.LogWarning("[ScriptExec] NpcInteractionService not available — cannot return and sell.");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " NpcInteractionService not available — cannot return and sell.");
             return false;
         }
 
         var map = this._context.WorldState.CurrentMap;
         if (map is null)
         {
-            this._logger.LogWarning("[ScriptExec] No current map — cannot return and sell.");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " No current map — cannot return and sell.");
             return false;
         }
 
         // Step 0: check interaction cooldown
         var ready = npcService.IsReadyForInteraction;
-        this._logger.LogInformation("[ScriptExec] IsReadyForInteraction={Ready}", ready);
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " IsReadyForInteraction={Ready}", ready);
         if (!ready)
         {
-            this._logger.LogInformation("[ScriptExec] NPC interaction on cooldown — waiting.");
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " NPC interaction on cooldown — waiting.");
             return false;
         }
 
@@ -2355,15 +2467,15 @@ public sealed class ScriptExecutor
         var returnCooldownSec = p.ReturnCooldownSec;
         if ((DateTime.UtcNow - this._lastFailedMerchantAttempt).TotalSeconds < returnCooldownSec)
         {
-            this._logger.LogInformation("[ScriptExec] ReturnAndSell on cooldown ({Sec}s) — skipping.", returnCooldownSec);
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " ReturnAndSell on cooldown ({Sec}s) — skipping.", returnCooldownSec);
             return false;
         }
 
         var merchant = npcService.FindNearestMerchant(map, playerPos);
-        this._logger.LogInformation("[ScriptExec] FindNearestMerchant returned {Merchant}", merchant?.Definition?.Designation ?? "null");
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " FindNearestMerchant returned {Merchant}", merchant?.Definition?.Designation ?? "null");
         if (merchant is null)
         {
-            this._logger.LogInformation("[ScriptExec] No merchant NPC found on map — cannot sell. Falling through to drop_item.");
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " No merchant NPC found on map — cannot sell. Falling through to drop_item.");
             this._lastFailedMerchantAttempt = DateTime.UtcNow;
             return false;
         }
@@ -2377,7 +2489,7 @@ public sealed class ScriptExecutor
         if (merchantDist > dialogRange)
         {
             this._logger.LogWarning(
-                "[ScriptExec] Nearest walkable tile ({Wx},{Wy}) is {Dist:F0} tiles from merchant ({Mx},{My}) — too far for dialog (max {Range}). Setting cooldown.",
+                "[ScriptExec]" + this._charTag + " Nearest walkable tile ({Wx},{Wy}) is {Dist:F0} tiles from merchant ({Mx},{My}) — too far for dialog (max {Range}). Setting cooldown.",
                 walkTarget.X, walkTarget.Y, merchantDist, merchant.Position.X, merchant.Position.Y, dialogRange);
             this._lastFailedMerchantAttempt = DateTime.UtcNow;
             return false;
@@ -2386,14 +2498,14 @@ public sealed class ScriptExecutor
         var dist = playerPos.EuclideanDistanceTo(walkTarget);
         if (dist > dialogRange)
         {
-            this._logger.LogDebug("[ScriptExec] Walking to merchant {Name} at ({X},{Y}), dist={Dist:F1}",
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " Walking to merchant {Name} at ({X},{Y}), dist={Dist:F1}",
                 merchant.Definition?.Designation, walkTarget.X, walkTarget.Y, dist);
 
             SuppressAutoNavigationForThisTick();
 
             if (!await TryWalkToAsync(walkTarget, map).ConfigureAwait(false))
             {
-                this._logger.LogWarning("[ScriptExec] Could not pathfind to merchant walk target at ({X},{Y})", walkTarget.X, walkTarget.Y);
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " Could not pathfind to merchant walk target at ({X},{Y})", walkTarget.X, walkTarget.Y);
                 this._lastFailedMerchantAttempt = DateTime.UtcNow;
                 return false;
             }
@@ -2403,41 +2515,41 @@ public sealed class ScriptExecutor
         }
 
         // Step 3: we're in range — open dialog
-        this._logger.LogDebug("[ScriptExec] Opening NPC dialog with merchant {Name}", merchant.Definition?.Designation);
+        this._logger.LogDebug("[ScriptExec]" + this._charTag + " Opening NPC dialog with merchant {Name}", merchant.Definition?.Designation);
 
         SuppressAutoNavigationForThisTick();
 
         if (!await npcService.TryOpenDialogAsync(this._player, merchant).ConfigureAwait(false))
         {
-            this._logger.LogWarning("[ScriptExec] Failed to open NPC dialog with merchant.");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " Failed to open NPC dialog with merchant.");
             return false;
         }
 
         // Step 4: sell items (inventory slot >= 12, i.e. non-equipped)
         var sold = await npcService.SellItemsAsync(this._player).ConfigureAwait(false);
-        this._logger.LogInformation("[ScriptExec] Sold {Sold} items to merchant.", sold);
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " Sold {Sold} items to merchant.", sold);
 
         // Step 5: repair all equipment
         try
         {
             await npcService.RepairAllEquipmentAsync(this._player).ConfigureAwait(false);
-            this._logger.LogDebug("[ScriptExec] Equipment repaired.");
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " Equipment repaired.");
         }
         catch (Exception ex)
         {
-            this._logger.LogWarning(ex, "[ScriptExec] Equipment repair failed.");
+            this._logger.LogWarning(ex, "[ScriptExec]" + this._charTag + " Equipment repair failed.");
         }
 
         // Step 6: buy potions
         var bought = await npcService.BuyPotionsAsync(this._player).ConfigureAwait(false);
         if (bought > 0)
         {
-            this._logger.LogDebug("[ScriptExec] Bought {Bought} potions.", bought);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " Bought {Bought} potions.", bought);
         }
 
         // Step 7: close dialog
         await npcService.CloseDialogAsync(this._player).ConfigureAwait(false);
-        this._logger.LogInformation("[ScriptExec] Return-and-sell complete. Sold={Sold}, RepairDone, Bought={Bought}", sold, bought);
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " Return-and-sell complete. Sold={Sold}, RepairDone, Bought={Bought}", sold, bought);
 
         // Clear target so patrol resumes
         this._context.CurrentTarget = null;
@@ -2449,7 +2561,7 @@ public sealed class ScriptExecutor
         var returnTarget = FindNearestWalkableTile(this._patrolCenter, map, this._context.GameAdapter.GetPlayerPosition(), maxRadius: 10);
         if (returnTarget != this._context.GameAdapter.GetPlayerPosition())
         {
-            this._logger.LogDebug("[ScriptExec] ReturnAndSell: walking back to patrol area ({X},{Y})", returnTarget.X, returnTarget.Y);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " ReturnAndSell: walking back to patrol area ({X},{Y})", returnTarget.X, returnTarget.Y);
             SuppressAutoNavigationForThisTick();
             if (await TryWalkToAsync(returnTarget, map).ConfigureAwait(false))
             {
@@ -2556,7 +2668,7 @@ public sealed class ScriptExecutor
                         if (map.Terrain.WalkMap[tx, ty])
                         {
                             this._logger.LogDebug(
-                                "[ScriptExec] FindNearestWalkableTile: fallback to walkable-only tile ({Tx},{Ty}) near ({Cx},{Cy}) — not reachable from player ({Px},{Py}).",
+                                "[ScriptExec]" + this._charTag + " FindNearestWalkableTile: fallback to walkable-only tile ({Tx},{Ty}) near ({Cx},{Cy}) — not reachable from player ({Px},{Py}).",
                                 tx, ty, center.X, center.Y, playerPos.X, playerPos.Y);
                             return new Point((byte)tx, (byte)ty);
                         }
@@ -2566,7 +2678,7 @@ public sealed class ScriptExecutor
         }
 
         this._logger.LogWarning(
-            "[ScriptExec] FindNearestWalkableTile: no walkable tile found within radius {Radius} around ({Cx},{Cy}). Walkable tiles in area: {Count}",
+            "[ScriptExec]" + this._charTag + " FindNearestWalkableTile: no walkable tile found within radius {Radius} around ({Cx},{Cy}). Walkable tiles in area: {Count}",
             maxRadius,
             center.X,
             center.Y,
@@ -2616,7 +2728,7 @@ public sealed class ScriptExecutor
     /// </summary>
     private async ValueTask DropItemAsync(ScriptParameters p)
     {
-        this._logger.LogInformation("[ScriptExec] drop_item: stub — inventory manager removed; item drop handled by stubs.");
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " drop_item: stub — inventory manager removed; item drop handled by stubs.");
         await Task.CompletedTask.ConfigureAwait(false);
     }
 
@@ -2628,75 +2740,23 @@ public sealed class ScriptExecutor
     /// </summary>
     private async ValueTask ScriptWalkRouteAsync(ScriptParameters p)
     {
-        var aiMap = this._context.AiMap;
-        if (aiMap is null)
-        {
-            return;
-        }
-
-        // 继续当前路线或按参数选择
-        RouteTemplate? route = null;
-        if (!string.IsNullOrEmpty(p.RouteId))
-        {
-            route = aiMap.GetRoute(p.RouteId);
-            if (route is null)
-            {
-                this._logger.LogWarning("[ScriptExec] walk_route: route '{Id}' not found", p.RouteId);
-                return;
-            }
-
-            this._scriptRouteId = p.RouteId;
-        }
-        else if (this._scriptRouteId is not null)
-        {
-            route = aiMap.GetRoute(this._scriptRouteId);
-        }
-
-        route ??= aiMap.PickRandomRoute(0);
-        if (route is null)
-        {
-            this._logger.LogTrace("[ScriptExec] walk_route: no routes available");
-            return;
-        }
-
-        this._scriptRouteId = route.Id;
-
-        // 如果指定了 jitter 覆盖，创建临时副本
-        if (p.Jitter != 3)
-        {
-            route = new RouteTemplate
-            {
-                Id = route.Id,
-                DisplayName = route.DisplayName,
-                Points = route.Points,
-                JitterRadius = p.Jitter,
-                Source = route.Source,
-                TeamId = route.TeamId,
-            };
-        }
-
-        var (hasMore, nextStep) = await RouteFollower.WalkRouteAsync(
-            this._player, aiMap, route, this._scriptRouteStep, this._context).ConfigureAwait(false);
-        this._scriptRouteStep = nextStep;
-
-        if (!hasMore)
-        {
-            // 到达终点，重置以便下次重新选路
-            this._scriptRouteId = null;
-            this._scriptRouteStep = 0;
-        }
+        // AiMap-based route walking is no longer available — routes can't be resolved
+        // without the AiMap service. Log a warning and silently return.
+        this._logger.LogWarning(
+            "[ScriptExec]" + this._charTag + " walk_route: AiMap not available, route walking skipped (route='{RouteId}')",
+            p.RouteId ?? "auto");
+        await Task.CompletedTask.ConfigureAwait(false);
     }
 
     /// <summary>
     /// 离开安全区（leave_safezone 脚本动作）。
-    /// 用 AiMap.SafezoneGrid 找最近的 non-safezone 可走瓦片，走过去。
+    /// 用 GameMap.Terrain 找最近的 non-safezone 可走瓦片，走过去。
     /// 清除当前目标。
     /// </summary>
     private async ValueTask ScriptLeaveSafezoneAsync(ScriptParameters p)
     {
-        var aiMap = this._context.AiMap;
         var map = this._context.WorldState.CurrentMap;
-        if (aiMap is null || map is null)
+        if (map is null)
         {
             return;
         }
@@ -2705,6 +2765,7 @@ public sealed class ScriptExecutor
 
         // 从当前位置向外螺旋搜索最近的 non-safezone 可走瓦片
         const int maxRadius = 30;
+        const int mapSize = 256;
         for (var radius = 1; radius <= maxRadius; radius++)
         {
             // 扫描当前半径的矩形边框
@@ -2721,17 +2782,17 @@ public sealed class ScriptExecutor
                     var tx = pos.X + dx;
                     var ty = pos.Y + dy;
 
-                    if (tx < 0 || tx >= AiMap.MapSize || ty < 0 || ty >= AiMap.MapSize)
+                    if (tx < 0 || tx >= mapSize || ty < 0 || ty >= mapSize)
                     {
                         continue;
                     }
 
-                    if (!aiMap.WalkGrid[tx, ty])
+                    if (!map.Terrain.WalkMap[tx, ty])
                     {
                         continue;
                     }
 
-                    if (aiMap.SafezoneGrid[tx, ty])
+                    if (map.Terrain.SafezoneMap[tx, ty])
                     {
                         continue; // 仍在安全区内
                     }
@@ -2740,7 +2801,7 @@ public sealed class ScriptExecutor
                     var target = new Point((byte)tx, (byte)ty);
                     if (await TryWalkToAsync(target, map).ConfigureAwait(false))
                     {
-                        this._logger.LogDebug("[ScriptExec] LeaveSafezone: walking to ({TX},{TY})", tx, ty);
+                        this._logger.LogDebug("[ScriptExec]" + this._charTag + " LeaveSafezone: walking to ({TX},{TY})", tx, ty);
                         this._context.CurrentTarget = null;
                         return;
                     }
@@ -2748,84 +2809,46 @@ public sealed class ScriptExecutor
             }
         }
 
-        // 半径内没找到合适目标 → 降级策略：直接朝安全区外走一步
-        this._logger.LogWarning("[ScriptExec] LeaveSafezone: TryWalkToAsync failed for all candidates within radius {Radius}, trying direct walk fallback", maxRadius);
-        await FallbackLeaveSafezoneAsync(aiMap, map, pos).ConfigureAwait(false);
+        // 半径内没找到合适目标 → 降级策略：直接朝外走一步
+        this._logger.LogWarning("[ScriptExec]" + this._charTag + " LeaveSafezone: TryWalkToAsync failed for all candidates within radius {Radius}, trying direct walk fallback", maxRadius);
+        await FallbackLeaveSafezoneAsync(map, pos).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// 离开安全区降级策略 — 直接朝远离安全区中心的方向走一步。
+    /// 离开安全区降级策略 — 直接朝远离安全区的方向走一步。
     /// 当 TryWalkToAsync 因 Monster Danger Filter 等阻塞所有路径时生效。
     /// </summary>
-    private async ValueTask FallbackLeaveSafezoneAsync(AiMap aiMap, GameMap map, Point pos)
+    private async ValueTask FallbackLeaveSafezoneAsync(GameMap map, Point pos)
     {
-        // 找安全区中心：扫描 SafezoneGrid 范围中心
-        var safeZoneCenter = FindSafeZoneCenter(aiMap);
-        if (safeZoneCenter is null)
-        {
-            // 连安全区中心都找不到 → 随机走一步
-            this._logger.LogWarning("[ScriptExec] FallbackLeaveSafezone: cannot find safezone center, random step");
-            await TryWalkOneStepTowardAsync(
-                new Point((byte)Random.Shared.Next(0, 256), (byte)Random.Shared.Next(0, 256)),
-                map).ConfigureAwait(false);
-            return;
-        }
-
-        // 朝远离安全区中心的方向走一步（使用 GameAdapter 直接走，不经过 Monster Danger Filter）
-        // 计算从安全区中心到玩家位置的向量，反向 = 远离中心
-        var awayX = pos.X + (pos.X - safeZoneCenter.Value.X);
-        var awayY = pos.Y + (pos.Y - safeZoneCenter.Value.Y);
+        // 朝地图中心的反方向走（远离安全区中心的大致方向）
+        const int mapCenterX = 128;
+        const int mapCenterY = 128;
+        var awayX = pos.X + (pos.X - mapCenterX);
+        var awayY = pos.Y + (pos.Y - mapCenterY);
 
         // 避免超出地图边界
         awayX = Math.Clamp(awayX, 0, 255);
         awayY = Math.Clamp(awayY, 0, 255);
 
         // 检查目标是否可走且非安全区
-        if (aiMap.WalkGrid[awayX, awayY] && !aiMap.SafezoneGrid[awayX, awayY])
+        if (map.Terrain.WalkMap[awayX, awayY] && !map.Terrain.SafezoneMap[awayX, awayY])
         {
             // 使用 GameAdapter.WalkToAsync（不走 TryWalkToAsync，跳过 Monster Danger Filter）
             var result = await this._context.GameAdapter.WalkToAsync(new Point((byte)awayX, (byte)awayY), map).ConfigureAwait(false);
             if (result.Status == WalkStatusCode.Success)
             {
-                this._logger.LogInformation("[ScriptExec] FallbackLeaveSafezone: direct walk to ({X},{Y}) away from safezone center", awayX, awayY);
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " FallbackLeaveSafezone: direct walk to ({X},{Y}) away from map center", awayX, awayY);
                 this._context.CurrentTarget = null;
                 return;
             }
         }
 
         // 备用：走一步（TryWalkOneStepTowardAsync 用 WalkMap 判断，最简单可靠）
-        this._logger.LogWarning("[ScriptExec] FallbackLeaveSafezone: direct walk failed, one-step fallback");
+        this._logger.LogWarning("[ScriptExec]" + this._charTag + " FallbackLeaveSafezone: direct walk failed, one-step fallback");
         if (await TryWalkOneStepTowardAsync(new Point((byte)awayX, (byte)awayY), map).ConfigureAwait(false))
         {
             this._context.CurrentTarget = null;
         }
-    }
-
-    /// <summary>
-    /// 在 SafezoneGrid 中找安全区中心（所有安全区格的平均坐标）。
-    /// 返回 null 表示地图没有安全区。
-    /// </summary>
-    private static Point? FindSafeZoneCenter(AiMap aiMap)
-    {
-        var sumX = 0;
-        var sumY = 0;
-        var count = 0;
-        for (var x = 0; x < AiMap.MapSize; x++)
-        {
-            for (var y = 0; y < AiMap.MapSize; y++)
-            {
-                if (aiMap.SafezoneGrid[x, y])
-                {
-                    sumX += x;
-                    sumY += y;
-                    count++;
-                }
-            }
-        }
-
-        return count > 0
-            ? new Point((byte)(sumX / count), (byte)(sumY / count))
-            : null;
     }
 
     /// <summary>
@@ -2834,18 +2857,9 @@ public sealed class ScriptExecutor
     /// </summary>
     private async ValueTask ScriptDiscoverTrailAsync(ScriptParameters p)
     {
-        var aiMap = this._context.AiMap;
-        if (aiMap is null)
-        {
-            return;
-        }
-
-        if (TrailDiscovery.FindTrail(aiMap, this._context.GameAdapter.GetPlayerPosition()) is null)
-        {
-            return; // 无痕迹，跳过
-        }
-
-        await TrailDiscovery.FollowTrailAsync(this._player, aiMap, this._context).ConfigureAwait(false);
+        // AiMap-based trail discovery is no longer available — silently skip.
+        this._logger.LogWarning("[ScriptExec]" + this._charTag + " discover_trail: AiMap not available, trail discovery skipped");
+        await Task.CompletedTask.ConfigureAwait(false);
     }
 
     private async ValueTask<bool> PickupNearbyItemsAsync(ScriptParameters p)
@@ -2929,33 +2943,21 @@ public sealed class ScriptExecutor
     }
 
     /// <summary>
-    /// Applies auto-buff skills via SkillAIService.
-    /// Only executes if SkillService is available and a buff needs reapplication.
+    /// Applies auto-buff skills — no-op since SkillService was removed.
     /// </summary>
     private async ValueTask UseBuffAsync(ScriptParameters p)
     {
-        var skillService = this._context.SkillService;
-        if (skillService is null)
-        {
-            return;
-        }
-
-        await skillService.TryAutoBuffAsync().ConfigureAwait(false);
+        // SkillService-based auto-buff is no longer available — skip.
+        await Task.CompletedTask.ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Applies healing/regeneration skills via SkillAIService.
-    /// Only executes if SkillService is available and a heal skill is usable.
+    /// Applies healing/regeneration skills — no-op since SkillService was removed.
     /// </summary>
     private async ValueTask UseHealSkillAsync(ScriptParameters p)
     {
-        var skillService = this._context.SkillService;
-        if (skillService is null)
-        {
-            return;
-        }
-
-        await skillService.TryHealAsync().ConfigureAwait(false);
+        // SkillService-based auto-heal is no longer available — skip.
+        await Task.CompletedTask.ConfigureAwait(false);
     }
 
     private async ValueTask SitAndRegenAsync(ScriptParameters p)
@@ -2976,9 +2978,8 @@ public sealed class ScriptExecutor
     /// </summary>
     private async ValueTask UseSkillAsync(ScriptParameters p)
     {
-        var skillService = this._context.SkillService;
         var target = this._context.CurrentTarget;
-        if (skillService is null || target is null || p.SkillNumber is null)
+        if (target is null || p.SkillNumber is null)
         {
             return;
         }
@@ -2992,7 +2993,7 @@ public sealed class ScriptExecutor
         var skillEntry = skillList.Skills.FirstOrDefault(s => s.Skill?.Number == p.SkillNumber.Value);
         if (skillEntry is null)
         {
-            this._logger.LogWarning("[ScriptExec] use_skill: skill #{SkillNumber} not found in skill list", p.SkillNumber.Value);
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " use_skill: skill #{SkillNumber} not found in skill list", p.SkillNumber.Value);
             return;
         }
 
@@ -3126,7 +3127,7 @@ public sealed class ScriptExecutor
         var expr = p.VariableExpression;
         if (string.IsNullOrWhiteSpace(expr))
         {
-            this._logger.LogWarning("[ScriptExec] variable condition with null/empty VariableExpression");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " variable condition with null/empty VariableExpression");
             return false;
         }
 
@@ -3135,7 +3136,7 @@ public sealed class ScriptExecutor
         var parts = expr.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (parts.Length < 3)
         {
-            this._logger.LogWarning("[ScriptExec] Invalid variable expression: {Expr}", expr);
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " Invalid variable expression: {Expr}", expr);
             return false;
         }
 
@@ -3143,7 +3144,7 @@ public sealed class ScriptExecutor
         var op = parts[1];
         if (!int.TryParse(parts[2], out var value))
         {
-            this._logger.LogWarning("[ScriptExec] Invalid variable comparison value: {Value} in expression: {Expr}", parts[2], expr);
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " Invalid variable comparison value: {Value} in expression: {Expr}", parts[2], expr);
             return false;
         }
 
@@ -3163,7 +3164,7 @@ public sealed class ScriptExecutor
         var opDesc = p.VariableOp;
         if (string.IsNullOrWhiteSpace(opDesc))
         {
-            this._logger.LogWarning("[ScriptExec] variable_op with null/empty VariableOp");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " variable_op with null/empty VariableOp");
             return false;
         }
 
@@ -3171,7 +3172,7 @@ public sealed class ScriptExecutor
         var parts = opDesc.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (parts.Length < 2)
         {
-            this._logger.LogWarning("[ScriptExec] Invalid variable operation: {Op}", opDesc);
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " Invalid variable operation: {Op}", opDesc);
             return false;
         }
 
@@ -3183,28 +3184,28 @@ public sealed class ScriptExecutor
             case "set":
                 if (parts.Length < 3 || !int.TryParse(parts[2], out var setValue))
                 {
-                    this._logger.LogWarning("[ScriptExec] Invalid set value: {Op}", opDesc);
+                    this._logger.LogWarning("[ScriptExec]" + this._charTag + " Invalid set value: {Op}", opDesc);
                     return false;
                 }
 
                 this._variables.Set(varName, setValue);
-                this._logger.LogTrace("[ScriptExec] Variable set: {Name} = {Value}", varName, setValue);
+                this._logger.LogTrace("[ScriptExec]" + this._charTag + " Variable set: {Name} = {Value}", varName, setValue);
                 return true;
 
             case "inc":
                 var incDelta = parts.Length >= 3 && int.TryParse(parts[2], out var parsedInc) ? parsedInc : 1;
                 this._variables.Inc(varName, incDelta);
-                this._logger.LogTrace("[ScriptExec] Variable inc: {Name} += {Delta} (now {Val})", varName, incDelta, this._variables.Get(varName));
+                this._logger.LogTrace("[ScriptExec]" + this._charTag + " Variable inc: {Name} += {Delta} (now {Val})", varName, incDelta, this._variables.Get(varName));
                 return true;
 
             case "dec":
                 var decDelta = parts.Length >= 3 && int.TryParse(parts[2], out var parsedDec) ? parsedDec : 1;
                 this._variables.Dec(varName, decDelta);
-                this._logger.LogTrace("[ScriptExec] Variable dec: {Name} -= {Delta} (now {Val})", varName, decDelta, this._variables.Get(varName));
+                this._logger.LogTrace("[ScriptExec]" + this._charTag + " Variable dec: {Name} -= {Delta} (now {Val})", varName, decDelta, this._variables.Get(varName));
                 return true;
 
             default:
-                this._logger.LogWarning("[ScriptExec] Unknown variable operation: {Cmd} in {Op}", cmd, opDesc);
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " Unknown variable operation: {Cmd} in {Op}", cmd, opDesc);
                 return false;
         }
     }
@@ -3244,18 +3245,83 @@ public sealed class ScriptExecutor
     {
         if (p.QuestGroup is null || p.QuestNumber is null)
         {
-            this._logger.LogWarning("[ScriptExec] start_quest requires questGroup and questNumber parameters");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " start_quest requires questGroup and questNumber parameters");
             return;
         }
+        var group = p.QuestGroup.Value;
+        var number = p.QuestNumber.Value;
         try
         {
             var questAction = new MUnique.OpenMU.GameLogic.PlayerActions.Quests.QuestStartAction();
-            await questAction.StartQuestAsync(this._player, p.QuestGroup.Value, p.QuestNumber.Value).ConfigureAwait(false);
-            this._logger.LogDebug("[ScriptExec] Started quest group={Group} number={Number}", p.QuestGroup, p.QuestNumber);
+            await questAction.StartQuestAsync(this._player, group, number).ConfigureAwait(false);
+
+            // Check if ActiveQuest was actually set by QuestStartAction.
+            // It silently fails when GetQuest() returns null (OpenedNpc-dependent).
+            var questStates = this._player.SelectedCharacter?.QuestStates;
+            var activeQuestSet = questStates?.Any(qs => qs.Group == group && qs.ActiveQuest is not null) ?? false;
+
+            if (activeQuestSet)
+            {
+                this._logger.LogDebug("[ScriptExec]" + this._charTag + " Started quest group={Group} number={Number}", group, number);
+                return;
+            }
+
+            // Fallback: QuestStartAction.StartQuestAsync failed (likely G0/QuestGiver=null)
+            // because GetQuest() depends on OpenedNpc. Find QuestDefinition from global config.
+            var questDef = this.FindQuestDefinition(group, number);
+            if (questDef is null)
+            {
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " start_quest fallback: QuestDefinition G{Group}/N{Number} not found in config", group, number);
+                return;
+            }
+
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " Auto-activating quest G{Group}/N{Number} via config fallback (QuestDefinition found={Found})", group, number, true);
+
+            // Check prerequisites: level range
+            if (questDef.MinimumCharacterLevel > this._player.Level ||
+                (questDef.MaximumCharacterLevel > 0 && questDef.MaximumCharacterLevel < this._player.Level))
+            {
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " start_quest fallback: level check failed for G{Group}/N{Number} (min={Min},max={Max})",
+                    group, number, questDef.MinimumCharacterLevel, questDef.MaximumCharacterLevel);
+                return;
+            }
+
+            // Get or create CharacterQuestState for this group
+            var questState = this._player.SelectedCharacter!.QuestStates.FirstOrDefault(q => q.Group == group);
+            if (questState is null)
+            {
+                questState = this._player.PersistenceContext.CreateNew<CharacterQuestState>();
+                questState.Group = group;
+                this._player.SelectedCharacter.QuestStates.Add(questState);
+            }
+
+            // Check repeatability
+            if (Equals(questState.LastFinishedQuest, questDef) && !questDef.Repeatable)
+            {
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " start_quest fallback: quest G{Group}/N{Number} is not repeatable", group, number);
+                return;
+            }
+
+            // Check RequiredStartMoney
+            if (questDef.RequiredStartMoney > 0)
+            {
+                if (!this._player.TryRemoveMoney(questDef.RequiredStartMoney))
+                {
+                    this._logger.LogWarning("[ScriptExec]" + this._charTag + " start_quest fallback: insufficient money for G{Group}/N{Number} (need={Need})",
+                        group, number, questDef.RequiredStartMoney);
+                    return;
+                }
+            }
+
+            // Clear existing state (matching QuestStartAction line 64-65 pattern)
+            await questState.ClearAsync(this._player.PersistenceContext).ConfigureAwait(false);
+            questState.ActiveQuest = questDef;
+
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " Quest G{Group}/N{Number} activated via config fallback", group, number);
         }
         catch (Exception ex)
         {
-            this._logger.LogDebug("[ScriptExec] Failed to start quest group={Group} number={Number}: {Msg}", p.QuestGroup, p.QuestNumber, ex.Message);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " Failed to start quest group={Group} number={Number}: {Msg}", group, number, ex.Message);
         }
     }
 
@@ -3263,19 +3329,19 @@ public sealed class ScriptExecutor
     {
         if (p.QuestGroup is null || p.QuestNumber is null)
         {
-            this._logger.LogWarning("[ScriptExec] complete_quest requires questGroup and questNumber parameters");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " complete_quest requires questGroup and questNumber parameters");
             return;
         }
         try
         {
             var questAction = new MUnique.OpenMU.GameLogic.PlayerActions.Quests.QuestCompletionAction();
             await questAction.CompleteQuestAsync(this._player, p.QuestGroup.Value, p.QuestNumber.Value).ConfigureAwait(false);
-            this._logger.LogDebug("[ScriptExec] Completed quest group={Group} number={Number}", p.QuestGroup, p.QuestNumber);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " Completed quest group={Group} number={Number}", p.QuestGroup, p.QuestNumber);
             await this._closeNpcDialog.CloseNpcDialogAsync(this._player).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            this._logger.LogDebug("[ScriptExec] Failed to complete quest group={Group} number={Number}: {Msg}", p.QuestGroup, p.QuestNumber, ex.Message);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " Failed to complete quest group={Group} number={Number}: {Msg}", p.QuestGroup, p.QuestNumber, ex.Message);
         }
         finally
         {
@@ -3287,7 +3353,7 @@ public sealed class ScriptExecutor
     {
         if (p.QuestGroup is null || p.QuestNumber is null)
         {
-            this._logger.LogWarning("[ScriptExec] accept_quest requires questGroup and questNumber parameters");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " accept_quest requires questGroup and questNumber parameters");
             return;
         }
 
@@ -3296,31 +3362,31 @@ public sealed class ScriptExecutor
             var result = await this._context.GameAdapter.StartQuestAsync(p.QuestGroup.Value, p.QuestNumber.Value).ConfigureAwait(false);
             if (result.Status == QuestStatusCode.Accepted)
             {
-                this._logger.LogInformation("[ScriptExec] Accepted quest group={Group} number={Number} status={Status}",
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " Accepted quest group={Group} number={Number} status={Status}",
                     p.QuestGroup, p.QuestNumber, result.Status);
                 this.ResetIdleTimer(); // 接任务成功 = 明确进展
                 // Log quest state right after accept
                 var qsAfter = this._player.SelectedCharacter?.QuestStates;
                 var afterCount = qsAfter?.Count ?? -1;
                 var afterDetails = qsAfter is null ? "null" : string.Join(", ", qsAfter.Select(qs => $"G{qs.Group} AQ={(qs.ActiveQuest is null ? "null" : qs.ActiveQuest.Number.ToString())}"));
-                this._logger.LogInformation("[ScriptExec] After accept: qsCount={Count}, details=[{Details}]", afterCount, afterDetails);
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " After accept: qsCount={Count}, details=[{Details}]", afterCount, afterDetails);
                 // Close NPC dialog so player returns to EnteredWorld and can resume hunting
                 await this._closeNpcDialog.CloseNpcDialogAsync(this._player).ConfigureAwait(false);
                 // Log quest state after dialog close too
                 var qsAfterClose = this._player.SelectedCharacter?.QuestStates;
                 var afterCloseCount = qsAfterClose?.Count ?? -1;
                 var afterCloseDetails = qsAfterClose is null ? "null" : string.Join(", ", qsAfterClose.Select(qs => $"G{qs.Group} AQ={(qs.ActiveQuest is null ? "null" : qs.ActiveQuest.Number.ToString())}"));
-                this._logger.LogInformation("[ScriptExec] After dialog close: qsCount={Count}, details=[{Details}]", afterCloseCount, afterCloseDetails);
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " After dialog close: qsCount={Count}, details=[{Details}]", afterCloseCount, afterCloseDetails);
             }
             else
             {
-                this._logger.LogWarning("[ScriptExec] Failed to accept quest group={Group} number={Number}: {Reason} (status={Status})",
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " Failed to accept quest group={Group} number={Number}: {Reason} (status={Status})",
                     p.QuestGroup, p.QuestNumber, result.Reason ?? "未知", result.Status);
             }
         }
         catch (Exception ex)
         {
-            this._logger.LogError(ex, "[ScriptExec] Error accepting quest group={Group} number={Number}", p.QuestGroup, p.QuestNumber);
+            this._logger.LogError(ex, "[ScriptExec]" + this._charTag + " Error accepting quest group={Group} number={Number}", p.QuestGroup, p.QuestNumber);
         }
         finally
         {
@@ -3332,7 +3398,7 @@ public sealed class ScriptExecutor
     {
         if (p.QuestGroup is null || p.QuestNumber is null)
         {
-            this._logger.LogWarning("[ScriptExec] submit_quest requires questGroup and questNumber parameters");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " submit_quest requires questGroup and questNumber parameters");
             return;
         }
 
@@ -3341,7 +3407,7 @@ public sealed class ScriptExecutor
             var result = await this._context.GameAdapter.CompleteQuestAsync(p.QuestGroup.Value, p.QuestNumber.Value).ConfigureAwait(false);
             if (result.Status == QuestStatusCode.Accepted)
             {
-                this._logger.LogInformation("[ScriptExec] Submitted quest group={Group} number={Number} status={Status}",
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " Submitted quest group={Group} number={Number} status={Status}",
                     p.QuestGroup, p.QuestNumber, result.Status);
                 this.ResetIdleTimer(); // 交任务成功 = 明确进展
                 // Close NPC dialog so player returns to EnteredWorld and can resume next cycle
@@ -3349,13 +3415,13 @@ public sealed class ScriptExecutor
             }
             else
             {
-                this._logger.LogWarning("[ScriptExec] Failed to submit quest group={Group} number={Number}: {Reason} (status={Status})",
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " Failed to submit quest group={Group} number={Number}: {Reason} (status={Status})",
                     p.QuestGroup, p.QuestNumber, result.Reason ?? "未知", result.Status);
             }
         }
         catch (Exception ex)
         {
-            this._logger.LogError(ex, "[ScriptExec] Error submitting quest group={Group} number={Number}", p.QuestGroup, p.QuestNumber);
+            this._logger.LogError(ex, "[ScriptExec]" + this._charTag + " Error submitting quest group={Group} number={Number}", p.QuestGroup, p.QuestNumber);
         }
         finally
         {
@@ -3371,143 +3437,171 @@ public sealed class ScriptExecutor
     /// </summary>
     private async ValueTask<WalkToNpcResult> WalkToQuestNpcWithFallthroughAsync(ScriptParameters p)
     {
-        if (p.QuestNpcNumber is null)
-        {
-            this._logger.LogWarning("[ScriptExec] walk_to_quest_npc requires questNpcNumber parameter");
-            return WalkToNpcResult.Failed;
-        }
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " walk_to_quest_npc ENTERED: QuestNpcNumber={Npc}, QuestGroup={Grp}, QuestNumber={Num}",
+            p.QuestNpcNumber, p.QuestGroup, p.QuestNumber);
 
-        // If the quest dialog was already opened in a previous tick, skip
-        // re-walking and allow fallthrough to accept/submit nodes.
-        if (this._questDialogReady)
+        if (p.QuestNpcNumber is null || p.QuestNpcNumber.Value == 0)
         {
-            this._logger.LogTrace("[ScriptExec] Quest dialog ready — allowing fallthrough.");
+            // null/0 QuestNpcNumber 意味着这是一个自动接受任务（如 G0 主线），没有 NPC 可对话
+            // 直接 Fallthrough 放行，脚本继续执行 accept/submit（start_quest/complete_quest
+            // 内部会处理无 NPC 对话的自动接取/提交）
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " walk_to_quest_npc: QuestNpcNumber is null/0 — auto-accept quest, skipping NPC walk.");
             return WalkToNpcResult.Fallthrough;
         }
 
-        var map = this._context.WorldState.CurrentMap;
+        // 对话已就绪 → 段落继续执行 accept/submit
+        if (this._questDialogReady)
+        {
+            this._logger.LogTrace("[ScriptExec]" + this._charTag + " Quest dialog ready — allowing fallthrough.");
+            return WalkToNpcResult.Fallthrough;
+        }
+
+        // 直接用游戏实体的 CurrentMap — 它是真实地图，始终由游戏服务器保持同步。
+        // 不依赖 BehaviorContext.WorldState（决策模式下未被 AiPlayerLogic 刷新）。
+        var map = this._player.CurrentMap;
         if (map is null)
         {
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " walk_to_quest_npc: player.CurrentMap is null");
             return WalkToNpcResult.Failed;
         }
 
-        var npcService = this._context.NpcService;
+        var npcService = this._npcService;
         if (npcService is null)
         {
             return WalkToNpcResult.Failed;
         }
 
-        var questNpc = npcService.FindQuestNpc(map, this._context.GameAdapter.GetPlayerPosition(), p.QuestNpcNumber.Value);
-        if (questNpc is null)
+        var npcNumber = p.QuestNpcNumber.Value;
+
+        // === 第一步：从 MonsterSpawns 获取 NPC 在当前地图的刷出坐标 ===
+        var spawnPos = npcService.GetQuestNpcSpawn(map, npcNumber);
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " DIAG: GetQuestNpcSpawn(#" + npcNumber + ")=({X},{Y})", spawnPos?.X, spawnPos?.Y);
+
+        if (spawnPos is null)
         {
-            // NPC不在当前地图 → 跨地图查找NPC出生地图并传送
-            this._logger.LogInformation("[ScriptExec] Quest NPC #{NpcNumber} not found on current map — searching all maps...",
-                p.QuestNpcNumber.Value);
-            var targetMapNumber = npcService.FindNpcMapNumber(this._player, p.QuestNpcNumber.Value);
+            // NPC 不在当前地图 → 跨地图查找并传送
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " Quest NPC #{NpcNumber} not spawned on current map — searching all maps...",
+                npcNumber);
+            var targetMapNumber = npcService.FindNpcMapNumber(this._player, npcNumber);
             if (targetMapNumber.HasValue && targetMapNumber.Value != map.Definition.Number)
             {
-                this._logger.LogInformation("[ScriptExec] NPC #{NpcNumber} found on map {MapNum} — warping...",
-                    p.QuestNpcNumber.Value, targetMapNumber.Value);
+                this._logger.LogInformation("[ScriptExec]" + this._charTag + " NPC #{NpcNumber} found on map {MapNum} — warping...",
+                    npcNumber, targetMapNumber.Value);
                 var npcParams = new ScriptParameters { TargetMapNumber = targetMapNumber.Value };
                 await WarpToMapAsync(npcParams).ConfigureAwait(false);
-                // 传送后返回 Walking，让PC停在原地，下一tick在目标地图找NPC
                 return WalkToNpcResult.Walking;
             }
-            return WalkToNpcResult.Failed;
-        }
-
-        var distance = this._context.GameAdapter.GetPlayerPosition().EuclideanDistanceTo(questNpc.Position);
-        if (distance <= 3f)
-        {
-            // Already at NPC
-
-            // If the player already has an active quest, skip dialog and fall through
-            // to check_accepted → goto @start, avoiding a re-open loop after accept/submit.
-            if (this._context.GameAdapter.GetActiveQuests().Count > 0)
-            {
-                this._logger.LogInformation("[ScriptExec] Active quest exists — skipping NPC dialog reopen, allowing fallthrough.");
-                return WalkToNpcResult.Fallthrough;
-            }
-
-            if (this._player.OpenedNpc is null)
-            {
-                // Dialog not yet open — try to open it
-                var opened = await npcService.TryOpenDialogAsync(this._player, questNpc).ConfigureAwait(false);
-                this._logger.LogInformation("[ScriptExec] Opened NPC #{NpcNumber} dialog: {Result}",
-                    p.QuestNpcNumber.Value, opened);
-                if (opened)
-                {
-                    this._questDialogReady = true;
-                }
-
-                return opened ? WalkToNpcResult.Walking : WalkToNpcResult.Fallthrough;
-            }
-
-            // Already at NPC AND dialog is open — no action needed, allow fallthrough
-            this._logger.LogTrace("[ScriptExec] Already at NPC #{NpcNumber} with open dialog — allowing fallthrough.",
-                p.QuestNpcNumber.Value);
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " Quest NPC #{NpcNumber} not found on any map — NPC may be hidden/gate-spawned or not in MonsterSpawns. Falling through.", npcNumber);
+            // NPC 找不到不一定致命: 有些任务 NPC 由事件/门触发而不是 MonsterSpawns 配置,
+            // 或者 QuestGiver 不可达但任务本身无需 NPC 对话(自动接取的副本任务等)
+            // Fallthrough 让脚本继续走 accept/submit, 服务器会处理实际任务逻辑
             return WalkToNpcResult.Fallthrough;
         }
 
-        // Walk to NPC
-        var algorithm = this._player.AlgorithmSelector?.Select(SelectionMode.ByName, "AStar");
-        if (algorithm is null)
+        // === 第二步：检查是否已在 NPC 附近 ===
+        var playerPos = this._context.GameAdapter.GetPlayerPosition();
+        var distance = playerPos.EuclideanDistanceTo(spawnPos.Value);
+        const int interactionRange = 3;
+
+        if (distance <= interactionRange)
         {
-            return WalkToNpcResult.Failed;
-        }
-
-        var playerPos = this._player.Position;
-        var playerAiGridVal = map.Terrain.AIgrid[playerPos.X, playerPos.Y];
-        this._logger.LogInformation("[ScriptExec] DIAG: playerPos=({X},{Y}), aiGridVal={Val}, npcPos=({NX},{NY}), dist={Dist:F1}",
-            playerPos.X, playerPos.Y, playerAiGridVal, questNpc.Position.X, questNpc.Position.Y, distance);
-
-        var path = algorithm.FindPath(playerPos, questNpc.Position, map.Terrain.AIgrid, true);
-        if (path is null || path.Count == 0)
-        {
-            // Direct A* failed — fall back to FindNearestWalkableTile + TryWalkToAsync
-            // (A* ThreadLocal<PathFinder> ScopedGridNetwork has stale node state when
-            // called in tight loops, so we use the multi-algorithm TryWalkToAsync instead.)
-            this._logger.LogInformation("[ScriptExec] Direct A* path to NPC #{NpcNumber} at ({X},{Y}) failed — trying walkable tile fallback.",
-                p.QuestNpcNumber.Value, questNpc.Position.X, questNpc.Position.Y);
-
-            const int questInteractionRange = 3;
-            var walkTarget = FindNearestWalkableTile(questNpc.Position, map, playerPos, maxRadius: 5);
-            var targetDist = playerPos.EuclideanDistanceTo(walkTarget);
-
-            if (targetDist <= questInteractionRange)
+            // 已有 NPC 实例且对话已打开 → 放行
+            if (this._player.OpenedNpc?.Definition?.Number == npcNumber)
             {
-                // Already within range of a walkable tile near NPC — just try dialog
-                this._logger.LogInformation("[ScriptExec] Already within {Range} tiles of walkable tile ({X},{Y}) near NPC #{NpcNumber}.",
-                    questInteractionRange, walkTarget.X, walkTarget.Y, p.QuestNpcNumber.Value);
+                this._logger.LogTrace("[ScriptExec]" + this._charTag + " Already at NPC #{NpcNumber} with open dialog — allowing fallthrough.",
+                    npcNumber);
                 return WalkToNpcResult.Fallthrough;
             }
 
-            SuppressAutoNavigationForThisTick();
-            if (!await TryWalkToAsync(walkTarget, map).ConfigureAwait(false))
+            // 尝试获取 NPC 实例 (GetNpcsInRange 在此范围可以可靠获取已生成的 NPC)
+            var questNpc = npcService.FindQuestNpc(map, playerPos, npcNumber);
+            if (questNpc is not null)
             {
-                this._logger.LogWarning("[ScriptExec] TryWalkToAsync also failed to reach NPC #{NpcNumber} at ({X},{Y}) — fallback walk target ({Wx},{Wy}).",
-                    p.QuestNpcNumber.Value, questNpc.Position.X, questNpc.Position.Y, walkTarget.X, walkTarget.Y);
+                // 尝试打开对话
+                if (this._player.OpenedNpc is null)
+                {
+                    var opened = await npcService.TryOpenDialogAsync(this._player, questNpc).ConfigureAwait(false);
+                    this._logger.LogInformation("[ScriptExec]" + this._charTag + " Opened NPC #{NpcNumber} dialog: {Result}",
+                        npcNumber, opened);
+                    if (opened)
+                    {
+                        this._questDialogReady = true;
+                        return WalkToNpcResult.Walking;
+                    }
+
+                    // Dialog may not stay open (e.g. LeavesDialogOpen=false). Retry next tick.
+                    this._logger.LogTrace("[ScriptExec]" + this._charTag + " TryOpenDialogAsync for NPC #{NpcNumber} returned false — retrying next tick.",
+                        npcNumber);
+                    return WalkToNpcResult.Walking;
+                }
+                return WalkToNpcResult.Fallthrough;
+            }
+            else
+            {
+                // 坐标已到但 NPC 实例还没生成（刚切地图 / 加载延迟）→ 等一 tick
+                this._logger.LogTrace("[ScriptExec]" + this._charTag + " At NPC #{NpcNumber} spawn ({X},{Y}) but instance not yet available — waiting.",
+                    npcNumber, spawnPos.Value.X, spawnPos.Value.Y);
+                return WalkToNpcResult.Walking;
+            }
+        }
+
+        // === 第三步：走到 NPC 刷出坐标 ===
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " Walking to quest NPC #{NpcNumber} spawn at ({X},{Y}), distance={Dist:F1}.",
+            npcNumber, spawnPos.Value.X, spawnPos.Value.Y, distance);
+
+        var walkOk = await TryWalkToAsync(spawnPos.Value, map).ConfigureAwait(false);
+        if (!walkOk)
+        {
+            // 第一层 fallback: 找 NPC 附近的可走格子
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " Direct path to NPC #{NpcNumber} spawn ({X},{Y}) failed — trying nearby walkable tile.",
+                npcNumber, spawnPos.Value.X, spawnPos.Value.Y);
+            var fallbackTarget = FindNearestWalkableTile(spawnPos.Value, map, playerPos, maxRadius: 10);
+            if (playerPos.EuclideanDistanceTo(fallbackTarget) <= interactionRange)
+            {
+                return WalkToNpcResult.Fallthrough;
+            }
+            SuppressAutoNavigationForThisTick();
+            if (!await TryWalkToAsync(fallbackTarget, map).ConfigureAwait(false))
+            {
+                // 第二层 fallback: Monster Danger Filter 可能阻塞了所有路径,
+                // 使用 GameAdapter.WalkToAsync（不走危险过滤, 用原始 AStar）
+                this._logger.LogInformation("[ScriptExec]" + this._charTag +
+                    " TryWalkToAsync fallback also failed — trying direct AStar walk to nearest walkable tile around player.",
+                    npcNumber);
+                var playerWalkable = FindNearestWalkableTile(playerPos, map, playerPos, maxRadius: 10);
+                if (playerPos.EuclideanDistanceTo(playerWalkable) > 1)
+                {
+                    var result = await this._context.GameAdapter.WalkToAsync(playerWalkable, map).ConfigureAwait(false);
+                    if (result.Status == WalkStatusCode.Success)
+                    {
+                        return WalkToNpcResult.Walking;
+                    }
+                }
+
+                // 第三层 fallback: 所有路径都失败, 但 NPC 可能已经在地图上存在
+                // 不用精确寻路, 用 GetNpcsInRange 找 NPC 实例直接走到
+                var anyNpc = npcService.FindQuestNpc(map, playerPos, npcNumber);
+                if (anyNpc is not null)
+                {
+                    this._logger.LogInformation("[ScriptExec]" + this._charTag +
+                        " Found NPC #{NpcNumber} instance on map — walking directly to it.", npcNumber);
+                    var npcWalkTarget = FindNearestWalkableTile(anyNpc.Position, map, playerPos, maxRadius: 10);
+                    if (playerPos.EuclideanDistanceTo(npcWalkTarget) <= interactionRange)
+                    {
+                        return WalkToNpcResult.Fallthrough;
+                    }
+                    var directResult = await this._context.GameAdapter.WalkToAsync(npcWalkTarget, map).ConfigureAwait(false);
+                    if (directResult.Status == WalkStatusCode.Success)
+                    {
+                        return WalkToNpcResult.Walking;
+                    }
+                }
+
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " All paths to NPC #{NpcNumber} failed.", npcNumber);
                 return WalkToNpcResult.Failed;
             }
-
-            this._logger.LogInformation("[ScriptExec] Walking to NPC #{NpcNumber} via walkable tile ({X},{Y}) (TryWalkToAsync).",
-                p.QuestNpcNumber.Value, walkTarget.X, walkTarget.Y);
-            return WalkToNpcResult.Walking;
         }
 
-        var maxSteps = Math.Min(path.Count, 16);
-        var steps = new WalkingStep[maxSteps];
-        for (int i = 0; i < maxSteps; i++)
-        {
-            var node = path[i];
-            var prevPos = i == 0 ? this._player.Position : steps[i - 1].To;
-            steps[i] = new WalkingStep(prevPos, node.Point, prevPos.GetDirectionTo(node.Point));
-        }
-
-        var targetNode = path[Math.Min(path.Count - 1, 16 - 1)];
-        this._logger.LogInformation("[ScriptExec] Walking to quest NPC #{NpcNumber} at ({X},{Y}), distance={Dist:F1}.",
-            p.QuestNpcNumber.Value, questNpc.Position.X, questNpc.Position.Y, distance);
-        await this._player.WalkToAsync(new Point(targetNode.X, targetNode.Y), steps).ConfigureAwait(false);
         return WalkToNpcResult.Walking;
     }
 
@@ -3533,7 +3627,7 @@ public sealed class ScriptExecutor
         // Check if leader is on the same map
         if (leader.CurrentMap != this._context.GameAdapter.GetCurrentMap() || this._context.WorldState.CurrentMap is null)
         {
-            this._logger.LogTrace("[ScriptExec] follow_leader: leader {Name} is on a different map or current map unknown",
+            this._logger.LogTrace("[ScriptExec]" + this._charTag + " follow_leader: leader {Name} is on a different map or current map unknown",
                 leader.Name);
             return;
         }
@@ -3550,7 +3644,7 @@ public sealed class ScriptExecutor
         }
 
         // Walk toward leader (stop at followDistance range)
-        this._logger.LogDebug("[ScriptExec] follow_leader: following {Name} from ({X},{Y}) to ({LX},{LY}), dist={Dist:F1}",
+        this._logger.LogDebug("[ScriptExec]" + this._charTag + " follow_leader: following {Name} from ({X},{Y}) to ({LX},{LY}), dist={Dist:F1}",
             leader.Name, myPos.X, myPos.Y, leaderPos.X, leaderPos.Y, dist);
 
         SuppressAutoNavigationForThisTick();
@@ -3558,7 +3652,7 @@ public sealed class ScriptExecutor
         var map = this._context.WorldState.CurrentMap;
         if (!await TryWalkToAsync(leaderPos, map).ConfigureAwait(false))
         {
-            this._logger.LogTrace("[ScriptExec] follow_leader: pathfinding to leader {Name} at ({X},{Y}) failed",
+            this._logger.LogTrace("[ScriptExec]" + this._charTag + " follow_leader: pathfinding to leader {Name} at ({X},{Y}) failed",
                 leader.Name, leaderPos.X, leaderPos.Y);
         }
     }
@@ -3574,7 +3668,7 @@ public sealed class ScriptExecutor
         var targetMapNumber = p.TargetMapNumber ?? this._context.TargetMapNumber;
         if (targetMapNumber is null)
         {
-            this._logger.LogTrace("[ScriptExec] travel_to_map: no target map set");
+            this._logger.LogTrace("[ScriptExec]" + this._charTag + " travel_to_map: no target map set");
             return;
         }
 
@@ -3588,7 +3682,7 @@ public sealed class ScriptExecutor
         if (currentMap.Definition.Number == targetMapNumber.Value)
         {
             this._context.TargetMapNumber = null; // arrived, clear target
-            this._logger.LogDebug("[ScriptExec] travel_to_map: arrived at target map {Map}",
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " travel_to_map: arrived at target map {Map}",
                 currentMap.Definition.Name);
             return;
         }
@@ -3597,7 +3691,7 @@ public sealed class ScriptExecutor
         var enterGates = currentMap.Definition.EnterGates;
         if (enterGates is null || enterGates.Count == 0)
         {
-            this._logger.LogWarning("[ScriptExec] travel_to_map: no enter gates on current map");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " travel_to_map: no enter gates on current map");
             return;
         }
 
@@ -3614,7 +3708,7 @@ public sealed class ScriptExecutor
         if (targetGate is null)
         {
             this._logger.LogWarning(
-                "[ScriptExec] travel_to_map: no gate found from current map to target map {Target}",
+                "[ScriptExec]" + this._charTag + " travel_to_map: no gate found from current map to target map {Target}",
                 targetMapNumber.Value);
             return;
         }
@@ -3631,7 +3725,7 @@ public sealed class ScriptExecutor
         {
             // Walk to the center of the gate first
             this._logger.LogDebug(
-                "[ScriptExec] travel_to_map: walking to gate at ({X},{Y}) on map {Map}",
+                "[ScriptExec]" + this._charTag + " travel_to_map: walking to gate at ({X},{Y}) on map {Map}",
                 gateCenterX, gateCenterY, currentMap.Definition.Name);
 
             SuppressAutoNavigationForThisTick();
@@ -3640,7 +3734,7 @@ public sealed class ScriptExecutor
             if (!await TryWalkToAsync(walkTarget, currentMap).ConfigureAwait(false))
             {
                 this._logger.LogTrace(
-                    "[ScriptExec] travel_to_map: could not walk to gate at ({X},{Y}) on map {Map}",
+                    "[ScriptExec]" + this._charTag + " travel_to_map: could not walk to gate at ({X},{Y}) on map {Map}",
                     gateCenterX, gateCenterY, currentMap.Definition.Name);
             }
 
@@ -3649,7 +3743,7 @@ public sealed class ScriptExecutor
 
         // At the gate — enter it
         this._logger.LogDebug(
-            "[ScriptExec] travel_to_map: entering gate to map {Target} (gate #{Num})",
+            "[ScriptExec]" + this._charTag + " travel_to_map: entering gate to map {Target} (gate #{Num})",
             targetMapNumber.Value, targetGate.Number);
 
         try
@@ -3660,7 +3754,7 @@ public sealed class ScriptExecutor
         catch (Exception ex)
         {
             this._logger.LogWarning(ex,
-                "[ScriptExec] travel_to_map: EnterGateAsync failed for gate #{Num} on map {Map}",
+                "[ScriptExec]" + this._charTag + " travel_to_map: EnterGateAsync failed for gate #{Num} on map {Map}",
                 targetGate.Number, currentMap.Definition.Name);
         }
     }
@@ -3673,7 +3767,7 @@ public sealed class ScriptExecutor
     {
         if (p.TargetMapNumber is null)
         {
-            this._logger.LogWarning("[ScriptExec] warp_to_map: no targetMapNumber parameter");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " warp_to_map: no targetMapNumber parameter");
             return;
         }
 
@@ -3681,19 +3775,19 @@ public sealed class ScriptExecutor
         var currentMap = this._context.GameAdapter.GetCurrentMap();
         if (currentMap?.Definition.Number == target)
         {
-            this._logger.LogDebug("[ScriptExec] warp_to_map: already on target map {Map}", target);
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " warp_to_map: already on target map {Map}", target);
             return;
         }
 
-        this._logger.LogInformation("[ScriptExec] warp_to_map: warping to map {Map}", target);
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " warp_to_map: warping to map {Map}", target);
         var result = await this._context.GameAdapter.WarpToMapAsync(target).ConfigureAwait(false);
         if (result.Status == WarpStatusCode.Success || result.Status == WarpStatusCode.AlreadyOnTarget)
         {
-            this._logger.LogInformation("[ScriptExec] warp_to_map: arrived at map {Map} (status={Status})", target, result.Status);
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " warp_to_map: arrived at map {Map} (status={Status})", target, result.Status);
         }
         else
         {
-            this._logger.LogWarning("[ScriptExec] warp_to_map: failed to warp to map {Map}: {Reason} (status={Status})",
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " warp_to_map: failed to warp to map {Map}: {Reason} (status={Status})",
                 target, result.Reason ?? "未知", result.Status);
         }
     }
@@ -3722,15 +3816,55 @@ public sealed class ScriptExecutor
             if (this._hotspotPoints.Count > 0)
             {
                 this._logger.LogInformation(
-                    "[ScriptExec] Hotspots loaded: {Count} points, starting at index 0",
+                    "[ScriptExec]" + this._charTag + " Hotspots loaded: {Count} points, starting at index 0",
                     this._hotspotPoints.Count);
             }
         }
 
         if (this._hotspotPoints.Count == 0)
         {
-            this._logger.LogTrace("[ScriptExec] relocate_to_hotspot: no hotspots configured");
+            this._logger.LogTrace("[ScriptExec]" + this._charTag + " relocate_to_hotspot: no hotspots configured");
             return new RelocateResult(RelocateStatusCode.NoHotspots, -1, null, playerPos, 0, "no hotspots configured");
+        }
+
+        // === 跨地图 warp: 当前热点在另一地图时 warp 过去 ===
+        if (p.Hotspots is { Count: > 0 })
+        {
+            // 获取当前要前往的热点索引（与下方逻辑保持一致）
+            var targetIdx = this._pendingHotspotIndex >= 0 ? this._pendingHotspotIndex
+                : (this._currentHotspotIndex + 1) % this._hotspotPoints.Count;
+            if (targetIdx < p.Hotspots.Count)
+            {
+                var hd = p.Hotspots[targetIdx];
+                if (hd.MapNumber != ushort.MaxValue)
+                {
+                    var currentMap = this._context.GameAdapter.GetCurrentMap();
+                    if (currentMap is not null && currentMap.Definition.Number != hd.MapNumber)
+                    {
+                        this._logger.LogInformation(
+                            "[ScriptExec]" + this._charTag + " Hotspot #{Idx} ({X},{Y}) on map #{Map}, current is #{CurMap} — warping...",
+                            targetIdx, hd.X, hd.Y, hd.MapNumber, currentMap.Definition.Number);
+                        // 使用完整命名空间前缀（WarpResult 是 record，没有 using）
+                        var warpResult = await this._context.GameAdapter.WarpToMapAsync(hd.MapNumber).ConfigureAwait(false);
+                        if (warpResult.Status == MUnique.OpenMU.AIPlayer.WarpStatusCode.Success || warpResult.Status == MUnique.OpenMU.AIPlayer.WarpStatusCode.AlreadyOnTarget)
+                        {
+                            // 重置状态以便在新地图重新开始
+                            this._currentHotspotIndex = targetIdx;
+                            this._pendingHotspotIndex = -1;
+                            this._context.CurrentTarget = null;
+                            this._noMonsterTickCount = 0;
+                            this._patrolCenter = this._context.GameAdapter.GetPlayerPosition();
+                            return new RelocateResult(RelocateStatusCode.Moving, this._currentHotspotIndex,
+                                this._hotspotPoints.Count > 0 ? this._hotspotPoints[this._currentHotspotIndex] : null,
+                                playerPos, 0, $"warped to map #{hd.MapNumber}");
+                        }
+                        else
+                        {
+                            this._logger.LogWarning("[ScriptExec]" + this._charTag + " Warp to map #{Map} failed: {Reason}", hd.MapNumber, warpResult.Reason);
+                        }
+                    }
+                }
+            }
         }
 
         // 已在行走中 — 不中断当前寻路，不推进索引
@@ -3757,29 +3891,7 @@ public sealed class ScriptExecutor
                 this._consecutiveDeaths);
 
             // Mark ALL hotspots as DangerZone for 15 minutes to force strategy change
-            if (this._context.AiMap is not null)
-            {
-                var shadow = this._context.AiMap.GetOrCreateShadowLayer(
-                    this._player.AiPlayerId, this._logger);
-                var now = DateTime.UtcNow;
-                foreach (var h in this._hotspotPoints)
-                {
-                    var entry = new ShadowEntry
-                    {
-                        Id = Guid.NewGuid(),
-                        X = (byte)h.X,
-                        Y = (byte)h.Y,
-                        Type = ShadowEntryType.DangerZone,
-                        SubType = 5,
-                        Visibility = ShadowVisibility.AIOnly,
-                        OwnerId = this._player.AiPlayerId,
-                        CreatedAt = now,
-                        ExpiresAt = now.AddMinutes(15),
-                        References = Array.Empty<Guid>(),
-                    };
-                    shadow.AddEntry((byte)h.X, (byte)h.Y, entry);
-                }
-            }
+            // AiMap not available — danger zone marking skipped.
 
             // Reset counter so we don't spam this every tick
             this._consecutiveDeaths = 0;
@@ -3797,6 +3909,7 @@ public sealed class ScriptExecutor
         var occupiedRadius = p.HotspotOccupiedRadius;
 
         // 中断恢复: 上次行走被打断(战斗干扰)时重试同一热点
+        // IMPORTANT: 如果 AlreadyThere 已经推进了索引，_pendingHotspotIndex 已被设为 -1
         if (this._pendingHotspotIndex >= 0)
         {
             this._currentHotspotIndex = this._pendingHotspotIndex;
@@ -3807,6 +3920,8 @@ public sealed class ScriptExecutor
             // 正常: 推进到下一个热点(循环)
             this._currentHotspotIndex = (this._currentHotspotIndex + 1) % this._hotspotPoints.Count;
         }
+        // 重置 pending 标记，防止被 advance 路径（PC1）推进后又因回退覆盖
+        this._pendingHotspotIndex = -1;
 
         var checkedCount = 0;
         for (var attempt = 0; attempt < this._hotspotPoints.Count; attempt++)
@@ -3825,7 +3940,7 @@ public sealed class ScriptExecutor
                     {
                         isOccupied = true;
                         this._logger.LogDebug(
-                            "[ScriptExec] Hotspot #{Idx} ({X},{Y}) occupied by {Name} at dist={Dist:F1} — skipping",
+                            "[ScriptExec]" + this._charTag + " Hotspot #{Idx} ({X},{Y}) occupied by {Name} at dist={Dist:F1} — skipping",
                             this._currentHotspotIndex, candidate.X, candidate.Y,
                             other.Name, otherDist);
                         break;
@@ -3838,20 +3953,40 @@ public sealed class ScriptExecutor
                 // 找到空闲热点，尝试前往
                 var targetPoint = candidate;
 
+                // 如果有矩形范围（非零），在矩形内随机选落脚点
+                if (p.Hotspots is not null && this._currentHotspotIndex < p.Hotspots.Count)
+                {
+                    var hd = p.Hotspots[this._currentHotspotIndex];
+                    if (hd.X1 != 0 || hd.X2 != 0 || hd.Y1 != 0 || hd.Y2 != 0)
+                    {
+                        var rx = Random.Shared.Next(hd.X1, hd.X2 + 1);
+                        var ry = Random.Shared.Next(hd.Y1, hd.Y2 + 1);
+                        var randomPt = new Point((byte)rx, (byte)ry);
+                        // 如果随机点可走则用它，否则 fallback 到热点中心
+                        if (map.Terrain.WalkMap[rx, ry])
+                            targetPoint = randomPt;
+                    }
+                }
+
                 // Check if already at or near the hotspot
                 if (playerPos.EuclideanDistanceTo(targetPoint) <= 3f)
                 {
-                    this._logger.LogDebug(
-                        "[ScriptExec] Already at hotspot #{Idx} ({X},{Y}) — resetting center",
-                        this._currentHotspotIndex, targetPoint.X, targetPoint.Y);
+                    // 即使到达热点也立即推进到下一个，这样 patrol 离开后触发 not_at_hotspot 就是新热点
+                    // 避免死循环：巡逻→走远→被拉回暖点#0→巡逻→走远→又被拉回暖点#0
+                    var nextIdx = (this._currentHotspotIndex + 1) % this._hotspotPoints.Count;
+                    this._logger.LogInformation(
+                        "[ScriptExec]" + this._charTag + " Already at hotspot #{Idx} ({X},{Y}) — immediately advancing to #{NextIdx}",
+                        this._currentHotspotIndex, targetPoint.X, targetPoint.Y, nextIdx);
+                    this._currentHotspotIndex = nextIdx;  // 立即推进
+                    this._pendingHotspotIndex = -1;  // 清除中断恢复标记，避免下次被拉回旧热点
                     this._patrolCenter = targetPoint;
-                    this._noMonsterTickCount = 0;
+                    // _noMonsterTickCount 不重置：到热点了但没怪，保留递增计数让巡逻逻辑正常工作
                     return new RelocateResult(RelocateStatusCode.AlreadyThere, this._currentHotspotIndex,
-                        targetPoint, playerPos, checkedCount, "already at hotspot");
+                        targetPoint, playerPos, checkedCount, "already at hotspot, advanced to next");
                 }
 
                 this._logger.LogInformation(
-                    "[ScriptExec] Relocating to hotspot #{Idx} ({X},{Y}) \"{Name}\"",
+                    "[ScriptExec]" + this._charTag + " Relocating to hotspot #{Idx} ({X},{Y}) \"{Name}\"",
                     this._currentHotspotIndex, targetPoint.X, targetPoint.Y,
                     p.Hotspots is not null && this._currentHotspotIndex < p.Hotspots.Count
                         ? p.Hotspots[this._currentHotspotIndex].Name ?? ""
@@ -3863,7 +3998,10 @@ public sealed class ScriptExecutor
                 {
                     this._pendingHotspotIndex = this._currentHotspotIndex; // 记录以便中断后重试
                     this._patrolCenter = targetPoint;
-                    this._noMonsterTickCount = 0;
+                    // 只在首次加载热点（_currentHotspotIndex == 0）时重置 noMonsterTickCount
+                    // 热点间循环时保留计数器，让 no_monsters_recently 条件正常工作
+                    if (this._currentHotspotIndex == 0 && this._hotspotPoints.Count > 1)
+                        this._noMonsterTickCount = 0;
                     this._context.CurrentTarget = null;
                     this._forceThruDeathCount = 0; // 成功到达热点，重置死亡计数
                     this._forceThruActive = false;
@@ -3882,7 +4020,7 @@ public sealed class ScriptExecutor
 
         // 所有热点均被占用，保持当前位置
         this._logger.LogInformation(
-            "[ScriptExec] All {Count} hotspots occupied by other players — staying at current position",
+            "[ScriptExec]" + this._charTag + " All {Count} hotspots occupied by other players — staying at current position",
             this._hotspotPoints.Count);
         return new RelocateResult(RelocateStatusCode.AllOccupied, this._currentHotspotIndex,
             this._hotspotPoints.Count > 0 ? this._hotspotPoints[this._currentHotspotIndex % this._hotspotPoints.Count] : null,
@@ -3897,7 +4035,7 @@ public sealed class ScriptExecutor
     {
         if (this._deathPosition.X == 0 && this._deathPosition.Y == 0)
         {
-            this._logger.LogTrace("[ScriptExec] return_to_death_spot: no death position recorded");
+            this._logger.LogTrace("[ScriptExec]" + this._charTag + " return_to_death_spot: no death position recorded");
             return;
         }
 
@@ -3911,7 +4049,7 @@ public sealed class ScriptExecutor
         if (dist <= 5f)
         {
             this._logger.LogInformation(
-                "[ScriptExec] Returned to death spot ({X},{Y}) — resuming hunt",
+                "[ScriptExec]" + this._charTag + " Returned to death spot ({X},{Y}) — resuming hunt",
                 this._deathPosition.X, this._deathPosition.Y);
             this._patrolCenter = this._deathPosition;
             this._deathPosition = default;
@@ -3919,7 +4057,7 @@ public sealed class ScriptExecutor
         }
 
         this._logger.LogInformation(
-            "[ScriptExec] Returning to death spot ({X},{Y}) from ({PX},{PY}), dist={Dist:F1}",
+            "[ScriptExec]" + this._charTag + " Returning to death spot ({X},{Y}) from ({PX},{PY}), dist={Dist:F1}",
             this._deathPosition.X, this._deathPosition.Y,
             this._context.GameAdapter.GetPlayerPosition().X, this._context.GameAdapter.GetPlayerPosition().Y, dist);
 
@@ -3932,7 +4070,88 @@ public sealed class ScriptExecutor
     }
 
     /// <summary>
-    /// Resets the hotspot tracking state (used when a new script is loaded).
+    /// Warps to the hunt map using the routing engine (WarpPlanner).
+    /// Uses gate walking first, falls back to warp menu with gold if needed.
+    /// </summary>
+    private async ValueTask WarpToHuntMapAsync(ScriptParameters p)
+    {
+        if (p.Hotspots is not { Count: > 0 } || p.Hotspots[0].MapNumber == ushort.MaxValue)
+        {
+            return;
+        }
+
+        var targetMap = p.Hotspots[0].MapNumber;
+        var currentMap = this._context.GameAdapter.GetCurrentMap();
+        if (currentMap is not null && currentMap.Definition.Number == targetMap)
+        {
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " warp_to_hunt_map: already on map #{Map}", targetMap);
+            return;
+        }
+
+        // Use WarpPlanner routing engine
+        var planner = this.GetWarpPlanner();
+        var fromMap = currentMap?.Definition.Number ?? 0;
+        var level = this._context.GameAdapter.GetPlayerLevel();
+        var money = this._player.Money;
+
+        var route = planner.ComputeRoute((short)fromMap, (short)targetMap, level, money);
+        if (route is null)
+        {
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " warp_to_hunt_map: no route from map {From} to {To}", fromMap, targetMap);
+            return;
+        }
+
+        if (route.IsFeasible)
+        {
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " warp_to_hunt_map: found {StepCount}-hop route (gold={Gold}, maxLevel={Level})",
+                route.Steps.Count, route.TotalGoldCost, route.HighestLevelRequirement);
+            this._context.ActiveWarpRoute = route;
+            this._context.ActiveWarpStepIndex = 0;
+            this._context.WarpInProgress = false;
+            await this.ExecuteNextWarpStepAsync().ConfigureAwait(false);
+        }
+        else
+        {
+            // Route exists but blocked by level/gold
+            var blocker = route.Steps.FirstOrDefault(s => s.LevelRequirement > level);
+            if (blocker is not null)
+            {
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " warp_to_hunt_map: blocked — level {Needed} required at step {From}->{To}",
+                    blocker.LevelRequirement, blocker.FromMap, blocker.ToMap);
+            }
+            else
+            {
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " warp_to_hunt_map: blocked — need {Gold} gold, have {Have}",
+                    route.TotalGoldCost, money);
+            }
+        }
+    }
+
+    private bool EvaluateNotOnHuntMap(ScriptParameters p)
+    {
+        // Condition: true if the first hotspot is on a different map than current
+        if (p.Hotspots is not { Count: > 0 })
+        {
+            return false;
+        }
+
+        var hotspotMap = p.Hotspots[0].MapNumber;
+        if (hotspotMap == ushort.MaxValue)
+        {
+            return false;
+        }
+
+        var currentMap = this._context.GameAdapter.GetCurrentMap();
+        if (currentMap is null)
+        {
+            return true; // no map context → need warp
+        }
+
+        return currentMap.Definition.Number != hotspotMap;
+    }
+
+    /// <summary>
+    /// Resets hotspot state (when new script loaded).
     /// </summary>
     private void ResetHotspotState()
     {
@@ -4018,16 +4237,9 @@ public sealed class ScriptExecutor
     /// </summary>
     private void WrapParagraph()
     {
-        if (this._context is { AiMap: not null } && this._context.WorldState.CurrentMap is not null)
-        {
-            var pos = this._context.GameAdapter.GetPlayerPosition();
-            var shadow = this._context.AiMap.GetOrCreateShadowLayer(this._player.AiPlayerId, this._logger);
-            shadow.RecordPathOutcome(pos, pos, false, this._player.AiPlayerId);
-        }
-
         this._programCounter = 0;
         this._ticksAtCurrentPc = 0;
-        this._logger.LogTrace("[PC] Paragraph wrap: PC=0 label={Label}", GetCurrentParagraphLabel());
+        this._logger.LogTrace("[ScriptExec]" + this._charTag + " Paragraph wrap: PC=0 label={Label}", GetCurrentParagraphLabel());
     }
 
     /// <summary>
@@ -4042,11 +4254,11 @@ public sealed class ScriptExecutor
             this._programCounter = 0;
             this._ticksAtCurrentPc = 0;
             this._gotoPending = null;
-            this._logger.LogInformation("[PC] Goto @{Label} → paragraph index {Idx}", targetLabel, targetIndex);
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " Goto @{Label} → paragraph index {Idx}", targetLabel, targetIndex);
         }
         else
         {
-            this._logger.LogWarning("[PC] Goto target '@{Label}' not found", targetLabel ?? "null");
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " Goto target '@{Label}' not found", targetLabel ?? "null");
         }
     }
 
@@ -4089,7 +4301,7 @@ public sealed class ScriptExecutor
     /// </summary>
     private async ValueTask ExecuteExternalCommandAsync(string command)
     {
-        this._logger.LogInformation("[PC] External command: {Cmd}", command);
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " External command: {Cmd}", command);
         this._currentNodeName = "external";
         this._currentNodeAction = command;
         switch (command)
@@ -4100,7 +4312,7 @@ public sealed class ScriptExecutor
             case "reload":
                 break;
             default:
-                this._logger.LogWarning("[PC] Unknown external command: {Cmd}", command);
+                this._logger.LogWarning("[ScriptExec]" + this._charTag + " Unknown external command: {Cmd}", command);
                 break;
         }
 
@@ -4119,5 +4331,246 @@ public sealed class ScriptExecutor
 
         var dsl = MuScriptCompiler.CompileToDsl(script);
         return dsl.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    /// <summary>
+    /// Gets the shared WarpPlanner instance (lazy-init).
+    /// </summary>
+    private WarpPlanner? _warpPlanner;
+
+    private WarpPlanner GetWarpPlanner()
+    {
+        if (_warpPlanner is null)
+        {
+            var config = this._player.GameContext?.Configuration;
+            if (config is null)
+            {
+                throw new InvalidOperationException("GameConfiguration not available for WarpPlanner");
+            }
+
+            _warpPlanner = new WarpPlanner(config, this._logger);
+        }
+
+        return _warpPlanner;
+    }
+
+    /// <summary>
+    /// Executes the next step of an active multi-hop warp route.
+    /// Supports both gate walking (free) and warp menu (paid) methods.
+    /// </summary>
+    private async ValueTask ExecuteNextWarpStepAsync()
+    {
+        var route = this._context.ActiveWarpRoute;
+        if (route is null || this._context.ActiveWarpStepIndex >= route.Steps.Count)
+        {
+            this._logger.LogWarning("[WarpRoute] No active route or step index out of range");
+            return;
+        }
+
+        var step = route.Steps[this._context.ActiveWarpStepIndex];
+        this._logger.LogInformation("[WarpRoute] Step {Idx}/{Total}: map {From}->{To} method={Method}",
+            this._context.ActiveWarpStepIndex + 1, route.Steps.Count,
+            step.FromMap, step.ToMap, step.Method);
+
+        if (step.Method == WarpEdgeType.Gate)
+        {
+            this._logger.LogInformation("[WarpRoute] Executing gate step: pos=({PX},{PY}) on map #{Map}, gate=({GX},{GY})",
+                this._context.GameAdapter.GetPlayerPosition().X,
+                this._context.GameAdapter.GetPlayerPosition().Y,
+                this._context.GameAdapter.GetCurrentMap()?.Definition.Number,
+                step.GateCenter.X, step.GateCenter.Y);
+            await this.ExecuteGateStepAsync(step).ConfigureAwait(false);
+        }
+        else
+        {
+            await this.ExecuteWarpMenuStepAsync(step).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Executes a gate walk step: walk to gate center, then enter via WarpGateAction.
+    /// </summary>
+    private async ValueTask ExecuteGateStepAsync(WarpStep step)
+    {
+        var currentMap = this._context.GameAdapter.GetCurrentMap();
+        if (currentMap is null) return;
+
+        var playerPos = this._context.GameAdapter.GetPlayerPosition();
+        var inaccuracy = this._player.GameContext!.Configuration.InfoRange;
+
+        var atGate = Math.Abs(playerPos.X - step.GateCenter.X) <= inaccuracy
+                  && Math.Abs(playerPos.Y - step.GateCenter.Y) <= inaccuracy;
+
+        if (!atGate)
+        {
+            // Walk to gate center — retry next tick
+            SuppressAutoNavigationForThisTick();
+
+            // Check if AI is walking (already in motion from previous tick's TryWalkToAsync)
+            if (this._player.IsWalking)
+            {
+                return;
+            }
+
+            await TryWalkToAsync(step.GateCenter, currentMap).ConfigureAwait(false);
+            return;
+        }
+
+        // At gate — enter it
+        if (step.EnterGate is null)
+        {
+            this._logger.LogWarning("[WarpRoute] Gate step has no EnterGate reference");
+            return;
+        }
+
+        this._logger.LogInformation("[WarpRoute] At gate #{Gate} — entering...", step.EnterGate.Number);
+        try
+        {
+            var warpAction = new MUnique.OpenMU.GameLogic.PlayerActions.WarpGateAction();
+            await warpAction.EnterGateAsync(this._player, step.EnterGate).ConfigureAwait(false);
+
+            // WarpToAsync sets CurrentMap=null internally — wait for map change
+            this._context.WarpInProgress = true;
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning(ex, "[WarpRoute] Gate enter failed for #{Gate}", step.EnterGate.Number);
+        }
+    }
+
+    /// <summary>
+    /// Executes a warp menu step: use WarpAction to teleport (pays gold).
+    /// </summary>
+    private async ValueTask ExecuteWarpMenuStepAsync(WarpStep step)
+    {
+        if (step.WarpInfo is null)
+        {
+            this._logger.LogWarning("[WarpRoute] Warp menu step has no WarpInfo reference");
+            return;
+        }
+
+        if (this._player.Money < step.GoldCost)
+        {
+            this._logger.LogWarning("[WarpRoute] Insufficient gold: have {Have}, need {Need}", this._player.Money, step.GoldCost);
+            return;
+        }
+
+        this._logger.LogInformation("[WarpRoute] Using warp menu #{Warp} \"{Name}\" (cost={Gold})",
+            step.WarpInfo.Index, step.WarpInfo.Name, step.GoldCost);
+        try
+        {
+            var warpAction = new MUnique.OpenMU.GameLogic.PlayerActions.WarpAction();
+            await warpAction.WarpToAsync(this._player, step.WarpInfo).ConfigureAwait(false);
+            this._context.WarpInProgress = true;
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning(ex, "[WarpRoute] Warp menu failed for #{Warp}", step.WarpInfo.Index);
+        }
+    }
+
+    /// <summary>
+    /// Checks warp progress in TickAsync: detect map change, advance to next step or complete.
+    /// </summary>
+    private async ValueTask CheckWarpProgressAsync()
+    {
+        if (!this._context.WarpInProgress)
+        {
+            return;
+        }
+
+        var route = this._context.ActiveWarpRoute;
+        if (route is null || this._context.ActiveWarpStepIndex >= route.Steps.Count)
+        {
+            this._context.WarpInProgress = false;
+            this._context.ActiveWarpRoute = null;
+            return;
+        }
+
+        var currentMap = this._context.GameAdapter.GetCurrentMap();
+        var currentStep = route.Steps[this._context.ActiveWarpStepIndex];
+
+        // If CurrentMap is null, warp is in progress — check if we need to ClientReadyAfterMapChangeAsync
+        if (currentMap is null)
+        {
+            this._logger.LogDebug("[WarpRoute] Waiting for map change — CurrentMap is null, calling ClientReadyAfterMapChangeAsync");
+
+            // For AI players without real client, we call ClientReadyAfterMapChangeAsync
+            // when CurrentMap is null after a warp. This completes the map change protocol.
+            if (this._player is AiPlayer)
+            {
+                await this._player.ClientReadyAfterMapChangeAsync().ConfigureAwait(false);
+                currentMap = this._context.GameAdapter.GetCurrentMap();
+            }
+        }
+
+        if (currentMap is not null && currentMap.Definition.Number == currentStep.ToMap)
+        {
+            // Arrived at destination of this step
+            this._context.ActiveWarpStepIndex++;
+            this._context.WarpInProgress = false;
+
+            if (this._context.ActiveWarpStepIndex >= route.Steps.Count)
+            {
+                // Route complete!
+                this._logger.LogInformation("[WarpRoute] ✅ Arrived at destination map #{Map}", currentStep.ToMap);
+                this._context.ActiveWarpRoute = null;
+                this._context.ActiveWarpStepIndex = 0;
+                this._noMonsterTickCount = 0;
+                this._patrolCenter = this._context.GameAdapter.GetPlayerPosition();
+                return;
+            }
+
+            // Execute next step
+            await this.ExecuteNextWarpStepAsync().ConfigureAwait(false);
+        }
+        // else still waiting for map change
+    }
+
+    /// <summary>
+    /// Checks whether a target map is reachable given current level/money.
+    /// </summary>
+    private WarpBlockReason CheckWarpBlocked(short targetMap)
+    {
+        var currentMap = this._context.GameAdapter.GetCurrentMap();
+        var fromMap = currentMap?.Definition.Number ?? 0;
+        var level = this._context.GameAdapter.GetPlayerLevel();
+        var money = this._player.Money;
+
+        var planner = this.GetWarpPlanner();
+        var route = planner.ComputeRoute((short)fromMap, (short)targetMap, level, money);
+
+        if (route is null)
+        {
+            return new WarpBlockReason { IsBlocked = true, Reason = "No gate route exists" };
+        }
+
+        if (route.IsFeasible)
+        {
+            return new WarpBlockReason { IsBlocked = false };
+        }
+
+        var levelBlocker = route.Steps.FirstOrDefault(s => s.LevelRequirement > level);
+        if (levelBlocker is not null)
+        {
+            return new WarpBlockReason
+            {
+                IsBlocked = true,
+                Reason = $"Level {levelBlocker.LevelRequirement} required",
+                LowestMissingLevel = levelBlocker.LevelRequirement,
+            };
+        }
+
+        if (route.TotalGoldCost > money)
+        {
+            return new WarpBlockReason
+            {
+                IsBlocked = true,
+                Reason = $"Need {route.TotalGoldCost} gold, have {money}",
+                GoldShortfall = route.TotalGoldCost - money,
+            };
+        }
+
+        return new WarpBlockReason { IsBlocked = false };
     }
 }

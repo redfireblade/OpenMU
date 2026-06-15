@@ -4,16 +4,16 @@
 
 namespace MUnique.OpenMU.AIPlayer;
 
+using MUnique.OpenMU.AIPlayer.Warp;
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.Pathfinding;
-using ExecContext = MUnique.OpenMU.Orchestrator.ExecutionContext;
 
 /// <summary>
-/// 模块间共享上下文。继承自通用 <see cref="ExecutionContext"/>，
-/// 添加游戏特定的世界状态、目标、服务和 Tick 录制功能。
+/// 模块间共享上下文。
+/// Contains game-specific world state, targets, services, and Tick recording.
 /// </summary>
-public sealed class BehaviorContext : ExecContext
+public sealed class BehaviorContext
 {
     /// <summary>当前玩家引用（所有模块共享）。</summary>
     public AiPlayer Player { get; }
@@ -33,26 +33,20 @@ public sealed class BehaviorContext : ExecContext
     /// </summary>
     public bool SuppressAutoNavigation { get; set; }
 
-    /// <summary>目标地图编号（GoalModule 设置，NavigationModule 读取）。到达后置 null。</summary>
+    /// <summary>目标地图编号。到达后置 null。</summary>
     public ushort? TargetMapNumber { get; set; }
 
-    /// <summary>AI 数字地图引用（桩属性）。</summary>
-    public Map.AiMap? AiMap { get; set; }
+    /// <summary>当前多跳传送路线（不为 null 时表示正在路由中）。</summary>
+    public WarpRoute? ActiveWarpRoute { get; set; }
+
+    /// <summary>当前路由步骤索引。</summary>
+    public int ActiveWarpStepIndex { get; set; }
+
+    /// <summary>Warp 进行中，等待地图切换完成。</summary>
+    public bool WarpInProgress { get; set; }
 
     /// <summary>经验记忆（跨模块共享）。</summary>
     public ExperienceMemory? ExperienceMemory { get; set; }
-
-    /// <summary>技能系统服务（桩属性）。</summary>
-    public SkillAIService? SkillService { get; set; }
-
-    /// <summary>知识访问服务（桩属性）。</summary>
-    public KnowledgeAccessService? KnowledgeAccess { get; set; }
-
-    /// <summary>NPC 交互服务（桩属性）。</summary>
-    public NpcInteractionService? NpcService { get; set; }
-
-    /// <summary>目标系统执行上下文。</summary>
-    public ExecContext? ExecutionContext { get; set; }
 
     /// <summary>最后加点时间戳。</summary>
     public DateTime LastStatTick { get; set; } = DateTime.UtcNow;
@@ -108,7 +102,7 @@ public sealed class BehaviorContext : ExecContext
             maxMp,
             level,
             mapId,
-            global::MUnique.OpenMU.AIPlayer.SurvivalManager.SurvivalLevel.Normal,
+            SurvivalLevel.Normal,
             this.CurrentTarget is not null,
             this.EmergencyRetreat,
             this._currentTickDecisions.ToArray(),

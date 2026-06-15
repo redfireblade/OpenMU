@@ -5,6 +5,7 @@
 namespace MUnique.OpenMU.GameLogic;
 
 using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.GameLogic.Views.World;
 using Nito.AsyncEx;
@@ -109,6 +110,17 @@ public sealed class ObserverToWorldViewAdapter : AsyncDisposable, IBucketMapObse
             return;
         }
 
+        if (item is Player removedPlayer)
+        {
+            var playerLogger = (this._adaptee as Player)?.Logger;
+            if (playerLogger is not null)
+            {
+                playerLogger.LogDebug("[DEBUG] LocateableRemovedAsync: Player \"{Name}\" removed from scope of \"{Observer}\"",
+                    removedPlayer.SelectedCharacter?.Name ?? "?",
+                    (this._adaptee as Player)?.SelectedCharacter?.Name ?? "?");
+            }
+        }
+
         using (await this._observingLock.WriterLockAsync())
         {
             if (item is IObservable observable)
@@ -189,10 +201,12 @@ public sealed class ObserverToWorldViewAdapter : AsyncDisposable, IBucketMapObse
             newItems.ForEach(item => this._observingObjects.Add(item));
         }
 
-        var players = newItems.OfType<Player>().WhereActive().WhereNotInvisible();
-        if (players.Any())
+        var players = newObjects.OfType<Player>().WhereActive().WhereNotInvisible();
+        var playersList = players.ToList();
+
+        if (playersList.Any())
         {
-            await this._adaptee.InvokeViewPlugInAsync<INewPlayersInScopePlugIn>(p => p.NewPlayersInScopeAsync(players, false)).ConfigureAwait(false);
+            await this._adaptee.InvokeViewPlugInAsync<INewPlayersInScopePlugIn>(p => p.NewPlayersInScopeAsync(playersList, false)).ConfigureAwait(false);
         }
 
         var npcs = newItems.OfType<NonPlayerCharacter>().WhereActive();

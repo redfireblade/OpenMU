@@ -5,6 +5,7 @@
 namespace MUnique.OpenMU.GameServer.RemoteView.World;
 
 using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.GameLogic.Views;
@@ -36,6 +37,16 @@ public class NewPlayersInScopeExtendedPlugIn : NewPlayersInScopePlugIn, INewPlay
     /// <inheritdoc />
     protected override async ValueTask SendCharacterAsync(Player newPlayer, bool isSpawned)
     {
+        var playerLogger = this.Player.Logger;
+        var observerName = this.Player.SelectedCharacter?.Name ?? "?";
+        var newPlayerName = newPlayer.SelectedCharacter?.Name ?? "?";
+
+        if (playerLogger.IsEnabled(LogLevel.Debug))
+        {
+            playerLogger.LogDebug("[TRACE] Extended SendCharacterAsync CALLED: observer={Observer}, newPlayer={NewPlayer}, hasConnection={HasConn}",
+                observerName, newPlayerName, this.Player.Connection is not null);
+        }
+
         var connection = this.Player.Connection;
         if (connection is null)
         {
@@ -46,6 +57,15 @@ public class NewPlayersInScopeExtendedPlugIn : NewPlayersInScopePlugIn, INewPlay
         if (selectedCharacter is null)
         {
             return;
+        }
+
+        if (playerLogger.IsEnabled(LogLevel.Debug))
+        {
+            playerLogger.LogDebug("[DEBUG] Extended SendCharacterAsync: Sending {Name} (Id={Id}) to {Observer} at {Pos}",
+                selectedCharacter.Name,
+                newPlayer.GetId(this.Player),
+                observerName,
+                this.Player.Position);
         }
 
         int Write()
@@ -90,6 +110,15 @@ public class NewPlayersInScopeExtendedPlugIn : NewPlayersInScopePlugIn, INewPlay
 
             appearanceSerializer.WriteAppearanceData(packet.AppearanceAndEffects, newPlayer.AppearanceData, true);
 
+            if (playerLogger.IsEnabled(LogLevel.Debug))
+            {
+                var appearanceBytes = packet.AppearanceAndEffects.ToArray();
+                playerLogger.LogDebug("[DEBUG] Extended SendCharacterAsync: Appearance bytes for {Name} (len={Len}): {Bytes}",
+                    selectedCharacter.Name,
+                    appearanceBytes.Length,
+                    BitConverter.ToString(appearanceBytes));
+            }
+
             var effectsStartIndex = appearanceSerializer.NeededSpace;
             packet.AppearanceAndEffects[effectsStartIndex] = (byte)activeEffects.Length;
             for (int e = 0; e < activeEffects.Length; ++e)
@@ -101,5 +130,12 @@ public class NewPlayersInScopeExtendedPlugIn : NewPlayersInScopePlugIn, INewPlay
         }
 
         await connection.SendAsync(Write).ConfigureAwait(false);
+
+        if (playerLogger.IsEnabled(LogLevel.Debug))
+        {
+            playerLogger.LogDebug("[DEBUG] Extended SendCharacterAsync: Successfully sent {Name} to {Observer}",
+                selectedCharacter.Name,
+                this.Player.SelectedCharacter?.Name ?? "?");
+        }
     }
 }

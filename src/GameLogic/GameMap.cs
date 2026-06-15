@@ -115,7 +115,19 @@ public class GameMap
     }
 
     /// <summary>
-    /// Gets all dropped items and money within the specified range of a point.
+    /// Gets all non-player characters (NPCs) within the specified range of coordinates.
+    /// Includes merchants, quest NPCs, and other friendly NPCs.
+    /// </summary>
+    /// <param name="point">The center coordinates.</param>
+    /// <param name="range">The search range.</param>
+    /// <returns>The NPCs in range of the specified coordinate.</returns>
+    public IList<NonPlayerCharacter> GetNpcsInRange(Point point, int range)
+    {
+        return this._areaOfInterestManager.GetInRange(point, range).OfType<NonPlayerCharacter>().ToList();
+    }
+
+    /// <summary>
+    /// Gets all drops and npc interactions within the specified range of a point.
     /// </summary>
     /// <param name="point">The coordinates.</param>
     /// <param name="range">The range.</param>

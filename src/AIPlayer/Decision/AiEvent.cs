@@ -4,7 +4,9 @@
 
 namespace MUnique.OpenMU.AIPlayer.Decision;
 
+using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.GameLogic;
+using MUnique.OpenMU.GameLogic.Views;
 using MUnique.OpenMU.Pathfinding;
 
 /// <summary>
@@ -111,6 +113,44 @@ public sealed record NpcInRangeEvent(short NpcNumber, string NpcName) : AiEvent
 /// P3 状态：角色升级。
 /// </summary>
 public sealed record LevelUpEvent(int NewLevel) : AiEvent
+{
+    /// <inheritdoc />
+    public override int Priority { get; init; } = 3;
+}
+
+/// <summary>
+/// P3: 世界频道聊天消息收到(含交易信息)。
+/// 由 GameAdapter 在排出 AiViewPlugInContainer 的聊天缓存时发布。
+/// </summary>
+public sealed record ChatMessageReceivedEvent(string SenderName, string Message, ChatMessageType MessageType) : AiEvent
+{
+    /// <inheritdoc />
+    public override int Priority { get; init; } = 3;
+}
+
+/// <summary>
+/// P1 事件: 活动入场窗口打开 — AI 应该考虑参加。
+/// </summary>
+public sealed record EventOpenEvent(MiniGameType Type, int GameLevel, string Name, int EntranceFee) : AiEvent
+{
+    /// <inheritdoc />
+    public override int Priority { get; init; } = 1;
+}
+
+/// <summary>
+/// P2 事件: 活动进行中提醒（定期广播）。
+/// MinutesLeft=0 表示刚开放(状态从 Prepared→Started)，-1 表示定时提醒。
+/// </summary>
+public sealed record EventReminderEvent(MiniGameType Type, int GameLevel, string Name, int MinutesLeft) : AiEvent
+{
+    /// <inheritdoc />
+    public override int Priority { get; init; } = 2;
+}
+
+/// <summary>
+/// P3 事件: 活动已结束。
+/// </summary>
+public sealed record EventClosedEvent(MiniGameType Type, int GameLevel, string Name) : AiEvent
 {
     /// <inheritdoc />
     public override int Priority { get; init; } = 3;

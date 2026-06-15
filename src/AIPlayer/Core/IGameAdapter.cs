@@ -114,6 +114,12 @@ public interface IGameAdapter
 
     /// <summary>执行任务客户端操作（标记 ClientActionPerformed）。</summary>
     ValueTask PerformQuestClientActionAsync(short group, short number);
+
+    // --- Wave Inventory: 背包管理接口 (1 方法) ---
+
+    /// <summary>将道具贩卖给已打开的NPC商店。</summary>
+    /// <param name="inventorySlot">背包中道具的格子索引。</param>
+    ValueTask SellItemToNpcAsync(byte inventorySlot);
 }
 
 #region Quest Data Classes

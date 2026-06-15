@@ -32,7 +32,7 @@ public sealed class SurvivalMode : IBehaviorSubModule
         var map = this._adapter.GetCurrentMap();
         if (map is null) return StepResult.Failed;
 
-        // 低血 → 用药水 + 回安全区
+        // 低血 → 用药水 + 短距离脱离战斗
         var hp = this._adapter.GetCurrentHp();
         var maxHp = this._adapter.GetMaxHp();
         if (maxHp > 0 && (float)hp / maxHp < 0.4f)
@@ -50,10 +50,12 @@ public sealed class SurvivalMode : IBehaviorSubModule
                 return StepResult.InProgress; // 喝药后血量回到安全线
             }
 
-            // 血量仍低 → 往安全区走
-            var safeZone = new Point(130, 130); // 默认安全区中心
-            // AiMap reference removed — just walk to map center
-            await this._adapter.WalkToAsync(safeZone, map).ConfigureAwait(false);
+            // 血量仍低 → 短距离脱离战斗（5 格内随机方向）
+            // 注意: 不走远距离安全区——长时间行走会阻塞心跳决策循环（行 148 return）
+            var pos = this._adapter.GetPlayerPosition();
+            var escapeX = (byte)Math.Clamp(pos.X + Random.Shared.Next(-5, 6), 0, 255);
+            var escapeY = (byte)Math.Clamp(pos.Y + Random.Shared.Next(-5, 6), 0, 255);
+            await this._adapter.WalkToAsync(new Point(escapeX, escapeY), map).ConfigureAwait(false);
         }
         // 有怪物 → 打
         var currentPos = this._adapter.GetPlayerPosition();

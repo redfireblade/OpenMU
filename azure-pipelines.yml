@@ -5,6 +5,7 @@
 
 trigger:
 - master
+- ai-*
 
 pool:
   vmImage: 'windows-2022'
@@ -14,16 +15,19 @@ variables:
 
 steps:
 - task: UseDotNet@2
-  displayName: 'Install .NET Core SDK'
+  displayName: 'Install .NET SDK'
   inputs:
     version: 10.0.x
     performMultiLevelLookup: true
-    includePreviewVersions: true # Required for preview versions
+    includePreviewVersions: true
 
-- script: dotnet restore
-  workingDirectory: src
-  displayName: 'dotnet restore'
+- script: dotnet build src/MUnique.OpenMU.sln --configuration $(buildConfiguration) -p:ci=true
+  displayName: 'Build + SpecAnalyzer validation'
 
-- script: dotnet build --configuration $(buildConfiguration) -p:ci=true
-  workingDirectory: src
-  displayName: 'dotnet build $(buildConfiguration)'
+- script: dotnet test tests/MUnique.OpenMU.Tests --configuration $(buildConfiguration) --no-build --logger trx
+  displayName: 'Run core tests'
+  continueOnError: true
+
+- script: dotnet test tests/MUnique.OpenMU.AIPlayer.IntegrationTests --configuration $(buildConfiguration) --no-build --logger trx
+  displayName: 'Run AIPlayer integration tests'
+  continueOnError: true

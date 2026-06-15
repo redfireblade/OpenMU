@@ -77,31 +77,36 @@ public sealed class ScopedGridNetwork : BaseGridNetwork
 
         var offsetX = GetOffset(avg.X, grid.GetUpperBound(0) + 1);
         var offsetY = GetOffset(avg.Y, grid.GetUpperBound(1) + 1);
-        this._segmentOffset = new(offsetX, offsetY);
+        this._segmentOffset = new((byte)offsetX, (byte)offsetY);
 
         var maxX = offsetX + this._actualSegmentSideLength;
         var maxY = offsetY + this._actualSegmentSideLength;
 
-        for (byte x = offsetX; x < maxX; ++x)
+        for (int x = offsetX; x < maxX; ++x)
         {
-            for (byte y = offsetY; y < maxY; ++y)
+            for (int y = offsetY; y < maxY; ++y)
             {
                 var i = this.GetIndexOfPoint(x, y);
+                if (i < 0 || i >= this._gridNodes.Length)
+                {
+                    continue;
+                }
+
                 var node = this._gridNodes[i];
                 if (node is not null)
                 {
                     node.Status = NodeStatus.Undefined;
-                    node.Position = new(x, y);
+                    node.Position = new((byte)x, (byte)y);
                 }
             }
         }
 
         return base.Prepare(start, end, grid, includeSafezone);
 
-        byte GetOffset(byte avgValue, int gridSize)
+        int GetOffset(int avgValue, int gridSize)
         {
-            var offset = (byte)Math.Max(avgValue - (this._actualSegmentSideLength / 2), 0);
-            offset = (byte)Math.Min(offset, gridSize - this._actualSegmentSideLength);
+            var offset = Math.Max(avgValue - (this._actualSegmentSideLength / 2), 0);
+            offset = Math.Min(offset, gridSize - this._actualSegmentSideLength);
             return offset;
         }
     }

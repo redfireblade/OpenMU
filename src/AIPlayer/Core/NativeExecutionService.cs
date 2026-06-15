@@ -34,7 +34,41 @@ public sealed class NativeExecutionService
     {
         if (!target.IsAlive || target is Monster { IsAlive: false }) return;
         this._player.Rotation = this._player.Position.GetDirectionTo(target.Position);
-        await target.AttackByAsync(this._player, null, false).ConfigureAwait(false);
+        var hitInfo = await target.AttackByAsync(this._player, null, false).ConfigureAwait(false);
+        this._player.Logger.LogInformation("[P0D] MeleeAttackAsync: target #{Target}({Name}) at ({X},{Y}), hpDmg={HpDmg}, shieldDmg={ShieldDmg}, targetAlive={Alive}",
+            target is Monster m ? m.Definition?.Number : 0,
+            target is Monster mon ? mon.Definition?.Designation ?? "?" : "?",
+            target.Position.X, target.Position.Y,
+            hitInfo?.HealthDamage ?? 0, hitInfo?.ShieldDamage ?? 0,
+            target.IsAlive);
+        await this.EnsureMinimumDamageAsync(target, hitInfo).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 兜底伤害：如果攻击伤害太低（空手无加点导致），通过 `ApplyBleedingDamageAsync`
+    /// 补充额外直接伤害确保怪物能被杀死。
+    /// 和 GameAdapter.EnsureMinimumDamageAsync 同步实现（两条攻击路径都需要）。
+    /// 不违反 AR-20（IAttackable 公开接口）。
+    /// </summary>
+    private async ValueTask EnsureMinimumDamageAsync(IAttackable target, HitInfo? hitInfo)
+    {
+        if (hitInfo is null || target is not Monster monster || !target.IsAlive)
+        {
+            return;
+        }
+
+        var level = this._player.Level;
+        var minimumDamage = Math.Max(30, level / 2);
+
+        if (hitInfo.Value.HealthDamage < minimumDamage)
+        {
+            var bonusDamage = (uint)(minimumDamage - hitInfo.Value.HealthDamage);
+            this._player.Logger.LogInformation(
+                "[P0D] EnsureMinimumDamageAsync: boosting damage from {ActualDmg} to {MinDmg} (+{Bonus}) for target #{Target}",
+                hitInfo.Value.HealthDamage, minimumDamage, bonusDamage,
+                monster.Definition?.Number);
+            await target.ApplyBleedingDamageAsync(this._player, bonusDamage).ConfigureAwait(false);
+        }
     }
 
     /// <summary>

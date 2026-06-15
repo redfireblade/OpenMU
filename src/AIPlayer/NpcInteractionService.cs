@@ -22,10 +22,23 @@ public sealed class NpcInteractionService
 
     public bool IsReadyForInteraction => true;
 
+    /// <summary>获取 NPC 在当前地图的刷出坐标（从 MonsterSpawns 配置读取）。</summary>
+    /// <param name="map">当前地图。</param>
+    /// <param name="npcNumber">NPC 编号。</param>
+    /// <returns>刷出坐标，如果该 NPC 不在当前地图则返回 null。</returns>
+    public Point? GetQuestNpcSpawn(GameMap map, short npcNumber)
+    {
+        if (npcNumber == 0) return null;
+        var spawn = map.Definition.MonsterSpawns
+            .FirstOrDefault(s => s.MonsterDefinition?.Number == npcNumber);
+        if (spawn is null) return null;
+        return new Point((byte)((spawn.X1 + spawn.X2) / 2), (byte)((spawn.Y1 + spawn.Y2) / 2));
+    }
+
+    /// <summary>在当前地图的 NPC 实例中查找指定编号的 NPC（必须在附近）。</summary>
     public NonPlayerCharacter? FindQuestNpc(GameMap map, Point playerPos, short? npcNumber)
     {
         if (npcNumber is null) return null;
-        // 只匹配确切编号，避免 NPC #0 误匹配
         if (npcNumber.Value == 0) return null;
         return map.GetNpcsInRange(playerPos, 200)
             .FirstOrDefault(n => n.Definition?.Number == npcNumber.Value);

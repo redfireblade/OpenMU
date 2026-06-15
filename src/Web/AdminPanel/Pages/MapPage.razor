@@ -64,7 +64,7 @@
         await adapter.InitializeAsync();
 
         this._gameServer = adapter;
-        this._map = this._gameServer.Maps.First(m => m.Id == this.MapId);
+        this._map = this._gameServer.Maps.FirstOrDefault(m => m.Id == this.MapId);
         await base.OnInitializedAsync();
     }
 }

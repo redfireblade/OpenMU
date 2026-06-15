@@ -402,7 +402,31 @@ public sealed class HotspotDef
     [JsonPropertyName("y")]
     public byte Y { get; set; }
 
+    /// <summary>热点所在地图编号。</summary>
+    [JsonPropertyName("map")]
+    public ushort MapNumber { get; set; } = ushort.MaxValue;
+
     /// <summary>热点名称（可选，用于日志）。</summary>
     [JsonPropertyName("name")]
     public string? Name { get; set; }
+
+    /// <summary>刷怪矩形 X 范围下限（来自 MonsterSpawn.X1）。</summary>
+    [JsonPropertyName("x1")]
+    public byte X1 { get; set; }
+
+    /// <summary>刷怪矩形 X 范围上限（来自 MonsterSpawn.X2）。</summary>
+    [JsonPropertyName("x2")]
+    public byte X2 { get; set; }
+
+    /// <summary>刷怪矩形 Y 范围下限（来自 MonsterSpawn.Y1）。</summary>
+    [JsonPropertyName("y1")]
+    public byte Y1 { get; set; }
+
+    /// <summary>刷怪矩形 Y 范围上限（来自 MonsterSpawn.Y2）。</summary>
+    [JsonPropertyName("y2")]
+    public byte Y2 { get; set; }
+
+    /// <summary>兜底占位标记—所有刷点均未找到时使用，供 Blocked 判断。</summary>
+    [JsonIgnore]
+    public bool IsNoSpawnFallback { get; set; }
 }

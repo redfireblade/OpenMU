@@ -30,20 +30,40 @@ public class QuestMonsterKillCountPlugIn : IAttackableGotKilledPlugIn, ISupportC
         var configuration = this.Configuration ??= CreateDefaultConfiguration();
 
         if (!(killer is Player player && killed is Monster monster)
-            || player.SelectedCharacter?.QuestStates is null)
+            || player.SelectedCharacter?.QuestStates is not { } questStates)
         {
             return;
         }
 
-        foreach (var questState in player.SelectedCharacter.QuestStates)
+        var killedMonsterNumber = monster.Definition.Number;
+        player.Logger.LogDebug("[QuestKillCount] AttackableGotKilled: monster #{Monster} ({Name}) killed by player {Player}",
+            killedMonsterNumber, monster.Definition.Designation, player.SelectedCharacter?.Name);
+
+        foreach (var questState in questStates)
         {
             if (questState.ActiveQuest is null)
             {
                 continue;
             }
 
-            foreach (var killRequirement in questState.ActiveQuest.RequiredMonsterKills.Where(r => object.Equals(r.Monster, monster.Definition)))
+            player.Logger.LogDebug("[QuestKillCount] ActiveQuest: G{Group}#{Number} '{Name}' with {Count} kill requirements",
+                questState.Group, questState.ActiveQuest.Number, questState.ActiveQuest.Name,
+                questState.ActiveQuest.RequiredMonsterKills?.Count ?? 0);
+
+            // Changed from reference equality (object.Equals) to Number comparison
+            // to work correctly with InMemory persistence where MonsterDefinition
+            // instances may not be the same reference.
+            var killRequirements = questState.ActiveQuest.RequiredMonsterKills;
+            if (killRequirements is null)
             {
+                continue;
+            }
+
+            foreach (var killRequirement in killRequirements.Where(r => r.Monster?.Number == killedMonsterNumber))
+            {
+                player.Logger.LogDebug("[QuestKillCount] Matched kill requirement: monster #{ReqMonster} (killed #{KilledMonster})",
+                    killRequirement.Monster?.Number, killedMonsterNumber);
+
                 if (questState.RequirementStates.FirstOrDefault(s => object.Equals(s.Requirement, killRequirement))
                     is not { } requirementState)
                 {
@@ -53,6 +73,8 @@ public class QuestMonsterKillCountPlugIn : IAttackableGotKilledPlugIn, ISupportC
                 }
 
                 requirementState!.KillCount++;
+                player.Logger.LogInformation("[QuestKillCount] KillCount incremented to {Count}/{Required} for monster #{Monster}",
+                    requirementState.KillCount, killRequirement.MinimumNumber, killedMonsterNumber);
 
                 if (killRequirement.MinimumNumber >= requirementState!.KillCount
                     && configuration.Message.GetTranslation(player.Culture) is { Length: > 0 } translation)

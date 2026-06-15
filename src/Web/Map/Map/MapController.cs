@@ -9,6 +9,7 @@ using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.JSInterop;
 using MUnique.OpenMU.GameLogic;
+using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.GameLogic.Views;
 using MUnique.OpenMU.GameLogic.Views.World;
 using MUnique.OpenMU.Pathfinding;
@@ -57,6 +58,8 @@ public sealed class MapController : IMapController, IWorldObserver, ILocateable,
         viewPlugIns.RegisterPlugIn<IShowAreaSkillAnimationPlugIn>(new ShowAreaSkillAnimationPlugIn(this._jsRuntime, loggerFactory, worldAccessor, this._disposeCts.Token));
 
         this.ViewPlugIns = viewPlugIns;
+        this.Logger.LogDebug("[MapController] Created for map {MapId} on server {ServerId}, worldAccessor={WorldAccessor}, position=({X},{Y}), infoRange={Range}",
+            mapId, gameServer.Id, worldAccessor, this.Position.X, this.Position.Y, this.InfoRange);
     }
 
     /// <inheritdoc />
@@ -89,6 +92,15 @@ public sealed class MapController : IMapController, IWorldObserver, ILocateable,
     /// <inheritdoc/>
     public ValueTask LocateableAddedAsync(ILocateable item)
     {
+        if (item is Player p)
+        {
+            this.Logger.LogDebug("[MapController] LocateableAddedAsync: Player \"{Name}\" (id={Id}) at ({X},{Y}), IsActive={IsActive}, IsInvisible={IsInvisible}",
+                p.SelectedCharacter?.Name ?? "?", p.Id, p.Position.X, p.Position.Y, item.IsActive(), (p as Player)?.IsInvisible);
+        }
+        else if (item is NonPlayerCharacter)
+        {
+            this.Logger.LogDebug("[MapController] LocateableAddedAsync: NPC at ({X},{Y})", item.Position.X, item.Position.Y);
+        }
         return this._adapterToWorldView.LocateableAddedAsync(item);
     }
 
@@ -107,6 +119,14 @@ public sealed class MapController : IMapController, IWorldObserver, ILocateable,
     /// <inheritdoc/>
     public ValueTask NewLocateablesInScopeAsync(IEnumerable<ILocateable> newObjects)
     {
+        var playerCount = newObjects.OfType<Player>().Count();
+        var npcCount = newObjects.OfType<NonPlayerCharacter>().Count();
+        var itemCount = newObjects.Count() - playerCount - npcCount;
+        if (playerCount > 0 || npcCount > 0)
+        {
+            this.Logger.LogDebug("[MapController] NewLocateablesInScopeAsync: {TotalCount} total, {PlayerCount} players, {NpcCount} NPCs, {ItemCount} other",
+                newObjects.Count(), playerCount, npcCount, itemCount);
+        }
         return this._adapterToWorldView.NewLocateablesInScopeAsync(newObjects);
     }
 

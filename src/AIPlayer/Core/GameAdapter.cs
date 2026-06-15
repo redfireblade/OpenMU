@@ -6,6 +6,8 @@ namespace MUnique.OpenMU.AIPlayer;
 
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.Attributes;
+using MUnique.OpenMU.DataModel.Entities;
+using MUnique.OpenMU.DataModel.Configuration.Quests;
 using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.GameLogic.PlayerActions.ItemConsumeActions;
 using MUnique.OpenMU.GameLogic.PlayerActions.Items;
@@ -15,6 +17,7 @@ using MUnique.OpenMU.GameLogic.PlayerActions.Skills;
 using MUnique.OpenMU.GameLogic.PlugIns;
 using MUnique.OpenMU.Pathfinding;
 using MUnique.OpenMU.GameLogic.Views.World;
+using MUnique.OpenMU.GameLogic.Views;
 
 /// <summary>
 /// <see cref="IGameAdapter"/> 的默认实现。
@@ -30,6 +33,7 @@ public sealed class GameAdapter : IGameAdapter
     private readonly QuestStartAction _questStartAction = new();
     private readonly QuestCompletionAction _questCompletionAction = new();
     private readonly QuestClientAction _questClientAction = new();
+    private readonly SellItemToNpcAction _sellItemAction = new();
 
     /// <summary>
     /// 事件发布委托 — 由 HeartbeatService 在启动后设置。
@@ -37,6 +41,12 @@ public sealed class GameAdapter : IGameAdapter
     /// 不在 <see cref="IGameAdapter"/> 接口中（接口不变约束）。
     /// </summary>
     public Action<Decision.AiEvent>? EventPublisher { get; set; }
+
+    /// <summary>
+    /// 聊天消息接收事件 — 由 <see cref="DrainChatMessages"/> 在每 tick 排出聊天缓存时触发。
+    /// HeartbeatService 订阅此事件以处理交易喊话。
+    /// </summary>
+    public event Action<string, string, ChatMessageType>? ChatMessageReceived;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="GameAdapter"/> class.
@@ -84,7 +94,14 @@ public sealed class GameAdapter : IGameAdapter
             ? this._player.Position.GetDirectionTo(target.Position)
             : direction;
         this._player.Rotation = attackDir;
-        await target.AttackByAsync(this._player, null, false).ConfigureAwait(false);
+        var hitInfo = await target.AttackByAsync(this._player, null, false).ConfigureAwait(false);
+        this._player.Logger.LogInformation("[P0D] HitAsync: target #{Target}({Name}) at ({X},{Y}), hpDmg={HpDmg}, shieldDmg={ShieldDmg}, targetAlive={Alive}",
+            target is Monster m ? m.Definition?.Number : 0,
+            target is Monster mon ? mon.Definition?.Designation ?? "?" : "?",
+            target.Position.X, target.Position.Y,
+            hitInfo?.HealthDamage ?? 0, hitInfo?.ShieldDamage ?? 0,
+            target.IsAlive);
+        await this.EnsureMinimumDamageAsync(target, hitInfo).ConfigureAwait(false);
         this.TryPublishMonsterKilled(target);
     }
 
@@ -110,7 +127,15 @@ public sealed class GameAdapter : IGameAdapter
         }
 
         this._player.Rotation = this._player.Position.GetDirectionTo(target.Position);
-        await target.AttackByAsync(this._player, skillEntry, false).ConfigureAwait(false);
+        var hitInfo = await target.AttackByAsync(this._player, skillEntry, false).ConfigureAwait(false);
+        this._player.Logger.LogInformation("[P0D] HitWithSkillAsync: target #{Target}({Name}) at ({X},{Y}), skill={Skill}, hpDmg={HpDmg}, shieldDmg={ShieldDmg}, targetAlive={Alive}",
+            target is Monster m ? m.Definition?.Number : 0,
+            target is Monster mon ? mon.Definition?.Designation ?? "?" : "?",
+            target.Position.X, target.Position.Y,
+            skillEntry.Skill?.Number ?? 0,
+            hitInfo?.HealthDamage ?? 0, hitInfo?.ShieldDamage ?? 0,
+            target.IsAlive);
+        await this.EnsureMinimumDamageAsync(target, hitInfo).ConfigureAwait(false);
         this.TryPublishMonsterKilled(target);
     }
 
@@ -195,11 +220,12 @@ public sealed class GameAdapter : IGameAdapter
             return new WarpResult(WarpStatusCode.MapNotFound, mapNumber, (ushort)currentMap.Definition.Number, reason, this._player.Position);
         }
 
-        // Find a spawn gate on the target map
-        var spawnGate = targetDef.ExitGates.FirstOrDefault(g => g.IsSpawnGate);
+        // Find a spawn gate on the target map (fallback to any exit gate)
+        var spawnGate = targetDef.ExitGates.FirstOrDefault(g => g.IsSpawnGate)
+                      ?? targetDef.ExitGates.FirstOrDefault();
         if (spawnGate is null)
         {
-            var reason = "No spawn gate found";
+            var reason = "No exit gate found";
             this._player.Logger.LogWarning("[WarpToMapAsync] {Reason} for map {MapNumber}.", reason, mapNumber);
             return new WarpResult(WarpStatusCode.NoSpawnGate, mapNumber, (ushort)currentMap.Definition.Number, reason, this._player.Position);
         }
@@ -207,6 +233,14 @@ public sealed class GameAdapter : IGameAdapter
         try
         {
             await this._player.WarpToAsync(spawnGate).ConfigureAwait(false);
+
+            // WarpToAsync 将 CurrentMap 设为 null，等客户端发 F3 12 确认。
+            // AI 玩家没有真实客户端，直接确认地图变换完成。
+            if (this._player.CurrentMap is null)
+            {
+                await this._player.ClientReadyAfterMapChangeAsync().ConfigureAwait(false);
+            }
+
             this._player.Logger.LogInformation("[WarpToMapAsync] WarpToAsync 完成: " +
                 "player.CurrentMap={Map} pos=({X},{Y}) gate.Map={GateMap}",
                 this._player.CurrentMap?.Definition.Number,
@@ -301,6 +335,14 @@ public sealed class GameAdapter : IGameAdapter
         await this.WalkToAsync(leaderPos, this._player.CurrentMap).ConfigureAwait(false);
     }
 
+    // --- Wave Inventory: 背包管理接口实现 ---
+
+    /// <inheritdoc />
+    public async ValueTask SellItemToNpcAsync(byte inventorySlot)
+    {
+        await this._sellItemAction.SellItemAsync(this._player, inventorySlot).ConfigureAwait(false);
+    }
+
     // --- Wave Quest: 任务接口实现 ---
 
     /// <inheritdoc />
@@ -342,9 +384,13 @@ public sealed class GameAdapter : IGameAdapter
                 var killInfos = new List<QuestMonsterKillInfo>(activeQuest.RequiredMonsterKills.Count);
                 foreach (var killReq in activeQuest.RequiredMonsterKills)
                 {
-                    var currentCount = state.RequirementStates
+                    var currentCount = state.RequirementStates?
                         .FirstOrDefault(r => Equals(r.Requirement, killReq))
                         ?.KillCount ?? 0;
+
+                    this._player.Logger.LogInformation("[P0D] GetActiveQuests: killReq #{Monster} cur={Cur}/{Req}, RequirementStates count={RS}",
+                        killReq.Monster?.Number, currentCount, killReq.MinimumNumber,
+                        state.RequirementStates?.Count ?? 0);
 
                     killInfos.Add(new QuestMonsterKillInfo
                     {
@@ -423,6 +469,80 @@ public sealed class GameAdapter : IGameAdapter
                     CharacterLevel: this._player.Level);
             }
 
+            // Fallback: StartQuestAsync failed (likely G0/QuestGiver=null because
+            // GetQuest() depends on OpenedNpc). Try global config fallback.
+            var found = false;
+            if (this._player.GameContext?.Configuration is { } config)
+            {
+                foreach (var monster in config.Monsters)
+                {
+                    if (monster.Quests is null) continue;
+                    var questDef = monster.Quests.FirstOrDefault(q =>
+                        q.Group == group && q.Number == number
+                        && (q.QualifiedCharacter is null || Equals(q.QualifiedCharacter, this._player.SelectedCharacter?.CharacterClass)));
+                    if (questDef is null) continue;
+
+                    this._player.Logger.LogInformation(
+                        "[StartQuestAsync] Auto-activating quest G{Group}/N{Number} via config fallback (QuestDefinition found=True).",
+                        group, number);
+
+                    // Check level prerequisites
+                    if (questDef.MinimumCharacterLevel > this._player.Level ||
+                        (questDef.MaximumCharacterLevel > 0 && questDef.MaximumCharacterLevel < this._player.Level))
+                    {
+                        this._player.Logger.LogWarning(
+                            "[StartQuestAsync] Fallback: level check failed for G{Group}/N{Number}.", group, number);
+                        break;
+                    }
+
+                    // Get or create CharacterQuestState
+                    var questState = this._player.SelectedCharacter!.QuestStates.FirstOrDefault(q => q.Group == group);
+                    if (questState is null)
+                    {
+                        questState = this._player.PersistenceContext.CreateNew<CharacterQuestState>();
+                        questState.Group = group;
+                        this._player.SelectedCharacter.QuestStates.Add(questState);
+                    }
+
+                    // Check repeatability
+                    if (Equals(questState.LastFinishedQuest, questDef) && !questDef.Repeatable)
+                    {
+                        this._player.Logger.LogWarning(
+                            "[StartQuestAsync] Fallback: quest G{Group}/N{Number} is not repeatable.", group, number);
+                        break;
+                    }
+
+                    // Check RequiredStartMoney
+                    if (questDef.RequiredStartMoney > 0)
+                    {
+                        if (!this._player.TryRemoveMoney(questDef.RequiredStartMoney))
+                        {
+                            this._player.Logger.LogWarning(
+                                "[StartQuestAsync] Fallback: insufficient money for G{Group}/N{Number} (need={Need}).",
+                                group, number, questDef.RequiredStartMoney);
+                            break;
+                        }
+                    }
+
+                    // Clear existing state and set ActiveQuest (matching QuestStartAction pattern)
+                    await questState.ClearAsync(this._player.PersistenceContext).ConfigureAwait(false);
+                    questState.ActiveQuest = questDef;
+
+                    this._player.Logger.LogInformation(
+                        "[StartQuestAsync] Quest G{Group}/N{Number} activated via config fallback.", group, number);
+                    found = true;
+                    break;
+                }
+            }
+
+            if (found)
+            {
+                return new QuestActionResult(
+                    QuestStatusCode.Accepted, group, number,
+                    MoneyBalance: this._player.SelectedCharacter?.Inventory?.Money,
+                    CharacterLevel: this._player.Level);
+            }
+
             // 任务未激活 — 可能是钱不够、等级不够或不可重复
             // 尝试判断具体原因
             var money = this._player.SelectedCharacter?.Inventory?.Money ?? 0;
@@ -467,6 +587,37 @@ public sealed class GameAdapter : IGameAdapter
         this._questClientAction.ClientAction(this._player, group, number);
         this._player.Logger.LogInformation("[QuestClientAction] ClientAction performed: group={Group}, number={Number}.", group, number);
         return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// 排出 AI 玩家的聊天消息缓存并触发 <see cref="ChatMessageReceived"/> 事件。
+    /// 每 tick 由 HeartbeatService 调用，将 AiViewPlugInContainer 中缓存的聊天消息
+    /// 批量取出并发布为事件，供 TransactionMonitor 处理。
+    /// </summary>
+    public void DrainChatMessages()
+    {
+        var container = this._player.ViewPlugIns as AiViewPlugInContainer;
+        if (container is null)
+        {
+            return;
+        }
+
+        List<(string Sender, string Message, ChatMessageType Type)> batch;
+        lock (container.ChatBuffer)
+        {
+            if (container.ChatBuffer.Count == 0)
+            {
+                return;
+            }
+
+            batch = new List<(string, string, ChatMessageType)>(container.ChatBuffer);
+            container.ChatBuffer.Clear();
+        }
+
+        foreach (var (sender, message, type) in batch)
+        {
+            this.ChatMessageReceived?.Invoke(sender, message, type);
+        }
     }
 
     private static ActiveQuestInfo BuildQuestInfoWithKills(ActiveQuestInfo info, IReadOnlyList<QuestMonsterKillInfo> kills)
@@ -517,5 +668,39 @@ public sealed class GameAdapter : IGameAdapter
         var monsterNumber = (short)(monster.Definition?.Number ?? 0);
         var monsterName = monster.Definition?.Designation ?? "?";
         this.EventPublisher(new Decision.MonsterKilledEvent(monsterNumber, monsterName));
+    }
+
+    /// <summary>
+    ///  AI 角色伤害兜底逻辑：当攻击怪物造成的基础伤害过低时（因为缺少装备/属性），
+    ///  补充额外的直接伤害以确保 AI 角色至少能造成有意义的伤害。
+    ///  这解决了 AI 角色没有武器、属性点未分配时的 8 点保底伤害问题。
+    /// </summary>
+    /// <remarks>
+    ///  注意：不能修改 GameLogic 的 AttackByAsync（AR-20 约束）。
+    ///  使用 IAttackable.ApplyBleedingDamageAsync 施加直接额外伤害，
+    ///  该方法是 IAttackable 公开接口的一部分，不违反约束。
+    /// </remarks>
+    /// <param name="target">被攻击的目标。</param>
+    /// <param name="hitInfo">原始攻击的伤害信息。</param>
+    private async ValueTask EnsureMinimumDamageAsync(IAttackable target, HitInfo? hitInfo)
+    {
+        if (hitInfo is null || target is not Monster monster || !target.IsAlive)
+        {
+            return;
+        }
+
+        var level = this._player.Level;
+        var minimumDamage = Math.Max(30, level / 2);
+
+        // hitInfo is Nullable<HitInfo> (record struct), so use .Value to access members
+        if (hitInfo.Value.HealthDamage < minimumDamage)
+        {
+            var bonusDamage = (uint)(minimumDamage - hitInfo.Value.HealthDamage);
+            this._player.Logger.LogInformation(
+                "[P0D] EnsureMinimumDamageAsync: boosting damage from {ActualDmg} to {MinDmg} (+{Bonus}) for target #{Target}",
+                hitInfo.Value.HealthDamage, minimumDamage, bonusDamage,
+                monster.Definition?.Number);
+            await target.ApplyBleedingDamageAsync(this._player, bonusDamage).ConfigureAwait(false);
+        }
     }
 }

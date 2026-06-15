@@ -1,0 +1,74 @@
+{
+  "id": "dag_hunting_loop_v2_test",
+  "name": "DAG 狩猎循环 v2.0-test — 含 goto @hunt 跳转测试版",
+  "version": "2.0.0-test",
+  "status": "draft",
+  "description": "DAG 段落测试 v2: @start 中增加 enter_hunt（always→goto @hunt），验证段落间 goto 跳转和 combat_priority elif/else 分支。",
+  "category": "composite",
+  "personality": "balanced",
+
+  "orchestrator": {
+    "mode": "dag",
+    "maxConcurrency": 1,
+    "errorIsolation": true
+  },
+
+  "parameters": {
+    "hpThreshold": 0.35,
+    "mpThreshold": 0.20,
+    "maxLevelDiff": 30,
+    "patrolRadius": 15,
+    "attackRange": 3.0,
+    "pickupFilter": "rare_and_above",
+    "returnWhenInventoryFull": false,
+    "searchRange": 20,
+    "potionCooldownMs": 2000,
+    "npcBlacklist": [],
+    "durabilityThreshold": 0.1,
+    "potionHysteresisMargin": 0.10,
+    "returnCooldownSec": 120,
+    "noMonsterTicksLimit": 30,
+    "hotspots": [
+      { "x": 130, "y": 110, "name": "出生点" },
+      { "x": 150, "y": 140, "name": "中央区域" },
+      { "x": 170, "y": 120, "name": "右侧区域" },
+      { "x": 110, "y": 140, "name": "左侧区域" }
+    ],
+    "pickupCooldownTicks": 10,
+    "positionStuckThreshold": 50
+  },
+
+  "paragraphs": [
+    {
+      "label": "@start",
+      "nodes": [
+        { "name": "death_check", "condition": "is_dead", "action": "wait_respawn" },
+        { "name": "hp_check", "condition": "hp_below_threshold", "action": "use_hp_potion" },
+        { "name": "mp_check", "condition": "mp_below_threshold", "action": "use_mp_potion" },
+        { "name": "repair_check", "condition": "durability_low", "action": "return_and_sell" },
+        { "name": "inventory_full_check", "condition": "inventory_full", "action": "return_and_sell" },
+        { "name": "safezone_check", "condition": "in_safe_zone", "action": "leave_safezone" },
+        { "name": "enter_hunt", "condition": "always", "action": "goto @hunt" }
+      ]
+    },
+    {
+      "label": "@hunt",
+      "nodes": [
+        {
+          "name": "combat_priority",
+          "condition": "has_target_in_range",
+          "action": "attack_target",
+          "elifNodes": [
+            { "name": "chase_target", "condition": "has_target_not_in_range", "action": "walk_to_target" },
+            { "name": "pickup_items", "condition": "always", "action": "pickup_nearby" }
+          ],
+          "elseNode": {
+            "name": "find_target_and_patrol",
+            "condition": "no_target",
+            "action": "find_nearest_monster"
+          }
+        }
+      ]
+    }
+  ]
+}

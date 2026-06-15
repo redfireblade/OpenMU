@@ -1,11 +1,14 @@
 ﻿@using MUnique.OpenMU.DataModel.Entities
 @using MUnique.OpenMU.Web.Map.Properties
+@implements IDisposable
 
 <table>
     <thead>
     <tr>
         <td>@(Resources.PlayerName)</td>
         <td>@(Resources.Id)</td>
+        <td>X</td>
+        <td>Y</td>
         <td>@(Resources.Actions)</td>
     </tr>
     </thead>
@@ -15,6 +18,8 @@
         <tr>
             <td>@player.Name</td>
             <td>@player.Id</td>
+            <td>@player.Position.X</td>
+            <td>@player.Position.Y</td>
             <td>
                 <button type="button" class="oi oi-account-logout" @onclick=@(async () => await player.DisconnectAsync()) title="@(Resources.Disconnect)"></button>
                 <button type="button" class="oi oi-ban" @onclick=@(async () => { if (player.Account is not null) { player.Account.State = AccountState.TemporarilyBanned; } await player.DisconnectAsync(); }) title="@(Resources.TemporarilyBan)"></button>
@@ -25,6 +30,8 @@
 </table>
 
 @code {
+
+    private System.Threading.Timer? _refreshTimer;
 
     /// <summary>
     /// Gets or sets the map controller.
@@ -37,5 +44,24 @@
     {
         base.OnParametersSet();
         this.MapController.PlayersChanged += (_, _) => this.InvokeAsync(this.StateHasChanged);
+    }
+
+    /// <inheritdoc />
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (firstRender)
+        {
+            this._refreshTimer = new System.Threading.Timer(
+                _ => this.InvokeAsync(this.StateHasChanged),
+                null,
+                TimeSpan.FromMilliseconds(500),
+                TimeSpan.FromMilliseconds(500));
+        }
+    }
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        this._refreshTimer?.Dispose();
     }
 }

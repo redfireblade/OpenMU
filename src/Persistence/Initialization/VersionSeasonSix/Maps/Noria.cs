@@ -38,4 +38,17 @@ internal class Noria : Version095d.Maps.Noria
         yield return this.CreateMonsterSpawn(13, this.NpcDictionary[451], 179, 129, Direction.SouthEast);
         yield return this.CreateMonsterSpawn(14, this.NpcDictionary[229], 169, 88, Direction.SouthEast, SpawnTrigger.Wandering); // Marlon
     }
+
+    /// <inheritdoc/>
+    protected override IEnumerable<MonsterSpawnArea> CreateMonsterSpawns()
+    {
+        foreach (var spawn in base.CreateMonsterSpawns())
+        {
+            yield return spawn;
+        }
+
+        // Spider (#3) 刷新点 — 覆盖热点区(200,140)~(220,180)附近
+        // 使 Elf Soldier 的 "Spider Hunt!" 任务(Group 18/1)可在 Noria 完成
+        yield return this.CreateMonsterSpawn(29, this.NpcDictionary[3], 190, 235, 130, 200, 15);
+    }
 }

@@ -4,7 +4,9 @@
 
 namespace MUnique.OpenMU.GameServer.RemoteView.World;
 
+using System;
 using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.GameLogic.Views;
@@ -45,6 +47,13 @@ public class NewPlayersInScopePlugIn : INewPlayersInScopePlugIn
             return;
         }
 
+        var playerLogger = this.Player.Logger;
+        if (playerLogger.IsEnabled(LogLevel.Debug))
+        {
+            playerLogger.LogDebug("[TRACE] NewPlayersInScopeAsync: pluginType={PluginType}, playerCount={Count}, isSpawned={Spawned}",
+                this.GetType().Name, newPlayers.Count(), isSpawned);
+        }
+
         var (shopPlayers, guildPlayers) = await this.SendCharactersAsync(newPlayers, isSpawned).ConfigureAwait(false);
 
         if (shopPlayers != null)
@@ -78,6 +87,19 @@ public class NewPlayersInScopePlugIn : INewPlayersInScopePlugIn
             return;
         }
 
+        var playerLogger = this.Player.Logger;
+        if (playerLogger.IsEnabled(LogLevel.Debug))
+        {
+            var observerName = this.Player.SelectedCharacter?.Name ?? "?";
+            playerLogger.LogDebug("[TRACE] BASE SendCharacterAsync CALLED: observer={Observer}, newPlayer={NewPlayer}",
+                observerName, selectedCharacter.Name);
+            playerLogger.LogDebug("[DEBUG] SendCharacterAsync: Sending {PlayerName} (Id={PlayerId}) to observer {Observer} at observer pos {Pos}",
+                selectedCharacter.Name,
+                newPlayer.GetId(this.Player),
+                observerName,
+                this.Player.Position);
+        }
+
         int Write()
         {
             var appearanceSerializer = this.Player.AppearanceSerializer;
@@ -103,6 +125,15 @@ public class NewPlayersInScopePlugIn : INewPlayersInScopePlugIn
             playerBlock.CurrentPositionY = newPlayer.Position.Y;
 
             appearanceSerializer.WriteAppearanceData(playerBlock.Appearance, newPlayer.AppearanceData, true); // 4 ... 21
+
+            if (playerLogger.IsEnabled(LogLevel.Debug))
+            {
+                var appearanceBytes = playerBlock.Appearance.ToArray();
+                playerLogger.LogDebug("[DEBUG] SendCharacterAsync: Appearance bytes for {Player}: {Bytes}",
+                    selectedCharacter.Name,
+                    BitConverter.ToString(appearanceBytes));
+            }
+
             playerBlock.Name = selectedCharacter.Name;
             if (newPlayer.IsWalking)
             {
@@ -133,6 +164,13 @@ public class NewPlayersInScopePlugIn : INewPlayersInScopePlugIn
         }
 
         await connection.SendAsync(Write).ConfigureAwait(false);
+
+        if (playerLogger.IsEnabled(LogLevel.Debug))
+        {
+            playerLogger.LogDebug("[DEBUG] SendCharacterAsync: Successfully sent {PlayerName} to {Observer}",
+                selectedCharacter.Name,
+                this.Player.SelectedCharacter?.Name ?? "?");
+        }
     }
 
     private async ValueTask<(IList<Player>? ShopPlayers, IList<Player>? GuildPlayers)> SendCharactersAsync(IEnumerable<Player> newPlayers, bool isSpawned)
@@ -147,9 +185,25 @@ public class NewPlayersInScopePlugIn : INewPlayersInScopePlugIn
         }
 
         var newPlayerList = newPlayers.ToList();
+        var playerLogger = this.Player.Logger;
+        if (playerLogger.IsEnabled(LogLevel.Debug))
+        {
+            playerLogger.LogDebug("[TRACE] SendCharactersAsync: iterating {Count} players from {PluginType}",
+                newPlayerList.Count, this.GetType().Name);
+        }
+
         foreach (var newPlayer in newPlayerList)
         {
-            if (newPlayer.Attributes?[Stats.TransformationSkin] == 0)
+            var transSkin = newPlayer.Attributes?[Stats.TransformationSkin];
+            if (playerLogger.IsEnabled(LogLevel.Debug))
+            {
+                playerLogger.LogDebug("[TRACE] SendCharactersAsync: player={Name}, transSkin={Skin}, pluginType={Type}",
+                    newPlayer.SelectedCharacter?.Name ?? "?",
+                    transSkin,
+                    this.GetType().Name);
+            }
+
+            if (transSkin == 0)
             {
                 await this.SendCharacterAsync(newPlayer, isSpawned).ConfigureAwait(false);
             }

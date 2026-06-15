@@ -25,8 +25,10 @@ public class PeriodicTaskGameServerState
 
     /// <summary>
     /// Gets or sets the next run in UTC.
+    /// Initialized to DateTime.MinValue so the first ExecuteTaskAsync call
+    /// will attempt to start the event immediately, rather than skipping it.
     /// </summary>
-    public DateTime NextRunUtc { get; set; } = DateTime.UtcNow;
+    public DateTime NextRunUtc { get; set; } = DateTime.MinValue;
 
     /// <summary>
     /// Gets or sets the state.

@@ -344,7 +344,7 @@ internal class Quests : InitializerBase
 
     private void CreateNewQuests()
     {
-        this.CreateQuest("Spider Hunt!", 18, 0, 1, 2, 1, 14, 257)
+        this.CreateQuest("Spider Hunt!", 18, 0, 1, 2, 1, 255, 257)
             .WithMonsterKillRequirement(10, 3, this.Context, this.GameConfiguration)
             .WithExperienceReward(2000, this.Context);
 

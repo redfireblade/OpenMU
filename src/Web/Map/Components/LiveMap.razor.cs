@@ -32,7 +32,16 @@ public partial class LiveMap
 
         if (firstRender)
         {
-            await this.MapController;
+            try
+            {
+                await this.MapController;
+            }
+            catch (Exception ex)
+            {
+                await Console.Error.WriteLineAsync($"[LiveMap] Error initializing map controller: {ex.GetType().Name}: {ex.Message}").ConfigureAwait(false);
+                throw;
+            }
+
             this.StateHasChanged();
         }
     }

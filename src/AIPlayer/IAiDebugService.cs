@@ -105,7 +105,7 @@ public sealed record AiPlayerDebugData(
     byte PositionX,
     byte PositionY,
     int TickNumber,
-    global::MUnique.OpenMU.AIPlayer.SurvivalManager.SurvivalLevel SurvivalLevel,
+    SurvivalLevel SurvivalLevel,
     bool HasTarget,
     bool EmergencyRetreat,
     IReadOnlyList<ModuleDecision>? LastDecisions,

@@ -22,7 +22,7 @@ public sealed record WarpResult(WarpStatusCode Status, ushort TargetMapNumber, u
 }
 
 /// <summary>传送状态码。</summary>
-public enum WarpStatusCode { Success, AlreadyOnTarget, MapNotFound, NoSpawnGate, PlayerNullContext, WarpFailed }
+public enum WarpStatusCode { Success, AlreadyOnTarget, MapNotFound, NoSpawnGate, PlayerNullContext, WarpFailed, BlockedLevelRequirement, BlockedNoRoute, BlockedNoMoney, GateLevelTooLow, MultiHopStepCompleted, MultiHopRouteComplete, WarpMenuInsufficientGold }
 
 /// <summary>组队结果。</summary>
 public sealed record PartyJoinResult(PartyJoinStatusCode Status, string TargetPlayerName, string? Reason = null);

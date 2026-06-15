@@ -1,0 +1,846 @@
+@page "/aidebug"
+@using System.ComponentModel
+@using System.Threading
+@using System.Threading.Tasks
+@using MUnique.OpenMU.AIPlayer
+@using MUnique.OpenMU.GameLogic
+@implements IDisposable
+
+<style>
+    /* Dark mode fix for Bootstrap dark cards */
+    .card { background-color: #1e1e1e; border-color: #444; }
+    .card-header { background-color: #2d2d2d; border-bottom-color: #444; color: #e0e0e0; font-weight: 600; }
+    body { background-color: #121212; color: #e0e0e0; }
+    .list-group-item { background-color: #1e1e1e; border-color: #444; color: #ccc; }
+    .list-group-item.active { background-color: #0d6efd; border-color: #0d6efd; color: #fff; }
+    .list-group-item:hover:not(.active) { background-color: #2d2d2d; }
+    code { color: #d4d4d4; font-size: 13px; }
+    .table { color: #d0d0d0; margin-bottom: 0; }
+    .table-striped > tbody > tr:nth-of-type(odd) > * { color: #d0d0d0; background-color: #1a1a1a; }
+    .table-striped > tbody > tr:nth-of-type(even) > * { background-color: #1e1e1e; }
+    .table-borderless td { border: none; padding: 2px 4px !important; }
+    .table-sm td { padding: 2px 4px !important; }
+    .progress { background-color: #333; }
+    pre { background: #1a1a1a; border: 1px solid #444; border-radius: 4px; margin: 0; }
+    .btn-close { filter: invert(0.8); }
+    .modal-content { background-color: #1e1e1e; color: #ccc; }
+    .modal-header { border-bottom-color: #444; }
+    .modal-footer { border-top-color: #444; }
+    .text-muted, .text-secondary { color: #999 !important; }
+    .badge { font-weight: 500; }
+    .form-control, .form-select { background-color: #2d2d2d; border-color: #555; color: #e0e0e0; }
+    .form-control:focus, .form-select:focus { background-color: #333; color: #fff; }
+    hr { border-color: #444; }
+    h1, h2, h3, h4, h5, h6 { color: #e8e8e8; }
+    .card-body { padding: 0.75rem; }
+    thead th { color: #aaa !important; border-bottom-color: #444 !important; }
+</style>
+
+<PageTitle>OpenMU: AI 调试面板</PageTitle>
+
+<div class="container-fluid">
+    <h1>AI 调试面板</h1>
+
+    <div class="row">
+        <!-- Left: Player List -->
+        <div class="col-3">
+            <div class="card shadow-sm mb-3">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span>AI 角色列表</span>
+                    <button class="btn btn-sm btn-success" @onclick="OpenCreateDialog">+ 创建</button>
+                </div>
+                <div class="card-body p-0">
+                    <ul class="list-group list-group-flush" style="max-height: 400px; overflow-y: auto;">
+                        @if (_players is null || _players.Count == 0)
+                        {
+                            <li class="list-group-item text-secondary">没有活跃的 AI 角色</li>
+                        }
+                        else
+                        {
+                            @foreach (var p in _players)
+                            {
+                                <li class="list-group-item list-group-item-action @(p.PlayerId == _selectedPlayerId ? "active" : "")"
+                                    @onclick="() => SelectPlayer(p.PlayerId)" style="cursor: pointer;">
+                                    <div class="d-flex justify-content-between">
+                                        <strong>@p.CharacterName</strong>
+                                        <span class="badge bg-info">Lv.@p.Level</span>
+                                    </div>
+                                    <small class="d-block text-secondary">
+                                        地图 @p.CurrentMapId · (@p.PositionX, @p.PositionY) · HP @p.CurrentHealth/@p.MaximumHealth
+                                    </small>
+                                </li>
+                            }
+                        }
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Center: Map + Script + Decision Log -->
+        <div class="col-5">
+            <!-- Mini-Map -->
+            <div class="card shadow-sm mb-3">
+                <div class="card-header">
+                    @if (_selectedPlayerId.HasValue && _selectedDebugData is { } mapData)
+                    {
+                        <span>@GetMapName(mapData.CurrentMapId) (Map @mapData.CurrentMapId)</span>
+                    }
+                    else
+                    {
+                        <span>小地图</span>
+                    }
+                </div>
+                <div class="card-body text-center">
+                    @if (_selectedPlayerId.HasValue && _selectedDebugData is { } data)
+                    {
+                        <canvas id="aidebug-canvas" width="400" height="400"
+                                style="border: 1px solid #444; max-width: 100%; image-rendering: pixelated;"></canvas>
+                        <div class="mt-2 text-light small">
+                            ���察: @data.PositionX,@data.PositionY &mdash;
+                            @if (data.SurvivalLevel == SurvivalLevel.Emergency)
+                            {
+                                <span class="text-danger fw-bold">紧急</span>
+                            }
+                            else if (data.SurvivalLevel != SurvivalLevel.Normal)
+                            {
+                                <span class="text-warning">@data.SurvivalLevel</span>
+                            }
+                            else
+                            {
+                                <span class="text-success">正常</span>
+                            }
+                            @if (data.HasTarget)
+                            {
+                                <span>&mdash; 有目标</span>
+                            }
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="text-secondary py-5">选择一个 AI 角色查看地图</div>
+                    }
+                </div>
+            </div>
+
+            <!-- Script View Card -->
+            @if (_selectedPlayerId.HasValue && _selectedDebugData is { } sv)
+            {
+                <div class="card shadow-sm mb-3">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>脚本视图</span>
+                        @if (sv.ScriptName is not null)
+                        {
+                            <span class="badge bg-info">@sv.ScriptName</span>
+                        }
+                    </div>
+                    <div class="card-body p-0">
+                        @if (sv.ScriptLines is { Length: > 0 })
+                    {
+                        var lines = sv.ScriptLines;
+                        var currentLine = sv.ScriptLineNumber;
+                        var startLine = Math.Max(0, currentLine - 6);
+                        var endLine = Math.Min(lines.Length, currentLine + 5);
+                        if (endLine - startLine < 11 && startLine > 0) startLine = Math.Max(0, endLine - 11);
+                        if (endLine - startLine < 11 && endLine < lines.Length) endLine = Math.Min(lines.Length, startLine + 11);
+                        <pre style="max-height: 260px; overflow-y: auto; font-size: 12px; line-height: 1.5; margin: 0; padding: 8px; background: #252525; color: #e0e0e0;"><code>@for (var i = startLine; i < endLine; i++)
+{
+    var lineNum = i + 1;
+    var isCurrent = lineNum == currentLine;
+    <span style="display: block; background: @(isCurrent ? "#0d6efd" : "transparent"); color: @(isCurrent ? "white" : "#d0d0d0"); padding: 0 4px; border-radius: 2px;"><span style="color: @(isCurrent ? "rgba(255,255,255,0.7)" : "#777"); display: inline-block; width: 36px; text-align: right; margin-right: 12px; user-select: none;">@lineNum</span>@lines[i]</span>
+}</code></pre>
+                    }
+                    else
+                    {
+                        <div class="text-muted p-3 text-center">No script loaded.</div>
+                    }
+                </div>
+            </div>
+            }
+
+            <!-- Decision Log -->
+            <div class="card shadow-sm">
+                <div class="card-header">Decision Log</div>
+                <div class="card-body p-0">
+                    @if (_selectedPlayerId.HasValue && _selectedDebugData?.LastDecisions is { Count: > 0 } decisions)
+                    {
+                        <table class="table table-sm table-striped mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Module</th>
+                                    <th>Duration</th>
+                                    <th>Details</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var d in decisions)
+                                {
+                                    <tr>
+                                        <td><span class="badge bg-secondary">@d.ModuleName</span></td>
+                                        <td>@(d.Duration.TotalMilliseconds.ToString("F1")) ms</td>
+                                        <td class="text-muted small">—</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    }
+                    else if (_selectedPlayerId.HasValue)
+                    {
+                        <div class="p-3 text-muted">No decisions recorded yet. Click <strong>Step</strong> to execute a tick.</div>
+                    }
+                    else
+                    {
+                        <div class="p-3 text-muted">Select an AI player to view decisions.</div>
+                    }
+                </div>
+            </div>
+        </div>
+
+        <!-- Right: Detail + Control -->
+        <div class="col-4">
+            @if (_selectedPlayerId.HasValue && _selectedDebugData is { } sel)
+            {
+                <!-- Detail Panel -->
+                <div class="card shadow-sm mb-3">
+                    <div class="card-header d-flex justify-content-between">
+                        <span class="fw-bold">@sel.CharacterName</span>
+                        <button class="btn btn-sm btn-danger" @onclick="() => StopPlayer(sel.PlayerId)">停止</button>
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-2">
+                            <small class="text-light-emphasis">HP</small>
+                            <div class="progress" style="height: 20px;">
+                                @{ var hpPct = sel.MaximumHealth > 0 ? (int)((float)sel.CurrentHealth / sel.MaximumHealth * 100) : 0; }
+                                <div class="progress-bar @(hpPct < 30 ? "bg-danger" : hpPct < 60 ? "bg-warning" : "bg-success")"
+                                     style="width: @hpPct%">
+                                    @sel.CurrentHealth / @sel.MaximumHealth
+                                </div>
+                            </div>
+                        </div>
+                        <div class="mb-2">
+                            <small class="text-light-emphasis">MP</small>
+                            <div class="progress" style="height: 20px;">
+                                @{ var mpPct = sel.MaximumMana > 0 ? (int)((float)sel.CurrentMana / sel.MaximumMana * 100) : 0; }
+                                <div class="progress-bar bg-info" style="width: @mpPct%">
+                                    @sel.CurrentMana / @sel.MaximumMana
+                                </div>
+                            </div>
+                        </div>
+                        <table class="table table-sm table-borderless mb-0 small">
+                            <tr><td class="text-light-emphasis">等级</td><td>@sel.Level</td></tr>
+                            <tr><td class="text-light-emphasis">地图</td><td>@GetMapName(sel.CurrentMapId) (@sel.CurrentMapId)</td></tr>
+                            <tr><td class="text-light-emphasis">坐标</td><td>(@sel.PositionX, @sel.PositionY)</td></tr>
+                            <tr><td class="text-light-emphasis">Tick</td><td>#@sel.TickNumber</td></tr>
+                            <tr><td class="text-light-emphasis" style="white-space: nowrap; vertical-align: top;">行为</td>
+                                <td style="max-width: 200px; word-break: break-word; white-space: normal;">
+                                    @if (!string.IsNullOrEmpty(sel.CurrentBehavior))
+                                    {
+                                        <span class="badge @GetBehaviorBadgeClass(sel.CurrentBehavior)" style="white-space: normal; word-break: break-word; text-align: left; display: inline-block; max-width: 100%;">@sel.CurrentBehavior</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="text-secondary">—</span>
+                                    }
+                                </td>
+                            </tr>
+                            <tr><td class="text-light-emphasis">生存</td><td>@sel.SurvivalLevel</td></tr>
+                            <tr><td class="text-light-emphasis">目标</td><td>@(sel.HasTarget ? "有" : "无")</td></tr>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- State Machine Panel -->
+                <div class="card shadow-sm mb-3">
+                    <div class="card-header">AI状态机</div>
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between mb-2">
+                            <span class="text-light-emphasis">状态</span>
+                            @if (sel.StateMachineRunning)
+                            {
+                                <span class="badge bg-success">运行中</span>
+                            }
+                            else
+                            {
+                                <span class="badge bg-secondary">空闲</span>
+                            }
+                        </div>
+                        @if (sel.StateMachineRunning)
+                        {
+                            <div class="mb-2 small">
+                                <div><span class="text-light-emphasis">当前项:</span> @(sel.StateMachineItem ?? "—")</div>
+                                <div><span class="text-light-emphasis">状态:</span> @(sel.StateMachineItemStatus ?? "—")</div>
+                            </div>
+                        }
+                        else
+                        {
+                            @if (sel.StateMachineItem is not null)
+                            {
+                                <div class="mb-2 small">
+                                    <div><span class="text-light-emphasis">最后项:</span> @sel.StateMachineItem ( @sel.StateMachineItemStatus )</div>
+                                </div>
+                            }
+                        }
+                        <table class="table table-sm table-borderless mb-0 small">
+                            <tr>
+                                <td class="text-light-emphasis">待执行队列</td>
+                                <td>@sel.StateMachineQueueLength</td>
+                            </tr>
+                            <tr>
+                                <td class="text-light-emphasis">已完成</td>
+                                <td>@sel.StateMachineCompleted</td>
+                            </tr>
+                            <tr>
+                                <td class="text-light-emphasis">已失败</td>
+                                <td>@sel.StateMachineFailed</td>
+                            </tr>
+                            <tr>
+                                <td class="text-light-emphasis">事件队列</td>
+                                <td>@sel.StateMachineEventCount (累计 @sel.StateMachineEventsProcessed)</td>
+                            </tr>
+                            @if (sel.StateMachineStuck)
+                            {
+                                <tr>
+                                    <td colspan="2"><span class="badge bg-danger w-100">⚠ 死锁已检测</span></td>
+                                </tr>
+                            }
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Performance Metrics Panel -->
+                <div class="card shadow-sm mb-3">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>性能指标</span>
+                        <span class="badge @GetRunModeBadgeClass(sel.RunMode)">@GetRunModeLabel(sel.RunMode)</span>
+                    </div>
+                    <div class="card-body">
+                        <table class="table table-sm table-borderless mb-0 small">
+                            <tr>
+                                <td class="text-light-emphasis">总计</td>
+                                <td class="text-end font-monospace">@sel.TickTotalUs.ToString("N0") μs</td>
+                            </tr>
+                            <tr>
+                                <td class="text-light-emphasis">世界刷新</td>
+                                <td class="text-end font-monospace">@sel.TickWorldRefreshUs.ToString("N0") μs</td>
+                            </tr>
+                            <tr>
+                                <td class="text-light-emphasis">脚本</td>
+                                <td class="text-end font-monospace">@sel.TickScriptExecutionUs.ToString("N0") μs</td>
+                            </tr>
+                            <tr>
+                                <td class="text-light-emphasis">模块</td>
+                                <td class="text-end font-monospace">@sel.TickModuleExecutionUs.ToString("N0") μs</td>
+                            </tr>
+                            <tr>
+                                <td class="text-light-emphasis">心智引擎</td>
+                                <td class="text-end font-monospace">@sel.TickMindEngineUs.ToString("N0") μs</td>
+                            </tr>
+                        </table>
+                        <div class="mt-2">
+                            <div class="progress" style="height: 8px;">
+                                @{
+                                    var barTotal = Math.Max(1, sel.TickTotalUs);
+                                    var worldPct = (int)((float)sel.TickWorldRefreshUs / barTotal * 100);
+                                    var scriptPct = (int)((float)sel.TickScriptExecutionUs / barTotal * 100);
+                                    var modulePct = (int)((float)sel.TickModuleExecutionUs / barTotal * 100);
+                                    var mindPct = (int)((float)sel.TickMindEngineUs / barTotal * 100);
+                                }
+                                @if (worldPct > 0) { <div class="progress-bar bg-secondary" style="width: @(worldPct)%" title="世界刷新"></div> }
+                                @if (scriptPct > 0) { <div class="progress-bar bg-primary" style="width: @(scriptPct)%" title="脚本"></div> }
+                                @if (modulePct > 0) { <div class="progress-bar bg-info" style="width: @(modulePct)%" title="模块"></div> }
+                                @if (mindPct > 0) { <div class="progress-bar bg-warning" style="width: @(mindPct)%" title="心智引擎"></div> }
+                            </div>
+                            <div class="d-flex justify-content-between mt-1 small text-light-emphasis">
+                                <span class="bg-secondary px-1">世界</span>
+                                <span class="bg-primary px-1">脚本</span>
+                                <span class="bg-info px-1">模块</span>
+                                <span class="bg-warning px-1">心智</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Quest Progress Panel -->
+                @if (!string.IsNullOrEmpty(sel.QuestProgress))
+                {
+                    <div class="card shadow-sm mb-3">
+                        <div class="card-header">任务进度</div>
+                        <div class="card-body small">
+                            <div>@sel.QuestProgress</div>
+                        </div>
+                    </div>
+                }
+
+                <!-- Dashboard 今日看板 (仅 Decision 模式) -->
+                @if (!string.IsNullOrEmpty(sel.DashboardTodos))
+                {
+                    <div class="card shadow-sm mb-3">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <span>今日看板</span>
+                            <span class="badge @(sel.DashboardActiveModule is not null ? "bg-success" : "bg-secondary")">
+                                @(sel.DashboardActiveModule ?? "—")
+                            </span>
+                        </div>
+                        <div class="card-body p-0 small">
+                            <div class="px-3 py-2 d-flex justify-content-between border-bottom">
+                                <span class="text-muted">状态</span>
+                                <span>@(sel.DashboardState ?? "—")</span>
+                            </div>
+                            <div class="px-3 py-2 d-flex justify-content-between border-bottom">
+                                <span class="text-muted">事件队列</span>
+                                <span>@sel.DashboardEventQueueLength</span>
+                            </div>
+                            <table class="table table-sm table-striped mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>#</th>
+                                        <th>任务</th>
+                                        <th>类型</th>
+                                        <th>状态</th>
+                                        <th>模块</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var todo in ParseDashboardTodos(sel.DashboardTodos!))
+                                    {
+                                        <tr class="@(todo.IsCurrent ? "table-active fw-bold" : "")">
+                                            <td>@todo.Index</td>
+                                            <td>@todo.Title</td>
+                                            <td><span class="badge bg-info">@todo.Type</span></td>
+                                            <td>@((MarkupString)GetTodoStatusBadge(todo.Status))</td>
+                                            <td>@todo.Module</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                }
+
+                <!-- Control Panel -->
+                <div class="card shadow-sm">
+                    <div class="card-header">Controls</div>
+                    <div class="card-body">
+                        <div class="d-grid gap-2 mb-3">
+                            <button class="btn btn-primary" @onclick="() => StepAsync(sel.PlayerId)" disabled="@_isStepping">
+                                @if (_isStepping) { <span class="spinner-border spinner-border-sm"></span> }
+                                Step
+                            </button>
+                            <button class="btn btn-outline-primary" @onclick="() => StepAsync(sel.PlayerId, 5)" disabled="@_isStepping">
+                                Step x5
+                            </button>
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" @bind="_autoMode" id="autoMode">
+                                <label class="form-check-label" for="autoMode">Auto (400ms)</label>
+                            </div>
+                        </div>
+
+                        <hr />
+                        <h6>State Injection</h6>
+                        <div class="mb-2">
+                            <label class="form-label small">HP</label>
+                            <input type="range" class="form-range" min="0" max="@sel.MaximumHealth"
+                                   value="@_hpSliderValue" @oninput="OnHpSliderChanged" />
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small">Level</label>
+                            <div class="input-group input-group-sm">
+                                <input type="number" class="form-control" @bind="_levelInput" min="1" max="400" />
+                                <button class="btn btn-outline-secondary" @onclick="() => SetLevelAsync(sel.PlayerId)">Set</button>
+                            </div>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small">Position</label>
+                            <div class="input-group input-group-sm">
+                                <input type="number" class="form-control" @bind="_posXInput" placeholder="X" style="width: 70px;" />
+                                <input type="number" class="form-control" @bind="_posYInput" placeholder="Y" style="width: 70px;" />
+                                <button class="btn btn-outline-secondary" @onclick="() => SetPositionAsync(sel.PlayerId)">Set</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+            else
+            {
+                <div class="card shadow-sm">
+                    <div class="card-body text-muted text-center py-5">
+                        Select an AI player from the list to inspect and control.
+                    </div>
+                </div>
+            }
+        </div>
+    </div>
+</div>
+
+<!-- Create Dialog -->
+@if (_showCreateDialog)
+{
+    <div class="modal-backdrop fade show"></div>
+    <div class="modal d-block" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Create AI Player</h5>
+                    <button type="button" class="btn-close" @onclick="CloseCreateDialog"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Name</label>
+                        <input type="text" class="form-control" @bind="_createName" placeholder="DebugBot" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Class</label>
+                        <select class="form-select" @bind="_createClass">
+                            <option value="0">Dark Wizard</option>
+                            <option value="1">Dark Knight</option>
+                            <option value="2">Fairy Elf</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Map</label>
+                        <select class="form-select" @bind="_createMap">
+                            <option value="0">Lorencia</option>
+                            <option value="1">Dungeon</option>
+                            <option value="2">Devias</option>
+                            <option value="3">Noria</option>
+                            <option value="4">Lost Tower</option>
+                        </select>
+                    </div>
+                    <div class="mb-3 form-check">
+                        <input type="checkbox" class="form-check-input" id="scriptModeCheck" @bind="_useScriptMode" />
+                        <label class="form-check-label" for="scriptModeCheck">1D Script Mode (basic_hunting_loop.json)</label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" @onclick="CloseCreateDialog">Cancel</button>
+                    <button type="button" class="btn btn-primary" @onclick="CreatePlayerAsync" disabled="@_isCreating">
+                        @if (_isCreating) { <span class="spinner-border spinner-border-sm"></span> }
+                        Create
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private IReadOnlyCollection<AiPlayerDebugData> _players = Array.Empty<AiPlayerDebugData>();
+    private Guid? _selectedPlayerId;
+    private AiPlayerDebugData? _selectedDebugData;
+    private bool _isStepping;
+    private bool _autoMode;
+    private int _hpSliderValue;
+    private int _levelInput = 1;
+    private int _posXInput = 100;
+    private int _posYInput = 100;
+
+    // Create dialog state
+    private bool _showCreateDialog;
+    private bool _isCreating;
+    private string _createName = "DebugBot";
+    private int _createClass;
+    private ushort _createMap;
+    private bool _useScriptMode;
+
+    private PeriodicTimer? _autoTimer;
+    private CancellationTokenSource? _autoCts;
+
+    [Inject]
+    public IAiService AiService { get; set; } = null!;
+
+    [Inject]
+    public IAiDebugService DebugService { get; set; } = null!;
+
+    [Inject]
+    public AiDebugStateProvider StateProvider { get; set; } = null!;
+
+    [Inject]
+    public IGameServerContextResolver ContextResolver { get; set; } = null!;
+
+    [Inject]
+    public IJSRuntime JsRuntime { get; set; } = null!;
+
+    protected override void OnInitialized()
+    {
+        this.StateProvider.PropertyChanged += OnStateChanged;
+        this._players = this.StateProvider.Players;
+    }
+
+    private async void OnStateChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(AiDebugStateProvider.Players))
+        {
+            this._players = this.StateProvider.Players;
+            this._selectedDebugData = this._selectedPlayerId.HasValue
+                ? this._players.FirstOrDefault(p => p.PlayerId == _selectedPlayerId.Value)
+                : null;
+
+            await this.InvokeAsync(this.StateHasChanged);
+
+            if (this._selectedPlayerId.HasValue && this._selectedDebugData is { } data)
+            {
+                await this.RenderMapAsync(data);
+            }
+        }
+    }
+
+    private async Task SelectPlayer(Guid playerId)
+    {
+        this._selectedPlayerId = playerId;
+        this._selectedDebugData = this._players.FirstOrDefault(p => p.PlayerId == playerId);
+
+        if (_selectedDebugData is { } data)
+        {
+            this._hpSliderValue = (int)data.CurrentHealth;
+            this._levelInput = data.Level;
+            this._posXInput = data.PositionX;
+            this._posYInput = data.PositionY;
+        }
+
+        await this.RenderMapAsync(this._selectedDebugData);
+    }
+
+    private void OpenCreateDialog()
+    {
+        this._showCreateDialog = true;
+    }
+
+    private void CloseCreateDialog()
+    {
+        this._showCreateDialog = false;
+    }
+
+    private async Task CreatePlayerAsync()
+    {
+        this._isCreating = true;
+        try
+        {
+            var scriptPath = this._useScriptMode
+                ? System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "aiplayer_data", "basic_hunting_loop.json")
+                : null;
+            var config = new AiPlayerCreateConfig(this._createName, (byte)this._createClass, this._createMap, scriptPath);
+            var result = await this.AiService.CreateAiPlayerAsync(config);
+            if (result.Success && result.PlayerId.HasValue)
+            {
+                this.StateProvider.Refresh();
+                this._selectedPlayerId = result.PlayerId.Value;
+            }
+
+            this._showCreateDialog = false;
+        }
+        finally
+        {
+            this._isCreating = false;
+        }
+    }
+
+    private async Task StopPlayer(Guid playerId)
+    {
+        await this.AiService.StopAiPlayerAsync(playerId);
+        if (this._selectedPlayerId == playerId)
+        {
+            this._selectedPlayerId = null;
+            this._selectedDebugData = null;
+        }
+
+        this.StateProvider.Refresh();
+    }
+
+    private async Task StepAsync(Guid playerId, int count = 1)
+    {
+        this._isStepping = true;
+        try
+        {
+            for (int i = 0; i < count; i++)
+            {
+                await this.DebugService.StepOnceAsync(playerId);
+            }
+
+            this.StateProvider.Refresh();
+        }
+        finally
+        {
+            this._isStepping = false;
+        }
+    }
+
+    private async Task OnHpSliderChanged(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var val) && this._selectedPlayerId.HasValue)
+        {
+            this._hpSliderValue = val;
+            await this.DebugService.SetHpAsync(this._selectedPlayerId.Value, (uint)val);
+            this.StateProvider.Refresh();
+        }
+    }
+
+    private async Task SetLevelAsync(Guid playerId)
+    {
+        await this.DebugService.SetLevelAsync(playerId, this._levelInput);
+        this.StateProvider.Refresh();
+    }
+
+    private async Task SetPositionAsync(Guid playerId)
+    {
+        await this.DebugService.SetPositionAsync(playerId, (byte)this._posXInput, (byte)this._posYInput);
+        this.StateProvider.Refresh();
+    }
+
+    private async Task RenderMapAsync(AiPlayerDebugData? data)
+    {
+        if (data is null) return;
+
+        try
+        {
+            var context = this.ContextResolver.ResolveContext();
+            var mapDef = context?.Configuration.Maps.FirstOrDefault(m => m.Number == data.CurrentMapId);
+            var terrain = mapDef?.TerrainData;
+
+            var entities = new List<object>
+            {
+                new { x = (int)data.PositionX, y = (int)data.PositionY, type = "player", color = "#ff4444", label = data.CharacterName }
+            };
+
+            await this.JsRuntime.InvokeVoidAsync("renderAiDebugMap",
+                "aidebug-canvas",
+                terrain is not null ? Convert.ToBase64String(terrain) : null,
+                256,
+                (int)data.PositionX,
+                (int)data.PositionY,
+                30, // view radius
+                entities);
+        }
+        catch
+        {
+            // Map rendering failures are non-critical
+        }
+    }
+
+    private static string GetMapName(ushort mapId)
+    {
+        return mapId switch
+        {
+            0 => "罗兰峡谷",
+            1 => "地下城",
+            2 => "冰风谷",
+            3 => "仙踪林",
+            4 => "失落之塔",
+            5 => "古战场",
+            6 => "死亡沙漠",
+            7 => "达维亚斯",
+            8 => "卡利玛神庙",
+            9 => "天空之城",
+            10 => "亚特兰蒂斯",
+            11 => "失落地图",
+            12 => "血色城堡",
+            13 => "恶魔广场",
+            14 => "卡利玛",
+            16 => "狼魂要塞",
+            17 => "要塞内部",
+            30 => "冰霜之地",
+            31 => "冰霜之地2",
+            32 => "安宁之池",
+            33 => "坎特鲁废墟",
+            34 => "狼魂要塞攻城",
+            35 => "克赛特",
+            36 => "安息之地",
+            37 => "巨龙峡谷",
+            38 => "罗兰峡谷",
+            39 => "铁脊沼泽",
+            40 => "哈尔特荒野",
+            41 => "纳尔斯",
+            42 => "卡伦特",
+            43 => "比伯",
+            44 => "雪地",
+            45 => "地下城2层",
+            46 => "地下城3层",
+            47 => "冰风谷2层",
+            48 => "高尔",
+            49 => "拉坎",
+            50 => "埃尔特隆",
+            51 => "努特",
+            _ => $"未知地图 ({mapId})",
+        };
+    }
+
+    private static string GetBehaviorBadgeClass(string behavior)
+    {
+        return behavior switch
+        {
+            "战斗中" => "bg-danger",
+            "追击中" => "bg-warning text-dark",
+            "索敌中" => "bg-info text-dark",
+            "巡逻中" or "换点中" => "bg-secondary",
+            "回城补给" or "返回死亡点" => "bg-primary",
+            "等待重生" => "bg-dark",
+            "喝药中" or "加Buff" => "bg-success",
+            _ => "bg-secondary",
+        };
+    }
+
+    private static string GetRunModeBadgeClass(ExecutionMode mode)
+    {
+        return mode switch
+        {
+            ExecutionMode.Mode1D => "bg-primary",
+            ExecutionMode.DAG => "bg-success",
+            ExecutionMode.Degraded => "bg-danger",
+            _ => "bg-secondary",
+        };
+    }
+
+    private static string GetRunModeLabel(ExecutionMode mode)
+    {
+        return mode switch
+        {
+            ExecutionMode.Mode1D => "1D",
+            ExecutionMode.DAG => "DAG",
+            ExecutionMode.Degraded => "Degraded",
+            _ => "?",
+        };
+    }
+
+    /// <summary>解析看板待办 JSON 为显示对象。</summary>
+    private static List<DashboardTodoItem> ParseDashboardTodos(string json)
+    {
+        try
+        {
+            var items = System.Text.Json.JsonSerializer.Deserialize<List<DashboardTodoItem>>(json);
+            return items ?? new();
+        }
+        catch
+        {
+            return new();
+        }
+    }
+
+    /// <summary>获取待办状态 Badge。</summary>
+    private static string GetTodoStatusBadge(string status)
+    {
+        return status switch
+        {
+            "InProgress" => "<span class='badge bg-primary'>执行中</span>",
+            "Done" => "<span class='badge bg-success'>完成</span>",
+            "Failed" => "<span class='badge bg-danger'>失败</span>",
+            "Suspended" => "<span class='badge bg-warning'>挂起</span>",
+            _ => "<span class='badge bg-secondary'>待处理</span>",
+        };
+    }
+
+    /// <summary>看板待办显示记录。</summary>
+    private sealed record DashboardTodoItem(int Index, string Title, string Type, string Status, string Module, bool IsCurrent);
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender && this._selectedDebugData is { } data)
+        {
+            await this.RenderMapAsync(data);
+        }
+    }
+
+    public void Dispose()
+    {
+        this.StateProvider.PropertyChanged -= OnStateChanged;
+        this._autoCts?.Cancel();
+        this._autoCts?.Dispose();
+    }
+}

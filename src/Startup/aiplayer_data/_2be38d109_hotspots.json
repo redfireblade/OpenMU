@@ -1,0 +1,47 @@
+{
+  "0_135_125": {
+    "MapNumber": 0,
+    "CenterX": 135,
+    "CenterY": 125,
+    "Radius": 10,
+    "TotalKills": 0,
+    "TotalExperience": 0,
+    "TotalDrops": 0,
+    "ExcellentDrops": 0,
+    "JewelDrops": 0,
+    "TotalDeaths": 0,
+    "SessionsCount": 0,
+    "TotalActiveSeconds": 3.1999999999999997,
+    "LastVisitedAt": "2026-06-04T19:35:51.2653294Z"
+  },
+  "0_135_105": {
+    "MapNumber": 0,
+    "CenterX": 135,
+    "CenterY": 105,
+    "Radius": 10,
+    "TotalKills": 0,
+    "TotalExperience": 0,
+    "TotalDrops": 0,
+    "ExcellentDrops": 0,
+    "JewelDrops": 0,
+    "TotalDeaths": 0,
+    "SessionsCount": 0,
+    "TotalActiveSeconds": 6.4,
+    "LastVisitedAt": "2026-06-04T19:36:47.3156924Z"
+  },
+  "0_135_85": {
+    "MapNumber": 0,
+    "CenterX": 135,
+    "CenterY": 85,
+    "Radius": 10,
+    "TotalKills": 0,
+    "TotalExperience": 0,
+    "TotalDrops": 0,
+    "ExcellentDrops": 0,
+    "JewelDrops": 0,
+    "TotalDeaths": 0,
+    "SessionsCount": 0,
+    "TotalActiveSeconds": 7.199999999999999,
+    "LastVisitedAt": "2026-06-04T19:36:47.3155756Z"
+  }
+}

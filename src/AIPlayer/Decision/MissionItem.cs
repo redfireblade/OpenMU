@@ -116,6 +116,14 @@ public sealed class MissionItem
 
     /// <summary>是否已标记为死任务 (永不再重试)。</summary>
     public bool IsDeadTask { get; set; }
+
+    // ========== AR-29 阻塞字段 ==========
+
+    /// <summary>阻塞原因 (仅在 Status == Blocked 时有意义)。</summary>
+    public BlockedReason? BlockedReason { get; set; }
+
+    /// <summary>是否已检查过阻塞条件（防多 tick 重复 log）。</summary>
+    public bool BlockedEverChecked { get; set; }
 }
 
 /// <summary>
@@ -176,6 +184,7 @@ public enum MissionStatus
     Completed,   // 已完成
     Failed,      // 失败
     Suspended,   // 被中断
+    Blocked,     // 条件不足（金币/等级/前置），等待恢复
 }
 
 /// <summary>阶段状态。</summary>
@@ -294,6 +303,19 @@ public enum FailureReason
 
     /// <summary>副本模块未实现。</summary>
     InstanceModuleMissing,
+}
+
+/// <summary>AR-29: 任务阻塞原因 — Blocked 状态专用，不影响重试计数/IsDeadTask。</summary>
+public enum BlockedReason
+{
+    /// <summary>前置条件不满足（金币不足、等级不够）。</summary>
+    PrerequisiteNotMet,
+
+    /// <summary>任务 NPC 暂时不可达。</summary>
+    NpcUnavailable,
+
+    /// <summary>所有狩猎热点的怪物在当前地图均不存在（刷点无实例）。</summary>
+    MonsterNotAvailable,
 }
 
 /// <summary>每类任务的等级配额配置。</summary>

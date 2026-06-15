@@ -1,4 +1,4 @@
-﻿// <copyright file="DevilSquareStartConfiguration.cs" company="MUnique">
+// <copyright file="DevilSquareStartConfiguration.cs" company="MUnique">
 // Licensed under the MIT License. See LICENSE file in the project root for full license information.
 // </copyright>
 
@@ -19,6 +19,6 @@ public class DevilSquareStartConfiguration : MiniGameStartConfiguration
             EntranceOpenedMessage = "Devil Square entrance is open and closes in {0} minute(s).",
             EntranceClosedMessage = "Devil Square entrance closed.",
             TaskDuration = TimeSpan.FromMinutes(25),
-            Timetable = PeriodicTaskConfiguration.GenerateTimeSequence(TimeSpan.FromMinutes(240)).ToList(),
+            Timetable = GenerateTimeSequence(TimeSpan.FromMinutes(10)).ToList(),
         };
 }

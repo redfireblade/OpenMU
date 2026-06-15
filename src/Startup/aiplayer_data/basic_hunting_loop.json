@@ -1,0 +1,310 @@
+{
+  "id": "basic_hunting_loop",
+  "name": "基础狩猎循环 v2.0 — 换点版",
+  "version": "2.0.0",
+  "status": "test",
+  "description": "外挂级综合狩猎脚本 v2.0。支持换点、死亡恢复、补给回城、技能优先级。适用于 Map 3 (Noria)。",
+  "category": "composite",
+  "personality": "balanced",
+  "orchestrator": {
+    "mode": "dag"
+  },
+
+  "parameters": {
+    "hpThreshold": 0.35,
+    "mpThreshold": 0.20,
+    "maxLevelDiff": 30,
+    "patrolRadius": 15,
+    "attackRange": 3.0,
+    "pickupFilter": "rare_and_above",
+    "returnWhenInventoryFull": false,
+    "searchRange": 20,
+    "potionCooldownMs": 2000,
+    "npcBlacklist": [],
+    "durabilityThreshold": 0.1,
+    "potionHysteresisMargin": 0.10,
+    "returnCooldownSec": 120,
+    "noMonsterTicksLimit": 30,
+    "questGroup": 18,
+    "questNumber": 1,
+    "questNpcNumber": 257,
+    "hotspots": [
+      { "x": 130, "y": 110, "name": "出生点" },
+      { "x": 150, "y": 140, "name": "中央区域" },
+      { "x": 170, "y": 120, "name": "右侧区域" },
+      { "x": 110, "y": 140, "name": "左侧区域" }
+    ]
+  },
+
+  "paragraphs": [
+    {
+      "label": "start",
+      "nodes": [
+        {
+          "name": "death_check",
+          "condition": "is_dead",
+          "action": "goto @recover",
+          "comment": "死亡→跳转恢复段"
+        },
+        {
+          "name": "just_revived_check",
+          "condition": "just_revived",
+          "action": "goto @recover",
+          "comment": "刚复活→跳转恢复段"
+        },
+        {
+          "name": "inventory_check",
+          "condition": "inventory_full",
+          "action": "goto @restock",
+          "comment": "背包满→跳转补给段"
+        },
+        {
+          "name": "equip_durable_check",
+          "condition": "equip_durable_low",
+          "action": "goto @restock",
+          "comment": "装备耐久低→跳转补给段"
+        },
+        {
+          "name": "submit_ready",
+          "condition": "quest_conditions_met",
+          "action": "goto @submit_quest",
+          "comment": "任务条件满足→交任务"
+        },
+        {
+          "name": "accept_if_none",
+          "condition": "no_active_quest",
+          "action": "goto @accept_quest",
+          "comment": "无活跃任务→接任务"
+        },
+        {
+          "name": "has_quest_go_hunt",
+          "condition": "has_active_quest",
+          "action": "goto @hunt",
+          "comment": "有活跃任务→狩猎"
+        },
+        {
+          "name": "enter_hunt",
+          "condition": "always",
+          "action": "goto @hunt",
+          "comment": "条件正常→进入主狩猎段"
+        }
+      ]
+    },
+
+    {
+      "label": "hunt",
+      "nodes": [
+        {
+          "name": "quest_check",
+          "condition": "quest_conditions_met",
+          "action": "goto @submit_quest",
+          "comment": "P0 任务完成检查"
+        },
+        {
+          "name": "hp_check",
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "P0 生存: HP低于阈值喝药"
+        },
+        {
+          "name": "mp_check",
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "comment": "P1 续航: MP低于阈值喝蓝"
+        },
+        {
+          "name": "leave_safezone",
+          "condition": "in_safe_zone",
+          "action": "leave_safezone",
+          "comment": "P2 脱安全区"
+        },
+        {
+          "name": "attack_current",
+          "condition": "has_target_in_range",
+          "action": "attack_target",
+          "comment": "P3 战斗: 目标在攻击范围内→攻击"
+        },
+        {
+          "name": "approach_current",
+          "condition": "has_target_not_in_range",
+          "action": "approach_target",
+          "comment": "P3 战斗: 目标不在范围内→接近"
+        },
+        {
+          "name": "find_target",
+          "condition": "no_target",
+          "action": "find_nearest_monster",
+          "comment": "P3 战斗: 无目标→索敌"
+        },
+        {
+          "name": "pickup_items",
+          "condition": "always",
+          "action": "pickup_nearby",
+          "comment": "P3.5 拾取地上的物品"
+        },
+        {
+          "name": "no_monsters_relocate",
+          "condition": "no_monsters_recently",
+          "action": "relocate_to_hotspot",
+          "comment": "P4 换点: 长时间无怪→换到下一个热点"
+        },
+        {
+          "name": "patrol",
+          "condition": "always",
+          "action": "random_patrol",
+          "comment": "P5 空闲: 在热点周边巡逻"
+        }
+      ]
+    },
+
+    {
+      "label": "accept_quest",
+      "nodes": [
+        {
+          "name": "warp_noria",
+          "condition": "always",
+          "action": "warp_to_map",
+          "parameters": { "targetMapNumber": 3 },
+          "comment": "确保在Noria"
+        },
+        {
+          "name": "walk_to_npc",
+          "condition": "always",
+          "action": "walk_to_quest_npc",
+          "parameters": { "questNpcNumber": 257 },
+          "comment": "走向精灵战士"
+        },
+        {
+          "name": "check_accepted",
+          "condition": "has_active_quest",
+          "action": "goto @hunt",
+          "comment": "已接任务→去狩猎"
+        },
+        {
+          "name": "try_accept",
+          "condition": "can_accept_quest",
+          "action": "accept_quest",
+          "parameters": { "questGroup": 18, "questNumber": 1 },
+          "comment": "接任务"
+        },
+        {
+          "name": "fallback",
+          "condition": "always",
+          "action": "stop",
+          "comment": "安全兜底→停止脚本(防无限循环)"
+        }
+      ]
+    },
+
+    {
+      "label": "relocate",
+      "nodes": [
+        {
+          "name": "relocate_action",
+          "condition": "always",
+          "action": "relocate_to_hotspot",
+          "comment": "换到下一个热点"
+        },
+        {
+          "name": "return_to_hunt",
+          "condition": "always",
+          "action": "goto @hunt",
+          "comment": "返回狩猎段"
+        }
+      ]
+    },
+
+    {
+      "label": "recover",
+      "nodes": [
+        {
+          "name": "wait_respawn",
+          "condition": "is_dead",
+          "action": "wait_respawn",
+          "comment": "等待重生"
+        },
+        {
+          "name": "hp_recover",
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "复活后补血"
+        },
+        {
+          "name": "buff_reapply",
+          "condition": "always",
+          "action": "use_buff",
+          "comment": "重新套buff"
+        },
+        {
+          "name": "return_to_death_spot",
+          "condition": "always",
+          "action": "return_to_death_spot",
+          "comment": "走回死亡地点"
+        },
+        {
+          "name": "back_to_hunt",
+          "condition": "always",
+          "action": "goto @hunt",
+          "comment": "恢复完成→返回狩猎段"
+        }
+      ]
+    },
+
+    {
+      "label": "restock",
+      "nodes": [
+        {
+          "name": "return_sell",
+          "condition": "always",
+          "action": "return_and_sell",
+          "comment": "回城卖物修装备买药"
+        },
+        {
+          "name": "refill_potions",
+          "condition": "potion_count_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "药水不足时补买（依赖 ReturnAndSell 内置买药）"
+        },
+        {
+          "name": "return_to_start",
+          "condition": "always",
+          "action": "goto @start",
+          "comment": "补给完成→回到入口段"
+        }
+      ]
+    },
+
+    {
+      "label": "submit_quest",
+      "nodes": [
+        {
+          "name": "warp_noria",
+          "condition": "always",
+          "action": "warp_to_map",
+          "parameters": { "targetMapNumber": 3 },
+          "comment": "确保在Noria"
+        },
+        {
+          "name": "walk_to_npc",
+          "condition": "always",
+          "action": "walk_to_quest_npc",
+          "parameters": { "questNpcNumber": 257 },
+          "comment": "走向精灵战士"
+        },
+        {
+          "name": "check_done",
+          "condition": "no_active_quest",
+          "action": "stop",
+          "comment": "已交→停止脚本(标记Completed)"
+        },
+        {
+          "name": "try_submit",
+          "condition": "always",
+          "action": "submit_quest",
+          "parameters": { "questGroup": 18, "questNumber": 1 },
+          "comment": "提交任务"
+        }
+      ]
+    }
+  ]
+}

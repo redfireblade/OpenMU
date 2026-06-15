@@ -1,4 +1,4 @@
-﻿// <copyright file="QuestStartAction.cs" company="MUnique">
+// <copyright file="QuestStartAction.cs" company="MUnique">
 // Licensed under the MIT License. See LICENSE file in the project root for full license information.
 // </copyright>
 
@@ -40,13 +40,6 @@ public class QuestStartAction
             questState = player.PersistenceContext.CreateNew<CharacterQuestState>();
             questState.Group = group;
             player.SelectedCharacter.QuestStates.Add(questState);
-        }
-
-        if (questState.ActiveQuest != null)
-        {
-            player.Logger.LogDebug("There is already an active quest of this group.");
-            await player.InvokeViewPlugInAsync<IQuestProgressPlugIn>(p => p.ShowQuestProgressAsync(questState.ActiveQuest, false)).ConfigureAwait(false);
-            return;
         }
 
         if (Equals(questState.LastFinishedQuest, quest) && !quest.Repeatable)

@@ -10,6 +10,7 @@ global using System.Threading;
 global using Microsoft.Extensions.Logging;
 
 global using MUnique.OpenMU.DataModel.Configuration;
+global using MUnique.OpenMU.DataModel.Configuration.Quests;
 global using MUnique.OpenMU.DataModel.Entities;
 global using MUnique.OpenMU.GameLogic;
 global using MUnique.OpenMU.GameLogic.Attributes;

@@ -120,29 +120,10 @@ public sealed class MissionBoardService
             });
         }
 
-        // ===== Phase 2: MiniGame 事件 → MissionItem =====
-        foreach (var mg in config.MiniGameDefinitions)
-        {
-            if (level < mg.MinimumCharacterLevel) continue;
-            if (mg.MaximumCharacterLevel > 0 && level > mg.MaximumCharacterLevel) continue;
-            if (mg.RequiresMasterClass && (charClass is null || !charClass.IsMasterClass)) continue;
-
-            this._boardState.Missions.Add(new MissionItem
-            {
-                Id = $"event_{mg.Type}_{mg.GameLevel}",
-                Title = mg.Name.ToString() ?? $"{mg.Type} Lv.{mg.GameLevel}",
-                Priority = 15,
-                Type = MissionType.Quest,
-                Category = QuestCategory.InstanceEvent,
-                Goal = QuestGoal.Instance,
-                Source = QuestSource.GameSystem,
-                MaxLevel = mg.MaximumCharacterLevel,
-                FailureRetryable = true,
-                MaxRepeatCount = -1,
-                Module = "survival", // 暂用 survival 模块，后续独立
-                TriggerEvents = Array.Empty<string>(),
-            });
-        }
+        // ===== Phase 2: MiniGame 事件注入（由 DynamicMissionGenerator 和 EventWatcherService 动态管理） =====
+        // 启动时不注入事件任务。事件任务在活动开放时(Prepared/Started)由 SystemEventScanner 每 10 秒扫描注入，
+        // 或在 EventWatcherService 检测到状态变化时通过 EventOpenEvent 注入。
+        // 这防止了 NotStarted 事件被错误选中执行入场流程。
 
         // ===== Phase 3: AI 自定义/群体任务（预留） =====
         // TODO: AIODS 发布任务时添加
@@ -151,17 +132,7 @@ public sealed class MissionBoardService
         var filtered = this.ApplyQuota(this._boardState.Missions, level);
         this._boardState.Missions = filtered;
 
-        // ===== Phase 5: 兜底生存刷怪 =====
-        this._boardState.Missions.Add(new MissionItem
-        {
-            Id = "survival",
-            Title = "生存模式 — 自由刷怪",
-            Priority = 999,
-            Type = MissionType.Survival,
-            Category = QuestCategory.Survival,
-            Module = "survival",
-            TriggerEvents = Array.Empty<string>(),
-        });
+        // ===== Phase 5: 兜底生存刷怪 -- 已移到 DynamicMissionGenerator Layer 6 =====
 
         this._boardState.Missions.Sort((a, b) => a.Priority.CompareTo(b.Priority));
 
@@ -273,6 +244,7 @@ public sealed class MissionBoardService
     /// <summary>
     /// 从游戏服务器查询当前活跃任务，同步到看板。
     /// 不推倒看板，只更新对应条目的状态、进度和阶段树。
+    /// 跳过 IsDeadTask 的条目——看板的死任务判定优先级高于游戏服务器同步。
     /// </summary>
     public void SyncActiveQuestToBoard()
     {
@@ -282,6 +254,10 @@ public sealed class MissionBoardService
             var entry = this._boardState.Missions.FirstOrDefault(m =>
                 m.QuestGroup == aq.Group && m.QuestNumber == aq.Number && m.Type == MissionType.Quest);
             if (entry is null) continue;
+
+            // AR-24: 看板纯数据 — 死任务的判定由 HeartbeatService 的决策层负责,
+            // 游戏服务器的活跃状态不应覆盖看板已做出的失败/死亡判定
+            if (entry.IsDeadTask) continue;
 
             entry.Status = MissionStatus.Active;
             this.BuildStagesForEntry(entry, aq);

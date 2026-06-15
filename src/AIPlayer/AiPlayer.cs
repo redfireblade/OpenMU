@@ -7,7 +7,6 @@ namespace MUnique.OpenMU.AIPlayer;
 using System.IO;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
-using MUnique.OpenMU.AIPlayer.World;
 using MUnique.OpenMU.DataModel.Entities;
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.Views;
@@ -36,25 +35,9 @@ public sealed class AiPlayer : Player
     public Guid AiPlayerId { get; internal set; }
 
     /// <summary>
-    /// Gets the world map for cross-map navigation (populated at startup).
-    /// </summary>
-    public WorldMap? WorldMap { get; internal set; }
-
-    /// <summary>
     /// Gets the algorithm selector for pathfinding.
     /// </summary>
     public AlgorithmSelector AlgorithmSelector { get; } = new();
-
-    /// <summary>
-    /// Gets or sets the personality profile identifier (reserved for Phase 2+).
-    /// </summary>
-    public string? PersonalityProfile { get; internal set; }
-
-    /// <summary>
-    /// Gets or sets the personality-driven behavioral preferences.
-    /// Shapes PK tendency, greed, risk tolerance, and hunting style.
-    /// </summary>
-    public PersonalityProfile Personality { get; set; } = MUnique.OpenMU.AIPlayer.PersonalityProfile.Balanced();
 
     /// <summary>
     /// Gets the timestamp when this AI player was started.
@@ -72,20 +55,6 @@ public sealed class AiPlayer : Player
     /// must be called manually. Intended for the test client.
     /// </summary>
     internal bool StepModeForTesting { get; set; }
-
-    /// <summary>
-    /// Gets the persistent character growth record for this AI player.
-    /// Tracks max level achieved, rebirth count, unlocked knowledge, and other
-    /// long-term progression data that survives across sessions and rebirths.
-    /// </summary>
-    public CharacterMemory? CharacterMemory { get; internal set; }
-
-    /// <summary>
-    /// Gets the execution context for this AI player session.
-    /// Preserves the current goal and task queue across disconnects.
-    /// Saved on stop, restored on start.
-    /// </summary>
-    public ExecutionContext? ExecutionContext { get; internal set; }
 
     /// <summary>
     /// Sets a target map for the AI to travel to.
@@ -113,7 +82,7 @@ public sealed class AiPlayer : Player
     /// When non-null and running, the Tick loop delegates to the state machine
     /// instead of executing the normal behavior engine.
     /// </summary>
-    public AIStateMachine.AIStateMachine? StateMachine { get; internal set; }
+    public object? StateMachine { get; internal set; }
 
     /// <summary>
     /// Initializes the AI player from the given account and character.

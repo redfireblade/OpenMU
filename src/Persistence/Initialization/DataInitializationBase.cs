@@ -227,7 +227,7 @@ public abstract class DataInitializationBase : IDataInitializationPlugIn
 
     private async ValueTask CreateConnectServerDefinitionAsync()
     {
-        var port = 44405;
+        var port = 44406;
         var clients = await this.Context.GetAsync<GameClientDefinition>().ConfigureAwait(false);
         foreach (var client in clients.OrderBy(c => c.Season))
         {

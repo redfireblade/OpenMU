@@ -1,0 +1,238 @@
+{
+  "id": "quest_test_loop",
+  "name": "任务测试循环 — 蜘蛛狩猎(Noria)",
+  "version": "1.1.0",
+  "status": "test",
+  "description": "QuestModule + 脚本测试：自动接蜘蛛狩猎任务(Group 18/1)→Noria狩猎→交任务。PC执行模型优化版。",
+  "category": "composite",
+  "personality": "balanced",
+  "orchestrator": {
+    "mode": "dag"
+  },
+
+  "parameters": {
+    "hpThreshold": 0.35,
+    "mpThreshold": 0.20,
+    "patrolRadius": 15,
+    "attackRange": 3.0,
+    "searchRange": 20,
+    "maxLevelDiff": 30,
+    "noMonsterTicksLimit": 30,
+    "potionCooldownMs": 2000,
+    "questGroup": 18,
+    "questNumber": 1,
+    "questNpcNumber": 257,
+    "skillPriority": [3],
+    "hotspots": [
+      { "x": 190, "y": 130, "name": "Lorencia 蜘蛛区入口" },
+      { "x": 200, "y": 150, "name": "Lorencia 蜘蛛区中" },
+      { "x": 210, "y": 180, "name": "Lorencia 蜘蛛区东" }
+    ]
+  },
+
+  "paragraphs": [
+    {
+      "label": "start",
+      "nodes": [
+        {
+          "name": "hp_check",
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "生存优先"
+        },
+        {
+          "name": "death_check",
+          "condition": "is_dead",
+          "action": "wait_respawn",
+          "comment": "死亡恢复"
+        },
+        {
+          "name": "just_revived_check",
+          "condition": "just_revived",
+          "action": "wait_respawn",
+          "comment": "刚复活稳定"
+        },
+        {
+          "name": "submit_ready",
+          "condition": "quest_conditions_met",
+          "action": "goto @submit_quest",
+          "comment": "任务条件满足→去交任务"
+        },
+        {
+          "name": "accept_if_none",
+          "condition": "no_active_quest",
+          "action": "goto @accept_quest",
+          "comment": "无活跃任务→去接任务"
+        },
+        {
+          "name": "has_quest_go_hunt",
+          "condition": "has_active_quest",
+          "action": "goto @warp_to_hunt",
+          "comment": "有任务→去Noria狩猎区"
+        },
+        {
+          "name": "enter_hunt",
+          "condition": "always",
+          "action": "goto @hunt",
+          "comment": "默认进入狩猎段"
+        }
+      ]
+    },
+
+    {
+      "label": "accept_quest",
+      "nodes": [
+        {
+          "name": "walk_to_npc",
+          "condition": "always",
+          "action": "walk_to_quest_npc",
+          "parameters": { "questNpcNumber": 257 },
+          "comment": "走向精灵战士"
+        },
+        {
+          "name": "check_accepted",
+          "condition": "has_active_quest",
+          "action": "goto @warp_to_hunt",
+          "comment": "已经接到任务→去狩猎"
+        },
+        {
+          "name": "try_accept",
+          "condition": "can_accept_quest",
+          "action": "accept_quest",
+          "parameters": { "questGroup": 18, "questNumber": 1 },
+          "comment": "接蜘蛛狩猎任务"
+        },
+        {
+          "name": "fallback",
+          "condition": "always",
+          "action": "goto @start",
+          "comment": "未接到也回主循环"
+        }
+      ]
+    },
+
+    {
+      "label": "warp_to_hunt",
+      "nodes": [
+        {
+          "name": "ensure_lorencia",
+          "condition": "always",
+          "action": "warp_to_map",
+          "parameters": { "targetMapNumber": 0 },
+          "comment": "确保在勇者大陆Lorencia（蜘蛛在Map 0一出口附近）"
+        },
+        {
+          "name": "enter_hunt_after_warp",
+          "condition": "always",
+          "action": "goto @hunt",
+          "comment": "传送后直接进入狩猎段"
+        }
+      ]
+    },
+
+    {
+      "label": "hunt",
+      "nodes": [
+        {
+          "name": "quest_check",
+          "condition": "quest_conditions_met",
+          "action": "goto @submit_quest",
+          "comment": "P1 任务检查优先: 杀够蜘蛛→去交任务"
+        },
+        {
+          "name": "hp_check",
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "生存安全网(硬中断已优先处理)"
+        },
+        {
+          "name": "mp_check",
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "comment": "续航安全网(硬中断已优先处理)"
+        },
+        {
+          "name": "leave_safezone",
+          "condition": "in_safe_zone",
+          "action": "leave_safezone",
+          "comment": "P2 脱安全区: 走出城镇找怪"
+        },
+        {
+          "name": "find_target",
+          "condition": "no_target",
+          "action": "find_nearest_monster",
+          "comment": "P3 索敌: 无目标→索敌"
+        },
+        {
+          "name": "approach_current",
+          "condition": "has_target_not_in_range",
+          "action": "approach_target",
+          "comment": "P3 接近: 目标不在范围内→接近"
+        },
+        {
+          "name": "attack_current",
+          "condition": "has_target_in_range",
+          "action": "attack_target",
+          "comment": "P3 攻击: 目标在范围内→攻击"
+        },
+        {
+          "name": "pickup_items",
+          "condition": "always",
+          "action": "pickup_nearby",
+          "comment": "P3.5 拾取地上的物品"
+        },
+        {
+          "name": "go_spider_hotspot",
+          "condition": "not_at_hotspot",
+          "action": "relocate_to_hotspot",
+          "comment": "P4 前往热点: PC推进不自旋(战斗中断不重触发)"
+        },
+        {
+          "name": "no_monsters_relocate",
+          "condition": "no_monsters_recently",
+          "action": "relocate_to_hotspot",
+          "comment": "P4 换热点: 长时间无怪→换点"
+        },
+        {
+          "name": "patrol",
+          "condition": "always",
+          "action": "random_patrol",
+          "comment": "P5 空闲: 在热点周边巡逻"
+        }
+      ]
+    },
+
+    {
+      "label": "submit_quest",
+      "nodes": [
+        {
+          "name": "warp_lorencia",
+          "condition": "always",
+          "action": "warp_to_map",
+          "parameters": { "targetMapNumber": 0 },
+          "comment": "确保在勇者大陆Lorencia交任务"
+        },
+        {
+          "name": "walk_to_npc",
+          "condition": "always",
+          "action": "walk_to_quest_npc",
+          "parameters": { "questNpcNumber": 257 },
+          "comment": "走向精灵战士交任务"
+        },
+        {
+          "name": "check_done",
+          "condition": "no_active_quest",
+          "action": "goto @start",
+          "comment": "任务已提交→回主循环"
+        },
+        {
+          "name": "try_submit",
+          "condition": "always",
+          "action": "submit_quest",
+          "parameters": { "questGroup": 18, "questNumber": 1 },
+          "comment": "提交任务"
+        }
+      ]
+    }
+  ]
+}

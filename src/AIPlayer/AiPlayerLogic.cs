@@ -57,22 +57,12 @@ public sealed class AiPlayerLogic : IDisposable
         this._context = new BehaviorContext(player)
         {
             GameAdapter = new GameAdapter(player),
-            NpcService = new NpcInteractionService(player, player.Logger),
         };
-
-        // Create event-driven AI state machine for async ScriptItem execution
-        var stateMachine = new AIStateMachine.AIStateMachine(player, this._adapter);
-        stateMachine.OnStuckDetected += hb =>
-        {
-            stateMachine.Cancel();
-        };
-        player.StateMachine = stateMachine;
 
         // Load behavior execution engine: ScriptExecutor (1D) or Heartbeat (Decision)
         if (script is not null)
         {
             // 1D Script-driven mode: priority-chain executor replaces DAG modules
-            ApplyPersonalityToScript(script, player.Personality);
             this._scriptExecutor = new Scripting.ScriptExecutor(player, this._context, script, player.ScriptPath);
             player.Logger.LogInformation("[AiPlayerLogic] Script-driven mode: {ScriptId} v{Version}",
                 script.Id, script.Version);
@@ -82,7 +72,7 @@ public sealed class AiPlayerLogic : IDisposable
             // Decision mode: Heartbeat + MissionBoard drives behavior autonomously
             var nativeExec = new NativeExecutionService(player, player.Logger);
             this._missionBoard = new Decision.MissionBoardService(player, this._adapter, player.Logger);
-            this._heartbeat = new Decision.HeartbeatService(player, this._missionBoard, this._adapter, player.Logger);
+            this._heartbeat = new Decision.HeartbeatService(player, this._context, this._missionBoard, this._adapter, player.Logger);
             player.Logger.LogInformation("[AiPlayerLogic] Decision mode: Heartbeat-driven (no script)");
         }
 
@@ -203,7 +193,6 @@ public sealed class AiPlayerLogic : IDisposable
     /// <inheritdoc />
     public void Dispose()
     {
-        this._player.StateMachine?.Dispose();
         this._cts.Cancel();
         this._cts.Dispose();
     }
@@ -270,28 +259,6 @@ public sealed class AiPlayerLogic : IDisposable
             return;
         }
 
-        // [AIStateMachine] Check if event-driven state machine is running a ScriptItem
-        if (this._player.StateMachine?.IsRunning == true)
-        {
-            var item = this._player.StateMachine.CurrentItem;
-
-            // Generate heartbeat with surrounding monster count (reuse world state or compute)
-            var monsterCount = this._context.WorldState.AttackablesInRange?.OfType<Monster>().Count(m => m.IsAlive) ?? 0;
-            this._player.StateMachine.UpdateHeartbeatAsync(this._adapter, monsterCount);
-
-            if (item?.RequiresTickLoop != true && this._heartbeat is null)
-            {
-                // Exclusive mode (non-Decision): state machine handles execution (e.g. walking to NPC, quest dialog).
-                // Tick loop is skipped — only record heartbeat snapshot.
-                // Decision mode (Heartbeat): ScriptExecutor runs inside BeatAsync, so the tick must continue.
-                this.RecordEndOfTickSnapshot();
-                return;
-            }
-
-            // Cooperative mode: item (e.g. HuntItem) needs tick loop to continue.
-            // Tick proceeds normally; the state machine monitors progress independently.
-        }
-
         var map = this._adapter.GetCurrentMap();
         if (map is null)
         {
@@ -314,6 +281,18 @@ public sealed class AiPlayerLogic : IDisposable
                 atkCount,
                 this._adapter.GetCurrentHp(),
                 this._adapter.GetMaxHp());
+
+            // [P0D] AttackablesInRange detail — shows monster composition
+            var attackables = this._context.WorldState.AttackablesInRange;
+            if (attackables is not null && attackables.Count > 0)
+            {
+                var monsterSummary = attackables
+                    .OfType<Monster>()
+                    .GroupBy(m => m.Definition?.Number ?? 0)
+                    .Select(g => $"#{g.Key}({g.Count()})");
+                logger.LogInformation("[P0D] AttackablesInRange: total={Total}, monsters=[{Monsters}]",
+                    attackables.Count, string.Join(", ", monsterSummary));
+            }
         }
 
         // 1. Refresh world state snapshot for all modules
@@ -325,6 +304,10 @@ public sealed class AiPlayerLogic : IDisposable
             CurrentMap = map,
             PlayerPosition = this._adapter.GetPlayerPosition(),
             AttackablesInRange = map.GetAttackablesInRange(this._adapter.GetPlayerPosition(), SearchRange),
+            DropsInRange = map.GetDropsInRange(this._adapter.GetPlayerPosition(), 10)
+                .OfType<DroppedItem>()
+                .Take(50)
+                .ToList(),
             IsAtSafezone = false,
             OtherPlayersInRange = map.GetAttackablesInRange(this._adapter.GetPlayerPosition(), 100)
                 .OfType<Player>()
@@ -408,36 +391,6 @@ public sealed class AiPlayerLogic : IDisposable
             return;
         }
 
-        // Check if the ideal phase is knowledge-unlocked
-        var phaseKey = $"statbuild.{baseClass}.phase{phaseIndex}";
-        if (this._context.KnowledgeAccess is not null && !this._context.KnowledgeAccess.IsUnlocked(phaseKey))
-        {
-            // Fall back to the best unlocked phase
-            (int MinLevel, int MaxLevel, float Str, float Agi, float Vit, float Ene) fallbackPhase = default;
-            var fallbackIndex = -1;
-            for (var i = 0; i < phases.Length; i++)
-            {
-                if (!this._context.KnowledgeAccess.IsUnlocked($"statbuild.{baseClass}.phase{i}"))
-                {
-                    continue;
-                }
-
-                var p = phases[i];
-                if (level >= p.MinLevel)
-                {
-                    fallbackPhase = p;
-                    fallbackIndex = i;
-                }
-            }
-
-            if (fallbackIndex < 0)
-            {
-                return;
-            }
-
-            phase = fallbackPhase;
-        }
-
         // Allocate up to 5 points per tick
         var points = character.LevelUpPoints;
         var toAllocate = Math.Min(points, 5);
@@ -482,23 +435,6 @@ public sealed class AiPlayerLogic : IDisposable
             (uint)this._adapter.GetMaxMp(),
             this._adapter.GetPlayerLevel(),
             (ushort)(this._adapter.GetCurrentMap()?.Definition.Number ?? 0));
-    }
-
-    /// <summary>
-    /// Applies the AI character's PersonalityProfile to override script parameters.
-    /// This connects the 8-dimension personality model to runtime behavior without
-    /// requiring separate JSON presets for each personality type.
-    /// </summary>
-    private static void ApplyPersonalityToScript(Scripting.BehaviorScript script, PersonalityProfile personality)
-    {
-        var p = script.Parameters;
-        p.MaxLevelDiff = (int)(15 + personality.RiskTolerance * 50);
-        p.HpThreshold = Math.Clamp((float)(0.50f - personality.RiskTolerance * 0.30f), 0.20f, 0.50f);
-        p.PotionCooldownMs = (int)(1500 + personality.RiskTolerance * 1000);
-        p.PatrolRadius = (int)(45 - personality.Caution * 30);
-        p.SearchRange = (int)(10 + personality.Aggression * 20);
-        p.PickupFilter = personality.Greed >= 0.3f ? "all" : "rare_and_above";
-        p.ReturnWhenInventoryFull = personality.Efficiency > 0.7f;
     }
 
     /// <summary>

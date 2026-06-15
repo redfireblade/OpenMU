@@ -11,6 +11,7 @@ using System.IO;
 using System.Text.Json.Serialization;
 using System.Threading;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -69,6 +70,7 @@ internal sealed class Program : IDisposable
 
         this._logger = new LoggerConfiguration()
             .ReadFrom.Configuration(configuration)
+            .MinimumLevel.Information()
             .CreateLogger();
     }
 
@@ -162,6 +164,74 @@ internal sealed class Program : IDisposable
             {
                 await connectServer.StartAsync().ConfigureAwait(false);
             }
+
+            // Auto-create debug AI players after a short delay
+            // to allow the game context to be fully initialized.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+                    var aiService = this._serverHost.Services.GetService<MUnique.OpenMU.AIPlayer.IAiService>();
+                    if (aiService is null)
+                    {
+                        this._logger.Warning("IAiService not available, skipping AI player auto-creation.");
+                        return;
+                    }
+
+                    // Use script-driven mode (1D) for predictable behavior
+                    var scriptsDir = System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "aiplayer_data");
+                    var scriptPath = System.IO.Path.Combine(scriptsDir, "basic_hunting_loop.json");
+                    var scriptPathArg = System.IO.File.Exists(scriptPath) ? scriptPath : null;
+                    if (scriptPathArg is null)
+                    {
+                        this._logger.Warning("Script {Path} not found; DebugBots will use DAG module mode.", scriptPath);
+                    }
+
+                    var bots = new[]
+                    {
+                        ("DebugBot1",    0, (ushort)2,  Path.Combine(scriptsDir, "basic_hunting_loop.json")),   // Devias (map 2), 狩猎
+                        ("DebugBot2",    0, (ushort)1,  Path.Combine(scriptsDir, "basic_hunting_loop.json")),   // Dungeon (map 1), 狩猎
+                        ("DebugBot3",    0, (ushort)0,  Path.Combine(scriptsDir, "basic_hunting_loop.json")),   // Lorencia (map 0), 狩猎
+                        ("DecisionTest", 0, (ushort)3,  null),                                                  // Noria, Decision模式
+                    };
+                    foreach (var (name, classId, mapId, botScriptPath) in bots)
+                    {
+                        var config = new MUnique.OpenMU.AIPlayer.AiPlayerCreateConfig(name, classId, mapId, botScriptPath);
+                        var result = await aiService.CreateAiPlayerAsync(config).ConfigureAwait(false);
+                        if (result.Success && result.PlayerId.HasValue)
+                        {
+                            // Raise level so bot can fight monsters (default is Lv.1)
+                            var debugService = this._serverHost.Services.GetService<MUnique.OpenMU.AIPlayer.IAiDebugService>();
+                            if (debugService is not null)
+                            {
+                                var level = name == "DecisionTest" ? 150 : 80;
+                                await debugService.SetLevelAsync(result.PlayerId.Value, level).ConfigureAwait(false);
+                                // Assign vitality for HP:
+                                var baseVitalityGuid = new Guid("6CA5C3A6-B109-45A5-87A7-FDCB107B4982");
+                                await debugService.SetStatAttributeAsync(result.PlayerId.Value, baseVitalityGuid, 400).ConfigureAwait(false);
+                                // Assign strength for attack power (关键: 不加力量则攻击力≈0, 打怪永远掉1HP)
+                                var baseStrengthGuid = new Guid("123282FE-FEAD-448E-AD2C-BAECE939B4B1");
+                                await debugService.SetStatAttributeAsync(result.PlayerId.Value, baseStrengthGuid, 800).ConfigureAwait(false);
+                                var baseAgilityGuid = new Guid("D0B5A988-1DCD-4D9D-9D07-77E6C35E27B3");
+                                await debugService.SetStatAttributeAsync(result.PlayerId.Value, baseAgilityGuid, 200).ConfigureAwait(false);
+                                await debugService.SetHpAsync(result.PlayerId.Value, 3000).ConfigureAwait(false);
+                                await debugService.SetMpAsync(result.PlayerId.Value, 2000).ConfigureAwait(false);
+                            }
+
+                            this._logger.Information("Auto-created AI player {Name} ID {Id} Lv.80 on map {Map} script={Script}.", name, result.PlayerId, mapId, botScriptPath ?? "none");
+                        }
+                        else
+                        {
+                            this._logger.Warning("Failed to auto-create AI player {Name}: {Error}", name, result.ErrorMessage);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    this._logger.Error(ex, "Failed to auto-create AI players.");
+                }
+            });
         }
     }
 
@@ -235,6 +305,11 @@ internal sealed class Program : IDisposable
         _ = GameLogic.Rand.NextInt(1, 2);
         _ = DataInitialization.Id;
         _ = OpenMU.GameServer.ClientVersionResolver.DefaultVersion;
+        // Initialize AI version catalog to match the server's client version
+        var serverClientVersion = OpenMU.GameServer.ClientVersionResolver.DefaultVersion;
+        MUnique.OpenMU.AIPlayer.ContentVersionCatalog.ServerVersion = new MUnique.OpenMU.AIPlayer.GameVersion(
+            serverClientVersion.Season, serverClientVersion.Episode);
+        _ = typeof(MUnique.OpenMU.AIPlayer.IAiService).Assembly;
 
         var addAdminPanel = this.IsAdminPanelEnabled(args);
         await new ConfigFileDatabaseConnectionStringProvider().InitializeAsync(default).ConfigureAwait(false);
@@ -274,8 +349,55 @@ internal sealed class Program : IDisposable
             .AddSingleton<IConnectServerInstanceManager>(provider => provider.GetService<ConnectServerContainer>()!)
             .AddSingleton<GameServerContainer>()
             .AddSingleton<IGameServerInstanceManager>(provider => provider.GetService<GameServerContainer>()!)
-            .AddScoped<IMapFactory, JavascriptMapFactory>()
-            .AddSingleton<SetupService>()
+            .AddSingleton<MUnique.OpenMU.AIPlayer.IGameServerContextResolver>(provider => provider.GetRequiredService<GameServerContainer>())
+            .AddSingleton<MUnique.OpenMU.AIPlayer.IAiService>(provider =>
+            {
+                var contextResolver = provider.GetRequiredService<MUnique.OpenMU.AIPlayer.IGameServerContextResolver>();
+                var logger = provider.GetRequiredService<ILogger<MUnique.OpenMU.AIPlayer.AiPlayerManager>>();
+                return new MUnique.OpenMU.AIPlayer.AiPlayerManager(contextResolver, logger);
+            })
+            .AddSingleton<MUnique.OpenMU.AIPlayer.AiPlayerManager>(provider =>
+                (MUnique.OpenMU.AIPlayer.AiPlayerManager)provider.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>())
+            .AddSingleton<MUnique.OpenMU.AIPlayer.IAiDebugService>(provider => (MUnique.OpenMU.AIPlayer.AiPlayerManager)provider.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>())
+            .AddSingleton<MUnique.OpenMU.AIPlayer.Map.AiMapManager>()
+            .AddSingleton<MUnique.OpenMU.AIPlayer.Map.AiMapLifecycleService>(provider =>
+            {
+                var contextResolver = provider.GetRequiredService<MUnique.OpenMU.AIPlayer.IGameServerContextResolver>();
+                var gameContext = contextResolver.ResolveContext();
+                if (gameContext is null)
+                {
+                    throw new InvalidOperationException("IGameContext not available yet. Ensure game server is started.");
+                }
+                var mapManager = provider.GetRequiredService<MUnique.OpenMU.AIPlayer.Map.AiMapManager>();
+                var logger = provider.GetRequiredService<ILogger<MUnique.OpenMU.AIPlayer.Map.AiMapLifecycleService>>();
+                return new MUnique.OpenMU.AIPlayer.Map.AiMapLifecycleService(gameContext, mapManager, logger);
+            })
+            .AddSingleton<MUnique.OpenMU.AIPlayer.Scripting.ScriptWatcherService>(provider =>
+            {
+                var basePath = System.AppDomain.CurrentDomain.BaseDirectory;
+                var scriptsPath = System.IO.Path.Combine(basePath, "scripts");
+                if (!System.IO.Directory.Exists(scriptsPath))
+                {
+                    System.IO.Directory.CreateDirectory(scriptsPath);
+                }
+                var logger = provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<MUnique.OpenMU.AIPlayer.Scripting.ScriptWatcherService>>();
+                return new MUnique.OpenMU.AIPlayer.Scripting.ScriptWatcherService(scriptsPath, logger);
+            })
+            .AddSingleton<MUnique.OpenMU.AIPlayer.Scripting.ScriptReloadBridge>()
+            .AddHostedService<MUnique.OpenMU.AIPlayer.Scripting.ScriptReloadBridge>(provider =>
+                provider.GetRequiredService<MUnique.OpenMU.AIPlayer.Scripting.ScriptReloadBridge>());
+
+            if (addAdminPanel)
+            {
+                builder.Services.AddScoped<MUnique.OpenMU.Web.AdminPanel.AiDebugStateProvider>()
+                    .AddScoped<IMapFactory, JavascriptMapFactory>();
+            }
+            else
+            {
+                builder.Services.AddSingleton<MUnique.OpenMU.Web.AdminPanel.AiDebugStateProvider>();
+            }
+
+            builder.Services.AddSingleton<SetupService>()
             .AddSingleton<IEnumerable<IConnectServer>>(provider => provider.GetService<ConnectServerContainer>() ?? throw new Exception($"{nameof(ConnectServerContainer)} not registered."))
             .AddSingleton<IGuildChangePublisher, GuildChangeToGameServerPublisher>()
             .AddSingleton<IFriendNotifier, FriendNotifierToGameServer>()
@@ -302,8 +424,197 @@ internal sealed class Program : IDisposable
 
         var host = builder.Build();
 
+        // Set AI service resolver for the AI command plugin
+        // (plugin system resolves instances before full DI is available)
+        MUnique.OpenMU.AIPlayer.AiCommandPlugIn.ServiceResolver = () => host.Services.GetService<MUnique.OpenMU.AIPlayer.IAiService>();
+
         // NpgsqlLoggingConfiguration.InitializeLogging(host.Services.GetRequiredService<ILoggerFactory>())
         this._logger.Information("Host created");
+
+        // Add AI debug API endpoints (for testing without game client)
+        _ = host.MapGet("/api/ai/create", async (string name, int classId, ushort mapId, string? mode) =>
+        {
+            var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
+            string? scriptPath = null;
+            if (mode == "1d")
+            {
+                var defaultScript = System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "aiplayer_data", "basic_hunting_loop.json");
+                if (System.IO.File.Exists(defaultScript)) scriptPath = defaultScript;
+            }
+            else if (!string.IsNullOrEmpty(mode))
+            {
+                // mode is a script filename (e.g. "dag_hunting_loop" or "dag_hunting_loop.json")
+                var scriptFileName = mode.EndsWith(".json") ? mode : mode + ".json";
+                var customScript = System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "aiplayer_data", scriptFileName);
+                if (System.IO.File.Exists(customScript))
+                {
+                    scriptPath = customScript;
+                }
+            }
+
+            var config = new MUnique.OpenMU.AIPlayer.AiPlayerCreateConfig(name, classId, mapId, scriptPath);
+            var result = await aiService.CreateAiPlayerAsync(config);
+            return result.Success
+                ? Results.Ok(new { success = true, playerId = result.PlayerId })
+                : Results.Ok(new { success = false, error = result.ErrorMessage });
+        });
+
+        _ = host.MapGet("/api/ai/state", async (string? id) =>
+        {
+            var debugService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiDebugService>();
+            if (!string.IsNullOrEmpty(id) && Guid.TryParse(id, out var playerId))
+            {
+                var data = debugService.GetDebugData(playerId);
+                if (data is not null)
+                {
+                    return Results.Ok(new
+                    {
+                        playerId = data.PlayerId,
+                        name = data.CharacterName,
+                        mapId = data.CurrentMapId,
+                        x = data.PositionX, y = data.PositionY,
+                        hp = data.CurrentHealth, maxHp = data.MaximumHealth,
+                        mp = data.CurrentMana, maxMp = data.MaximumMana,
+                        level = data.Level,
+                        tick = data.TickNumber,
+                        hasTarget = data.HasTarget,
+                        survival = data.SurvivalLevel.ToString(),
+                        decisions = data.LastDecisions?.Select(d => d.ModuleName).ToList() ?? new List<string>(),
+                        currentBehavior = data.CurrentBehavior,
+                        scriptName = data.ScriptName,
+                        scriptPosition = data.ScriptPosition,
+                        scriptLines = data.ScriptLines,
+                        scriptLineNumber = data.ScriptLineNumber,
+                        dashboardTodos = data.DashboardTodos,
+                        dashboardActiveModule = data.DashboardActiveModule,
+                        dashboardState = data.DashboardState,
+                        dashboardEventQueueLength = data.DashboardEventQueueLength,
+                    });
+                }
+
+                return Results.Ok(new { error = "Player not found" });
+            }
+
+            var all = debugService.GetAllDebugData();
+            var list = all.Select(d => new
+            {
+                playerId = d.PlayerId,
+                name = d.CharacterName,
+                mapId = d.CurrentMapId,
+                x = d.PositionX, y = d.PositionY,
+                hp = d.CurrentHealth, maxHp = d.MaximumHealth,
+                level = d.Level,
+                tick = d.TickNumber,
+                hasTarget = d.HasTarget,
+                currentBehavior = d.CurrentBehavior,
+                scriptName = d.ScriptName,
+                scriptPosition = d.ScriptPosition,
+                scriptLines = d.ScriptLines,
+                scriptLineNumber = d.ScriptLineNumber,
+                dashboardTodos = d.DashboardTodos,
+                dashboardActiveModule = d.DashboardActiveModule,
+                dashboardState = d.DashboardState,
+                dashboardEventQueueLength = d.DashboardEventQueueLength,
+            }).ToList();
+            return Results.Ok(new { count = list.Count, players = list });
+        });
+
+        _ = host.MapGet("/api/ai/set-hp", async (string id, uint hp) =>
+        {
+            var debugService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiDebugService>();
+            if (Guid.TryParse(id, out var playerId))
+            {
+                await debugService.SetHpAsync(playerId, hp);
+                return Results.Ok(new { success = true, playerId = playerId, hp = hp });
+            }
+
+            return Results.Ok(new { success = false, error = "Invalid player ID" });
+        });
+
+        // Script hot-reload endpoint: reload all scripts from disk
+        // ScriptExecutors with EnableHotReload=true will pick up changes on next tick
+        _ = host.MapGet("/api/ai/reload-scripts", async () =>
+        {
+            var watcher = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.Scripting.ScriptWatcherService>();
+            var reloadedCount = watcher.ReloadAllScripts();
+            return Results.Ok(new { reloaded = reloadedCount, registered = watcher.Count });
+        });
+
+        // Script status endpoint: returns status of all watched scripts
+        _ = host.MapGet("/api/ai/script-status", async () =>
+        {
+            var watcher = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.Scripting.ScriptWatcherService>();
+            var status = watcher.GetScriptStatus();
+            return Results.Ok(new { count = status.Count, scripts = status });
+        });
+
+        // Script execution stats endpoint: returns formatted stats from each player's ScriptExecutor
+        _ = host.MapGet("/api/ai/script-stats", async () =>
+        {
+            var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
+            var manager = (MUnique.OpenMU.AIPlayer.AiPlayerManager)aiService;
+            var stats = manager.GetActivePlayers()
+                .Where(p => p.Logic is not null)
+                .Select(p => new
+                {
+                    playerId = p.AiPlayerId.ToString(),
+                    name = p.SelectedCharacter?.Name ?? "?",
+                    stats = p.Logic!.GetScriptStats(),
+                })
+                .ToList();
+            return Results.Ok(new { count = stats.Count, players = stats });
+        });
+
+        // AiMap overlay API endpoints (Phase E0)
+        _ = host.MapGet("/api/ai-map/{mapId}/pheromones", async (int mapId) =>
+        {
+            var aiMap = MUnique.OpenMU.AIPlayer.Map.AiMapManager.Default.GetOrCreateMap((ushort)mapId);
+            var data = new List<object>();
+            for (int x = 0; x < MUnique.OpenMU.AIPlayer.Map.AiMap.MapSize; x++)
+            for (int y = 0; y < MUnique.OpenMU.AIPlayer.Map.AiMap.MapSize; y++)
+            {
+                if (aiMap.PheromoneGrid[x, y] > 0.01f)
+                    data.Add(new { x, y, v = aiMap.PheromoneGrid[x, y] });
+            }
+
+            return Results.Ok(new { mapId, total = data.Count, cells = data });
+        });
+
+        _ = host.MapGet("/api/ai-map/{mapId}/territories", async (int mapId) =>
+        {
+            var aiMap = MUnique.OpenMU.AIPlayer.Map.AiMapManager.Default.GetOrCreateMap((ushort)mapId);
+            var data = new List<object>();
+            for (int x = 0; x < MUnique.OpenMU.AIPlayer.Map.AiMap.MapSize; x++)
+            for (int y = 0; y < MUnique.OpenMU.AIPlayer.Map.AiMap.MapSize; y++)
+            {
+                if (aiMap.TerritoryGrid[x, y] != 0)
+                    data.Add(new { x, y, groupId = aiMap.TerritoryGrid[x, y] });
+            }
+
+            return Results.Ok(new { mapId, total = data.Count, cells = data });
+        });
+
+        _ = host.MapGet("/api/ai-map/{mapId}/waypoints", async (int mapId) =>
+        {
+            var aiMap = MUnique.OpenMU.AIPlayer.Map.AiMapManager.Default.GetOrCreateMap((ushort)mapId);
+            var data = aiMap.Waypoints.ToDictionary(kvp => kvp.Key, kvp => new
+            {
+                count = kvp.Value.Count,
+                points = kvp.Value.Select(p => new { x = (int)p.X, y = (int)p.Y }).ToList(),
+            });
+            return Results.Ok(new { mapId, waypoints = data });
+        });
+
+        _ = host.MapGet("/api/ai-map/{mapId}/assembly-points", async (int mapId) =>
+        {
+            var aiMap = MUnique.OpenMU.AIPlayer.Map.AiMapManager.Default.GetOrCreateMap((ushort)mapId);
+            var data = aiMap.AssemblyPoints.ToDictionary(kvp => kvp.Key, kvp => new
+            {
+                count = kvp.Value.Count,
+                points = kvp.Value.Select(p => new { x = (int)p.X, y = (int)p.Y }).ToList(),
+            });
+            return Results.Ok(new { mapId, groups = data });
+        });
 
         if (addAdminPanel)
         {
