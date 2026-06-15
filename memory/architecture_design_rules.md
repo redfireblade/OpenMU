@@ -132,3 +132,27 @@ ProcessGoto (paragraph switch):
 ### 违反后果
 
 违反此规则（缺少熔断保护）将导致 AI 在无目标/无任务/无怪物时继续全速空转，每秒 2-3 次空 tick。与其他内存泄漏因素（异常堆积、日志缓存、SQLite WAL）叠加后，9.5 小时内即可耗尽 128 GB RAM 触发 OOM 崩溃。
+
+---
+
+## AR-30: 死亡重生规则 (Death Respawn Rule)
+
+**状态: 生效** · 2026-06-16
+
+### 规则
+
+1. **死亡后必须在当前地图安全区的随机可通过位置重生** — 不能传送到其他地图，不能出生在不可行走格（wall/blocked tile）。使用 `WarpToSafezoneAsync` + `GetSpawnGateOfCurrentMapAsync` 获取当前地图安全区出口门，门的矩形区域 `(X1,Y1)-(X2,Y2)` 内的随机坐标即为重生点。
+2. **安全区门过滤** — `GetSafezoneGate()` 的筛选逻辑是：`ExitGates.FirstOrDefault(g => g.IsSpawnGate && terrain.SafezoneMap[g.X1, g.Y1])`。即必须是 `IsSpawnGate=true` 且所覆盖的地形格被标记为安全区。
+3. **满状态恢复** — 重生后必须将 HP/MP 恢复至满值：遍历 `Stats.IntervalRegenerationAttributes`，将每个 `CurrentAttribute` 设为 `MaximumAttribute` 的值。同时设置 `player.IsAlive = true`。
+4. **地图确认** — AI 玩家没有真实客户端，重生后 `CurrentMap` 可能为 null，需要显式调用 `ClientReadyAfterMapChangeAsync()` 确认地图变换完成。
+5. **执行器重置** — 重生后必须清空 `_scriptExecutor = null`，防止旧脚本上下文干扰新周期。
+6. **死亡计时器** — `_deathStartTime` 在死亡瞬间记录 `DateTime.UtcNow`，5 秒后仍未复活 → 调用 `RespawnPlayerAsync()` 手动触发。
+7. **卡死绕过** — 当 `hp > 0` 但 `IsAlive = false` 或 `PlayerState == Dead/Disconnected` 时（如通过 API set-hp 强行补血后），心跳循环应强制恢复 Alive 状态并推进到 EnteredWorld。
+8. **不跨地图复活** — 禁止使用 `WarpToAsync(newGate)` 跨图传送。只使用当前地图的 `SafeZoneSpawnGate`。
+9. **复活后补给** — 复活后执行 `PostRespawnSupplyAsync()`：找附近商店NPC → 修理全部装备 → 购买药水 → 关闭对话框。
+
+### 违反后果
+
+不遵守此规则（跨地图复活、出生在不可行走格、HP未恢复满）将导致 AI 在安全区也无法正常活动，反复死亡或卡在地形中。
+
+---
