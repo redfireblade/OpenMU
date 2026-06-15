@@ -26,6 +26,19 @@ AI角色多任务优先级循环体系已基本建设完成。决策引擎是 6 
 - 死亡状态卡死修复(IsAlive+PlayerState.Dead检测绕过)
 - Web UI Decision Log可见决策记录(RecordDecision三条路径全接入)
 - 行走tick不覆盖空白snapshot(保持上一tick决策日志)
+- MaterialKnowledgeService: 配置扫描+DropItemGroups修复
+- MaterialFarmModule: 定向刷怪物材料+等级匹配
+- 恶魔广场门票全链路: 配置→按等级打材料→合成(80%成功率)→重试
+
+## 本会话验证结果 (2026-06-16)
+
+**Hermes集体编程完成:**
+1. ✅ **MaterialKnowledgeService** — 扫描GameConfiguration.DropItemGroups查找掉落来源+等级匹配
+2. ✅ **MaterialFarmModule** — 定向刷材料(跨地图/巡逻/攻击/背包等级检查)
+3. ✅ **CraftingModule修复** — 合成时匹配恶魔眼+恶魔钥匙等级,失败检测背包目标物品
+4. ✅ **EventExecutorModule** — 注入farm_ticket带TargetLevel参数
+5. ✅ **编译通过** — 0 errors (AIPlayer + Startup)
+6. ⚠️ **端到端验证受限** — EventWatcher在HeartbeatService内,AI死后不监控(需独立服务)
 
 ## 本会话验证结果 (2026-06-16)
 
