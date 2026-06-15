@@ -12,16 +12,21 @@ AI角色多任务优先级循环体系已基本建设完成。决策引擎是 6 
 当前已验证：6层决策循环、事件状态扫描（NotStarted正确跳过/不注入）、仓库检查、死循环兜底、DropsInRange管线、ScavengeForCrafting合成扫描。
 
 **已完成的全天运行保障**:
-- P0-A: NPC对话超时自动关闭(40tick)
-- P0-B: 断线重连检测(3次确认+30s冷却)
-- P3-A: WarpPlanner 接入决策层(ExecuteCrossMapWarp 多跳路由)
-- P3-B: CraftingModule 泛化(多配方 NPC 支持 + 跨地图 NoTarget 联动)
-- P3-C: CraftingModule 决策联动(NoTarget → TargetMap → 传送 → 继续任务)
-- P0-C: 服务器端到端验证(EventWatcher/EventScanner/自动复活)
+- NPC对话超时自动关闭(40tick)
+- 断线重连检测(3次确认+30s冷却)
+- WarpPlanner接入决策层(ExecuteCrossMapWarp多跳路由)
+- CraftingModule泛化(多配方NPC+跨地图NoTarget联动)
+- CraftingModule决策联动(NoTarget→传送→继续任务)
+- 主动嗑药HP/MP(TryConsumePotionsAsync, 2s冷却防浪费)
+- 复活补给(PostRespawnSupplyAsync: 修装备+买10瓶药)
+- 商店买药(BuyPotionsAsync/NpcInteractionService)
+- 装备修理(RepairAllEquipmentAsync)
+- 任务道具合成链路修复(统一ChaosGoblin, 按类型选mixType)
+- 服务器端到端验证(EventWatcher/EventScanner/自动复活)
 
 ## 下一阶段任务 (按优先级排序)
 
-### ⚠️ 当前: P0/P1/P2/P3 核心链路已完成 — 可进行全天运行测试
+### ✅ 所有 P0/P1/P2/P3 核心保障已完成 — 当前无未完成任务
 
 ### P0: 活动入场全链路端到端验证
 
