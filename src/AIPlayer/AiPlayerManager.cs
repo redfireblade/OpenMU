@@ -11,19 +11,27 @@ using MUnique.OpenMU.AttributeSystem;
 using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.DataModel.Entities;
 using MUnique.OpenMU.GameLogic;
+using MUnique.OpenMU.GameLogic.MiniGames;
 using MUnique.OpenMU.Persistence;
 using MUnique.OpenMU.AIPlayer.Scripting;
+using MUnique.OpenMU.AIPlayer.Decision;
 
 /// <summary>
 /// Manages the lifecycle of all AI player entities.
 /// Implements <see cref="IAiService"/> and is registered as a singleton in DI.
 /// </summary>
-public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
+public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadcaster, IDisposable
 {
     private readonly ConcurrentDictionary<Guid, AiPlayer> _activePlayers = new();
     private IGameContext? _gameContext;
     private readonly ILogger<AiPlayerManager> _logger;
     private int _nameCounter;
+
+    /// <summary>
+    /// 群体级事件活动广播器 — 检测 MiniGameDefinition 状态变更并分发到各 AI。
+    /// 不依赖任何单个 AI 角色的生命周期。
+    /// </summary>
+    private EventWatcherService? _eventWatcher;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="AiPlayerManager"/> class.
@@ -38,11 +46,15 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
         // Load the knowledge base from the embedded resource at startup.
         // Safe to call multiple times; subsequent calls are no-ops.
         KnowledgeLoader.Load();
+
+        // 启动群体级事件活动广播器（依赖已就绪的 IGameContext）
+        this._eventWatcher = new EventWatcherService(gameContext, this, logger);
     }
 
     /// <summary>
     /// Initializes a new instance with delayed game context resolution.
     /// Used when GameServerContainer hasn't fully started yet.
+    /// EventWatcherService 会在 Context 首次可用时自动创建。
     /// </summary>
     public AiPlayerManager(IGameServerContextResolver contextResolver, ILogger<AiPlayerManager> logger)
     {
@@ -69,8 +81,17 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
             {
                 var ctx = this._delayedContextResolver.ResolveContext();
                 if (ctx is not null)
+                {
                     this._gameContext = ctx;
+
+                    // 延迟初始化的场景：Context 刚刚可用，启动事件广播器
+                    if (this._eventWatcher is null)
+                    {
+                        this._eventWatcher = new EventWatcherService(ctx, this, this._logger);
+                    }
+                }
             }
+
             return this._gameContext ?? throw new InvalidOperationException("IGameContext not available yet.");
         }
     }
@@ -344,6 +365,9 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
         }
 
         this._activePlayers.Clear();
+
+        // 停止群体级事件广播器
+        this._eventWatcher?.Dispose();
     }
 
     /// <summary>
@@ -353,6 +377,130 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IDisposable
     public IEnumerable<AiPlayer> GetActivePlayers()
     {
         return this._activePlayers.Values.ToList();
+    }
+
+    // ==================== IEventBroadcaster Implementation ====================
+
+    /// <inheritdoc />
+    void IEventBroadcaster.OnEventOpen(MiniGameType type, int gameLevel, string name, int entranceFee)
+    {
+        var config = this._gameContext?.Configuration;
+        if (config is null)
+        {
+            return;
+        }
+
+        // 查找 MiniGameDefinition 用于等级过滤
+        var mgDef = config.MiniGameDefinitions
+            .FirstOrDefault(d => d.Type == type && d.GameLevel == gameLevel);
+        if (mgDef is null)
+        {
+            this._logger.LogWarning("[EventBroadcaster] 未找到 MiniGameDefinition: {Type} Lv.{Level}", type, gameLevel);
+            return;
+        }
+
+        // 遍历所有活跃 AI，按等级过滤分发
+        foreach (var kvp in this._activePlayers)
+        {
+            var aiPlayer = kvp.Value;
+            var level = aiPlayer.Level;
+
+            // 等级过滤
+            if (level < mgDef.MinimumCharacterLevel)
+            {
+                continue;
+            }
+
+            if (mgDef.MaximumCharacterLevel > 0 && level > mgDef.MaximumCharacterLevel)
+            {
+                continue;
+            }
+
+            // 通过 HeartbeatService 分发事件
+            var heartbeat = aiPlayer.Logic?.GetHeartbeat();
+            if (heartbeat is IEventBroadcaster broadcaster)
+            {
+                broadcaster.OnEventOpen(type, gameLevel, name, entranceFee);
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    void IEventBroadcaster.OnEventReminder(MiniGameType type, int gameLevel, string name, int minutesLeft)
+    {
+        var config = this._gameContext?.Configuration;
+        if (config is null)
+        {
+            return;
+        }
+
+        var mgDef = config.MiniGameDefinitions
+            .FirstOrDefault(d => d.Type == type && d.GameLevel == gameLevel);
+        if (mgDef is null)
+        {
+            return;
+        }
+
+        foreach (var kvp in this._activePlayers)
+        {
+            var aiPlayer = kvp.Value;
+            var level = aiPlayer.Level;
+
+            if (level < mgDef.MinimumCharacterLevel)
+            {
+                continue;
+            }
+
+            if (mgDef.MaximumCharacterLevel > 0 && level > mgDef.MaximumCharacterLevel)
+            {
+                continue;
+            }
+
+            var heartbeat = aiPlayer.Logic?.GetHeartbeat();
+            if (heartbeat is IEventBroadcaster broadcaster2)
+            {
+                broadcaster2.OnEventReminder(type, gameLevel, name, minutesLeft);
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    void IEventBroadcaster.OnEventClosed(MiniGameType type, int gameLevel, string name)
+    {
+        var config = this._gameContext?.Configuration;
+        if (config is null)
+        {
+            return;
+        }
+
+        var mgDef = config.MiniGameDefinitions
+            .FirstOrDefault(d => d.Type == type && d.GameLevel == gameLevel);
+        if (mgDef is null)
+        {
+            return;
+        }
+
+        foreach (var kvp in this._activePlayers)
+        {
+            var aiPlayer = kvp.Value;
+            var level = aiPlayer.Level;
+
+            if (level < mgDef.MinimumCharacterLevel)
+            {
+                continue;
+            }
+
+            if (mgDef.MaximumCharacterLevel > 0 && level > mgDef.MaximumCharacterLevel)
+            {
+                continue;
+            }
+
+            var heartbeat = aiPlayer.Logic?.GetHeartbeat();
+            if (heartbeat is IEventBroadcaster broadcaster3)
+            {
+                broadcaster3.OnEventClosed(type, gameLevel, name);
+            }
+        }
     }
 
     // ==================== IAiDebugService Implementation ====================

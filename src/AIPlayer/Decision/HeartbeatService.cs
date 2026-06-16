@@ -28,7 +28,7 @@ using MUnique.OpenMU.GameLogic.Views;
 /// 不再调用 MissionBoardService 的任何服务方法（InitializeAsync 除外）。
 /// SelectNext/Advance 逻辑迁入决策系统自身。
 /// </summary>
-public sealed class HeartbeatService
+public sealed class HeartbeatService : IEventBroadcaster
 {
     private readonly AiPlayer _player;
     private readonly MissionBoardService _missionBoard;
@@ -51,9 +51,6 @@ public sealed class HeartbeatService
     private ItemPickupManager _itemPickupManager;
     private MaterialKnowledgeService _materialKnowledge;
     private MaterialFarmModule _materialFarm;
-
-    /// <summary>事件活动广播器 — 监听活动事件开放/关闭状态。</summary>
-    private readonly EventWatcherService _eventWatcher;
 
     /// <summary>事件中断决策服务 — 判断是否中断当前任务去参加事件。</summary>
     private readonly EventInterruptService _eventInterrupt;
@@ -164,8 +161,6 @@ public sealed class HeartbeatService
         this._itemPickupManager = new ItemPickupManager(player, adapter, context, logger, this._valueAssessment);
         this._modules["item_pickup_manager"] = this._itemPickupManager;
 
-        this._eventWatcher = new EventWatcherService(player, this.EventBus, logger);
-
         this._eventInterrupt = new EventInterruptService(player, logger);
         this._vaultService = new VaultService(player, logger);
 
@@ -186,9 +181,9 @@ public sealed class HeartbeatService
         this.EventBus.Subscribe<StuckEvent>(OnStuck);
         this.EventBus.Subscribe<QuestItemDroppedEvent>(OnQuestItemDropped);
         this.EventBus.Subscribe<NpcInRangeEvent>(OnNpcInRange);
-        this.EventBus.Subscribe<EventOpenEvent>(OnEventOpen);
-        this.EventBus.Subscribe<EventReminderEvent>(OnEventReminder);
-        this.EventBus.Subscribe<EventClosedEvent>(OnEventClosed);
+        this.EventBus.Subscribe<EventOpenEvent>(evt => ((IEventBroadcaster)this).OnEventOpen(evt.Type, evt.GameLevel, evt.Name, evt.EntranceFee));
+        this.EventBus.Subscribe<EventReminderEvent>(evt => ((IEventBroadcaster)this).OnEventReminder(evt.Type, evt.GameLevel, evt.Name, evt.MinutesLeft));
+        this.EventBus.Subscribe<EventClosedEvent>(evt => ((IEventBroadcaster)this).OnEventClosed(evt.Type, evt.GameLevel, evt.Name));
 
         if (adapter is GameAdapter ga)
         {
@@ -220,9 +215,6 @@ public sealed class HeartbeatService
         {
             ga.DrainChatMessages();
         }
-
-        // 扫描活动事件状态 → 发布状态变更事件（下一 tick 的 DrainEvents 处理）
-        await this._eventWatcher.CheckEventsAsync().ConfigureAwait(false);
 
         this._missionBoard.SyncPlayerState();
 
@@ -1653,6 +1645,26 @@ public sealed class HeartbeatService
         {
             this.MarkTaskFailed(existing, FailureReason.NotExecutable);
         }
+    }
+
+    // ===================== IEventBroadcaster Explicit Implementation =====================
+
+    /// <inheritdoc />
+    void IEventBroadcaster.OnEventOpen(MiniGameType type, int gameLevel, string name, int entranceFee)
+    {
+        this.OnEventOpen(new EventOpenEvent(type, gameLevel, name, entranceFee));
+    }
+
+    /// <inheritdoc />
+    void IEventBroadcaster.OnEventReminder(MiniGameType type, int gameLevel, string name, int minutesLeft)
+    {
+        this.OnEventReminder(new EventReminderEvent(type, gameLevel, name, minutesLeft));
+    }
+
+    /// <inheritdoc />
+    void IEventBroadcaster.OnEventClosed(MiniGameType type, int gameLevel, string name)
+    {
+        this.OnEventClosed(new EventClosedEvent(type, gameLevel, name));
     }
 
     #endregion
