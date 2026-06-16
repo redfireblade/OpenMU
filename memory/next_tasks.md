@@ -1,6 +1,6 @@
 # next_tasks.md — 下一阶段任务列表
 
-> 最后更新: 2026-06-15
+> 最后更新: 2026-06-16
 > 状态: 生效
 
 ---
@@ -29,6 +29,15 @@ AI角色多任务优先级循环体系已基本建设完成。决策引擎是 6 
 - MaterialKnowledgeService: 配置扫描+DropItemGroups修复
 - MaterialFarmModule: 定向刷怪物材料+等级匹配
 - 恶魔广场门票全链路: 配置→按等级打材料→合成(80%成功率)→重试
+- EventWatcherService 独立化为AI群体级服务(Timer驱动,不依赖AI存活)
+- IEventBroadcaster 接口定义 3 方法
+- 编译通过(0 errors), 233文件, 66.7K行新增
+
+## 待验证/已知问题
+
+1. ⚠️ EventWatcher 独立化后需等活动窗口验证状态检测和广播
+2. ⚠️ 合成端到端需等 AI 打够材料才能验证(掉落是概率事件)
+3. ⚠️ AI 在 Dungeon 等高危地图持续死亡问题仍未完全解决
 
 ## 本会话验证结果 (2026-06-16)
 
