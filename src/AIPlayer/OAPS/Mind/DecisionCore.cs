@@ -93,10 +93,23 @@ public sealed class DecisionCore
         return DecisionResult.NoAction();
     }
 
-    /// <summary>三轨决策（向后兼容 — 被 CognitiveLoop 调用，当前未激活LLM推理）。</summary>
+    /// <summary>三轨决策（向后兼容 — 包含快速生存规则）。</summary>
     public async ValueTask<DecisionResult> Decide(OAPS.World.WorldState state, PerceptContext? context = null, PersonalityEngine? personality = null)
     {
-        // v4.0: 当前 Phase 未启用 LLM 推理，CognitiveLoop 返回 NoAction
+        // Fast survival rules (Track 1 equivalent, backward compat)
+        if (state.Self.MaxHP > 0)
+        {
+            var hpPct = (float)state.Self.HP / state.Self.MaxHP;
+            if (hpPct < 0.05f)
+                return new DecisionResult { ActionName = "flee", Priority = 1, Reason = "HP < 5%" };
+            if (hpPct < 0.20f)
+                return new DecisionResult { ActionName = "use_hp_potion", Priority = 2, Reason = "HP < 20%" };
+        }
+
+        // Check habits
+        var habit = _inertia.TryHabit(state);
+        if (habit is not null) return habit;
+
         return DecisionResult.NoAction();
     }
 
@@ -118,6 +131,9 @@ public sealed record DecisionResult
     public StepResult ExecutionResult { get; init; }
     public object? Payload { get; init; }
 
+    /// <summary>向后兼容：习惯生成标记。</summary>
+    public bool IsHabit { get; init; }
+
     /// <summary>向后兼容：映射 ActionName 到 DecisionAction 枚举。</summary>
     public DecisionAction Action => ActionName switch
     {
@@ -125,6 +141,8 @@ public sealed record DecisionResult
         "survival" or "patrol" => DecisionAction.Patrol,
         "inventory" or "pickup" => DecisionAction.Pickup,
         "quest" or "interact" => DecisionAction.Interact,
+        "use_hp_potion" => DecisionAction.UseHealthPotion,
+        "flee" => DecisionAction.Flee,
         "wait" => DecisionAction.Wait,
         _ => DecisionAction.Wait,
     };
@@ -162,6 +180,25 @@ public sealed class BehaviorInertiaEngine
     public bool TryHabit(string actionName) =>
         _habits.TryGetValue(actionName, out var h) && h.Strength > 0.6f;
 
+    /// <summary>向后兼容：检查习惯是否匹配（忽略WorldState）。</summary>
+    public DecisionResult? TryHabit(OAPS.World.WorldState state)
+    {
+        foreach (var kvp in _habits)
+        {
+            if (kvp.Value.Strength > 0.6f)
+            {
+                return new DecisionResult
+                {
+                    ActionName = kvp.Key,
+                    Priority = 3,
+                    Reason = $"习惯: {kvp.Key}",
+                    IsHabit = true,
+                };
+            }
+        }
+        return null;
+    }
+
     public void Record(string actionName, bool success)
     {
         if (!_habits.TryGetValue(actionName, out var habit))
@@ -176,6 +213,10 @@ public sealed class BehaviorInertiaEngine
         habit.Strength = Math.Min(1.0f, habit.SuccessCount / 3f);
         habit.LastPerformed = DateTime.UtcNow;
     }
+
+    /// <summary>向后兼容：3 参数 Record（忽略 WorldState）。</summary>
+    public void Record(string actionName, bool success, OAPS.World.WorldState? state)
+        => Record(actionName, success);
 }
 
 /// <summary>习惯记录。</summary>

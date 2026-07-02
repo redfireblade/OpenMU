@@ -294,13 +294,15 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
                 aiPlayer.Position.X,
                 aiPlayer.Position.Y);
 
-            // F7: Register FuguOrchestrator with CMA-ES evolution service
+            // F7: Register with CMA-ES evolution service
             if (_fuguEvolution is not null && aiPlayer.Logic?.FuguOrchestrator is not null)
             {
                 _fuguEvolution.RegisterOrchestrator(aiPlayer.Logic.FuguOrchestrator);
-                this._logger.LogDebug("[FuguEvolution] Registered {Char} for CMA-ES swarm",
-                    config.CharacterName);
             }
+
+            // F10: Register worker with SwarmOrchestrator → Kanban task assignment
+            var workerId = config.CharacterName ?? playerId.ToString("N")[..8];
+            _swarmOrchestrator?.RegisterWorker(workerId, _kanbanBoard!);
 
             return new AiPlayerCreateResult(true, playerId, null);
         }
@@ -391,6 +393,9 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
             {
                 _fuguEvolution.RegisterOrchestrator(aiPlayer.Logic.FuguOrchestrator);
             }
+
+            // F10: SwarmOrchestrator worker registration
+            _swarmOrchestrator?.RegisterWorker(characterName, _kanbanBoard!);
 
             return new AiPlayerCreateResult(true, playerId, null);
         }
