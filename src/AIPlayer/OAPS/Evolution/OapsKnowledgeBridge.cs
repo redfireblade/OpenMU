@@ -1,0 +1,128 @@
+// <copyright file="OapsKnowledgeBridge.cs" company="MUnique">
+// Licensed under the MIT License. See LICENSE file in the project root for full license information.
+// </copyright>
+
+namespace OAPS.Evolution;
+
+using System.IO;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using MUnique.OpenMU.AIPlayer;
+using MUnique.OpenMU.AIPlayer.Decision;
+
+/// <summary>
+/// OAPS 知识桥梁 — 连接分析结果和 AI 执行引擎。
+/// 使用 Segmenter + Bucket 管线替代旧的平面 PatternAnalyzer。
+/// </summary>
+public sealed class OapsKnowledgeBridge
+{
+    private readonly BehaviorEventStore _eventStore;
+    private readonly RuleEngine? _ruleEngine;
+    private readonly ILogger _logger;
+    private readonly BehaviorSegmenter _segmenter;
+    private readonly CapabilityBucketStore _bucketStore;
+
+    public OapsKnowledgeBridge(BehaviorEventStore eventStore, RuleEngine? ruleEngine, ILogger logger)
+    {
+        ArgumentNullException.ThrowIfNull(eventStore);
+        ArgumentNullException.ThrowIfNull(logger);
+        _eventStore = eventStore;
+        _ruleEngine = ruleEngine;
+        _logger = logger;
+        _segmenter = new BehaviorSegmenter();
+        _bucketStore = new CapabilityBucketStore();
+    }
+
+    public OapsKnowledgeBridge(BehaviorEventStore eventStore, ILogger logger) : this(eventStore, null, logger) { }
+
+    /// <summary>执行完整学习闭环：分段 → 归桶 → 蒸馏 → 规则注入 → 脚本生成。</summary>
+    public void SyncLearning(string playerName)
+    {
+        try
+        {
+            var allEvents = _eventStore.GetEvents(playerName);
+            if (allEvents.Count == 0) return;
+            var events = allEvents.Count > 500 ? allEvents.Skip(allEvents.Count - 500).ToList() : [.. allEvents];
+
+            // 1. 分段
+            var segments = _segmenter.Segmentate(events);
+            if (segments.Count == 0) return;
+
+            // 2. 推断能力标签
+            foreach (var seg in segments)
+                seg.CapacityLabel ??= InferCapacity(seg);
+
+            // 3. 归桶
+            _bucketStore.BucketSegments(segments);
+            _logger.LogInformation("[OAPS] {P}: {Seg}段 → {Buck}桶", playerName, segments.Count, _bucketStore.GetAllBuckets().Count);
+
+            // 4. 合并
+            foreach (var m in segments.Select(s => s.MapNumber).Distinct())
+            {
+                var merges = _bucketStore.Consolidate(m);
+                if (merges.Count > 0)
+                    _logger.LogInformation("[OAPS] 地图{m} 合并 {M} 桶", m, merges.Count);
+            }
+
+            // 5. 蒸馏 → 规则注入
+            var ready = _bucketStore.GetBucketsReadyForDistill();
+            if (ready.Count > 0 && _ruleEngine is not null)
+            {
+                var defs = ready.Select(b => new RuleDef(
+                    $"learned_{b.Capacity}_{playerName}", 50, "learned",
+                    $"on_map_{b.MapNumber}", $"hunt_spot_{b.MapNumber}_{b.Capacity}",
+                    0, 0, null, null,
+                    $"从{playerName}学到的{b.Capacity}({b.EvidenceCount}条)",
+                    null, true, (float)Math.Min(1.0, b.EvidenceCount / 5.0)
+                )).ToList();
+                _ruleEngine.AddLearnedRules(defs);
+                foreach (var b in ready) _bucketStore.MarkDistilled(b.BucketId);
+                _logger.LogInformation("[OAPS] 注入 {C} 条蒸馏规则", defs.Count);
+            }
+
+            // 6. 生成脚本
+            var patterns = new AllPatternsResult();
+            patterns.Hunting.AddRange(segments.Where(s => s.SegmentType == SegmentType.Hunting).Select(s =>
+                new HuntingPattern { MapNumber = s.MapNumber, X = s.StartX, Y = s.StartY,
+                    MonsterNumber = s.MonsterNumber ?? 0, KillCount = s.KillCount,
+                    Confidence = Math.Min(1.0, s.KillCount / 10.0),
+                    FirstObserved = s.StartTime, LastObserved = s.EndTime }));
+            var potEvts = events.Where(e => e.EventType == BehaviorEventType.PotionBought).ToList();
+            if (potEvts.Count > 0) patterns.Potions.Add(new PotionPattern { IsHpPotion = true, ThresholdPercent = 0.4, SampleCount = potEvts.Count, Confidence = 0.5 });
+            var skEvts = events.Where(e => e.SkillNumber.HasValue).ToList();
+            if (skEvts.Count > 0) patterns.Skills.AddRange(skEvts.GroupBy(e => e.SkillNumber!.Value).Select(g =>
+                new SkillPattern { SkillNumber = g.Key, UseCount = g.Count(), PreferredDistance = 0, Confidence = Math.Min(1.0, g.Count() / 5.0) }));
+
+            // NPC 交互模式 — 从原始事件中分析 NPC 对话/Buff 行为
+            var analyzer = new BehaviorPatternAnalyzer();
+            patterns.NpcInteractions = analyzer.AnalyzeNpcInteractionPatterns(events);
+
+            var script = new ScriptGenerator().GenerateFromPatterns(patterns, playerName, events.Max(e => e.Level));
+            if (script.Script.PriorityChain.Count > 0)
+            {
+                var dir = Path.Combine(AppContext.BaseDirectory, "scripts", "learned");
+                Directory.CreateDirectory(dir);
+                var path = Path.Combine(dir, $"learned_{playerName}.json");
+                File.WriteAllText(path, JsonSerializer.Serialize(script.Script, new JsonSerializerOptions { WriteIndented = true }));
+                _logger.LogInformation("[OAPS] 脚本 {Path} ({N}节点)", path, script.Script.PriorityChain.Count);
+            }
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "[OAPS] SyncLearning({P}) 异常", playerName); }
+    }
+
+    public void SyncAll()
+    {
+        foreach (var name in _eventStore.CharacterNames)
+        {
+            try { SyncLearning(name); } catch { }
+        }
+    }
+
+    private static string InferCapacity(BehaviorSegment seg) => seg.SegmentType switch
+    {
+        SegmentType.Hunting => seg.MonsterNumber.HasValue ? $"hunt-mob-{seg.MonsterNumber}" : "hunt",
+        SegmentType.Restock => "restock",
+        SegmentType.Quest => "quest",
+        _ => "unknown",
+    };
+}

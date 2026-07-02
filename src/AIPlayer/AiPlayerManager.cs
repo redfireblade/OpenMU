@@ -15,6 +15,10 @@ using MUnique.OpenMU.GameLogic.MiniGames;
 using MUnique.OpenMU.Persistence;
 using MUnique.OpenMU.AIPlayer.Scripting;
 using MUnique.OpenMU.AIPlayer.Decision;
+using System.IO;
+using System.Text.Json;
+using MUnique.OpenMU.AIPlayer.Scripting;
+using OAPS.Evolution;
 
 /// <summary>
 /// Manages the lifecycle of all AI player entities.
@@ -22,6 +26,9 @@ using MUnique.OpenMU.AIPlayer.Decision;
 /// </summary>
 public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadcaster, IDisposable
 {
+    /// <inheritdoc/>
+    public GameConfiguration? GameConfiguration => this._gameContext?.Configuration;
+
     private readonly ConcurrentDictionary<Guid, AiPlayer> _activePlayers = new();
     private IGameContext? _gameContext;
     private readonly ILogger<AiPlayerManager> _logger;
@@ -32,6 +39,69 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
     /// 不依赖任何单个 AI 角色的生命周期。
     /// </summary>
     private EventWatcherService? _eventWatcher;
+
+    /// <summary>OAPS 旁观者系统 — 包装 PBO 采集行为事件。</summary>
+    private OapsObserver? _oapsObserver;
+
+    /// <summary>OAPS 知识桥接器 — 学习闭环协调。</summary>
+    private OapsKnowledgeBridge? _knowledgeBridge;
+
+    /// <summary>全局规则引擎 — AI 角色决策系统的共享规则库。</summary>
+    /// 旁观者系统学习的经验规则注入到此引擎，所有 AI 角色共享。
+    /// 各 AI 角色的 HeartbeatService 从此引擎读取规则驱动行为。
+    /// 这是"观察者学习→决策系统执行"解耦架构的核心桥梁。</summary>
+    private Decision.RuleEngine? _sharedRuleEngine;
+
+    /// <summary>学习同步定时器 — 每 60 秒调用一次 SyncAll。</summary>
+    private Timer? _syncTimer;
+
+    /// <summary>群体进化引擎。</summary>
+    private SwarmEvolution? _swarmEvolution;
+
+    /// <summary>进化定时器 — 每 5 分钟。</summary>
+    private Timer? _evolutionTimer;
+
+    /// <summary>Fugu v4.0 共享记忆层（全局单例，跨所有 AI 角色）。</summary>
+    private Knowledge.SharedMemoryLayer? _sharedMemory;
+
+    /// <summary>Fugu v4.0 CMA-ES 群体进化服务（每 5 分钟自动进化）。</summary>
+    private OAPS.Evolution.FuguEvolutionService? _fuguEvolution;
+
+    /// <summary>Fugu v4.0 群体编排器（全局事件→子任务分配）。</summary>
+    private OAPS.Evolution.SwarmOrchestrator? _swarmOrchestrator;
+
+    /// <summary>Fugu v4.0 群体 Rewards 聚合器。</summary>
+    private OAPS.Evolution.SwarmRewardAggregator? _rewardAggregator;
+
+    /// <summary>Fugu v4.0 SFT 训练器 — 离线训练 SoftRouter 权重。</summary>
+    private OAPS.Evolution.FuguSftTrainer? _fuguSftTrainer;
+
+    /// <summary>SFT 训练定时器 — 每 10 分钟。</summary>
+    private Timer? _sftTrainingTimer;
+
+    /// <summary>Fugu v4.0 冷启动引导器 — 从领域知识生成初始 SFT 权重。</summary>
+    private OAPS.Evolution.FuguColdStartBootstrapper? _fuguBootstrapper;
+
+    /// <summary>Fugu v4.0 Worker 可用性追踪 — 死亡/断线检测 + 动态聚合器选择。</summary>
+    private OAPS.Evolution.WorkerAvailabilityService? _workerAvailability;
+
+    /// <summary>行为事件存储 — 持久化玩家离散行为。</summary>
+    private BehaviorEventStore? _behaviorEventStore;
+
+    /// <summary>玩家行为观察器 — 分析真实玩家行为模式。</summary>
+    private PlayerBehaviorObserver? _pbo;
+
+    /// <summary>群体影子地图 — 跨角色知识融合。</summary>
+    private GlobalShadowMap? _globalShadowMap;
+
+    /// <summary>集体经验记忆 — 全服打怪/金币/死亡统计。</summary>
+    private ExperienceMemory? _collectiveExpMem;
+
+    /// <summary>OAPS 懒初始化锁。</summary>
+    private readonly object _oapsLock = new();
+
+    /// <summary>PBO 观察循环取消令牌。</summary>
+    private CancellationTokenSource? _pboCts;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="AiPlayerManager"/> class.
@@ -89,6 +159,9 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
                     {
                         this._eventWatcher = new EventWatcherService(ctx, this, this._logger);
                     }
+
+                    // OAPS 学习系统自动初始化
+                    this.EnsureOapsInitialized();
                 }
             }
 
@@ -175,6 +248,18 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
                 }
             }
 
+            // Initialize Fugu v4.0 + AiCollector before AI logic starts
+            if (_sharedMemory is not null)
+            {
+                aiPlayer.SharedMemory = _sharedMemory;
+            }
+
+            aiPlayer.BehaviorEventStore = _behaviorEventStore;
+            aiPlayer.SftWeightsPath = Path.Combine(AppContext.BaseDirectory, "scripts", "learned", "fugu_sft_weights_bootstrap.bin");
+
+            // 注意：不自动加载学习脚本到 ScriptPath。
+            // 学习脚本是旁观者系统(OAPS)的输出记录，AI角色始终由决策系统(HeartbeatService+RuleEngine)驱动。
+            // 旁观者系统通过 RuleEngine.AddLearnedRules() 注入经验规则，而非替换 AI 决策模式。
             if (!await aiPlayer.InitializeAsync(account!, character!, needsAttach: loadedFromDb).ConfigureAwait(false))
             {
                 this._activePlayers.TryRemove(playerId, out _);
@@ -266,6 +351,15 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
 
         try
         {
+            // Initialize Fugu v4.0 + AiCollector before AI logic starts
+            if (_sharedMemory is not null)
+            {
+                aiPlayer.SharedMemory = _sharedMemory;
+            }
+
+            aiPlayer.BehaviorEventStore = _behaviorEventStore;
+            aiPlayer.SftWeightsPath = Path.Combine(AppContext.BaseDirectory, "scripts", "learned", "fugu_sft_weights_bootstrap.bin");
+
             if (!await aiPlayer.InitializeAsync(account, character, needsAttach: true).ConfigureAwait(false))
             {
                 this._activePlayers.TryRemove(playerId, out _);
@@ -368,6 +462,10 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
 
         // 停止群体级事件广播器
         this._eventWatcher?.Dispose();
+
+        // 停止 PBO 观察循环
+        try { _pboCts?.Cancel(); } catch { }
+        _pboCts?.Dispose();
     }
 
     /// <summary>
@@ -813,7 +911,7 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
         var potionDefs = gameContext.Configuration.Items
             .Where(i => i.Group == 14 && i.Number is >= 1 and <= 6)
             .ToDictionary(i => i.Number);
-        byte slot = 0;
+        byte slot = DataModel.InventoryConstants.EquippableSlotsCount; // 12 = first inv slot after equipment
         foreach (var num in new byte[] { 1, 2, 3, 4, 5, 6 })
         {
             if (potionDefs.TryGetValue(num, out var def))
@@ -864,8 +962,19 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
 
         if (mapDefinition is not null)
         {
-            character.PositionX = 130;
-            character.PositionY = 130;
+            // Try SpawnGate first, then any ExitGate, then any gate
+            var gate = mapDefinition.ExitGates?.Where(g => g.IsSpawnGate).SelectRandom()
+                       ?? mapDefinition.ExitGates?.SelectRandom();
+            if (gate is not null)
+            {
+                character.PositionX = (byte)Random.Shared.Next(gate.X1, gate.X2 + 1);
+                character.PositionY = (byte)Random.Shared.Next(gate.Y1, gate.Y2 + 1);
+            }
+            else
+            {
+                character.PositionX = 130;
+                character.PositionY = 130;
+            }
         }
 
         // Initialize empty QuestStates so quest module can create new quest states.
@@ -880,5 +989,314 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
         account.PasswordHash = string.Empty;
 
         return (account, character);
+    }
+
+    // ==================== OAPS Bridge Members ====================
+
+    /// <summary>
+    /// Ensures OAPS components are initialized (lazy, once).
+    /// </summary>
+    private void EnsureOapsInitialized()
+    {
+        if (_pbo is not null) return;
+        lock (_oapsLock)
+        {
+            if (_pbo is not null) return;
+            try
+            {
+                var ctx = Context;
+                var logger = _logger;
+                var dataDir = Path.Combine(AppContext.BaseDirectory, "scripts", "learned");
+                Directory.CreateDirectory(dataDir);
+
+                _collectiveExpMem = new ExperienceMemory
+                {
+                    CharacterName = "collective",
+                    LastUpdated = DateTime.UtcNow,
+                };
+
+                _behaviorEventStore = new BehaviorEventStore(dataDir, logger);
+                _pbo = new PlayerBehaviorObserver(ctx, _collectiveExpMem, logger);
+                _pbo.SetEventStore(_behaviorEventStore);
+
+                _oapsObserver = new OapsObserver(_pbo, _behaviorEventStore, logger);
+                _globalShadowMap = new GlobalShadowMap(dataDir, logger);
+
+                // 创建全局共享规则引擎 — 所有 AI 角色的决策系统从这里读取规则
+                // 旁观者系统学习的经验规则也注入到此引擎（解耦架构：观察者不直接控制AI）
+                // 注意：ScriptLibrary 需要 AiPlayer 实例才能在运行时解析脚本ID，
+                // 在 AiPlayerManager 层面用 null 创建共享 RuleEngine，仅用于接收学习规则。
+                // 各 AI 角色自己的 HeartbeatService 仍创建独立的 RuleEngine 用于实际决策。
+                _sharedRuleEngine = new Decision.RuleEngine(logger);
+
+                _knowledgeBridge = new OapsKnowledgeBridge(_behaviorEventStore, _sharedRuleEngine, logger);
+
+                // Start PBO tick loop (~4s) — scan real players, collect behavior data
+                _pboCts = new CancellationTokenSource();
+                var ct = _pboCts.Token;
+                _ = Task.Run(async () =>
+                {
+                    while (!ct.IsCancellationRequested)
+                    {
+                        try
+                        {
+                            _oapsObserver?.Observe();
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning(ex, "[OAPS] PBO Observe error");
+                        }
+
+                        await Task.Delay(4000, ct).ConfigureAwait(false);
+                    }
+                }, ct);
+
+                // Start sync timer (60s) — SyncLearning for each observed player
+                _syncTimer = new Timer(_ =>
+                {
+                    try { _knowledgeBridge?.SyncAll(); }
+                    catch (Exception ex) { logger.LogWarning(ex, "[OAPS] SyncAll error"); }
+                }, null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+
+                // 学习脚本文件监控 — 当 OapsKnowledgeBridge 写出新的 learned_{Name}.json 时，
+                // 自动热加载到对应的 AI 玩家
+                try
+                {
+                    var learnedDir = Path.Combine(AppContext.BaseDirectory, "scripts", "learned");
+                    Directory.CreateDirectory(learnedDir);
+                    var watcher = new FileSystemWatcher(learnedDir, "learned_*.json")
+                    {
+                        EnableRaisingEvents = true,
+                        NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName,
+                    };
+                    void ReloadScriptForPlayer(string fullPath, string fileName)
+                    {
+                        try
+                        {
+                            // learned_fashi01.json → "fashi01"
+                            var nameOnly = Path.GetFileNameWithoutExtension(fileName);
+                            var charName = nameOnly?.StartsWith("learned_") == true ? nameOnly["learned_".Length..] : null;
+                            if (charName is null || charName.Length == 0) return;
+
+                            // Wait for file write to complete
+                            for (int retry = 0; retry < 5; retry++)
+                            {
+                                try { using var fs = File.Open(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read); break; }
+                                catch { Thread.Sleep(200); }
+                            }
+
+                            // 找到对应的 AI 玩家并热加载脚本
+                            foreach (var kvp in _activePlayers)
+                            {
+                                if (kvp.Value.SelectedCharacter?.Name == charName && !kvp.Value.IsDisposed)
+                                {
+                                    var script = Scripting.ScriptExecutor.LoadFromFile(fullPath);
+                                    if (script is not null)
+                                    {
+                                        kvp.Value.Logic?.ReloadScript(script);
+                                        logger.LogInformation("[OAPS] Hot-reloaded script for {Name}", charName);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        catch (Exception ex) { logger.LogWarning(ex, "[OAPS] Script watcher error"); }
+                    }
+
+                    watcher.Changed += (_, e) => { if (e.Name is not null) ReloadScriptForPlayer(e.FullPath, e.Name); };
+                    watcher.Created += (_, e) => { if (e.Name is not null) ReloadScriptForPlayer(e.FullPath, e.Name); };
+                    logger.LogInformation("[OAPS] Script watcher active on {Dir}", learnedDir);
+                }
+                catch (Exception ex) { logger.LogWarning(ex, "[OAPS] Failed to start script watcher"); }
+
+                logger.LogInformation("[OAPS] OAPS learning system initialized");
+
+                // ═══ Fugu v4.0 Component Initialization ═══
+                try
+                {
+                    _sharedMemory = new Knowledge.SharedMemoryLayer(
+                        _logger as Microsoft.Extensions.Logging.ILogger<Knowledge.SharedMemoryLayer>
+                        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<Knowledge.SharedMemoryLayer>.Instance);
+
+                    _fuguEvolution = new OAPS.Evolution.FuguEvolutionService(
+                        _logger as Microsoft.Extensions.Logging.ILogger<OAPS.Evolution.FuguEvolutionService>
+                        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<OAPS.Evolution.FuguEvolutionService>.Instance);
+
+                    _swarmOrchestrator = new OAPS.Evolution.SwarmOrchestrator(
+                        _sharedMemory,
+                        _logger as Microsoft.Extensions.Logging.ILogger<OAPS.Evolution.SwarmOrchestrator>
+                        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<OAPS.Evolution.SwarmOrchestrator>.Instance);
+
+                    _rewardAggregator = new OAPS.Evolution.SwarmRewardAggregator(
+                        _sharedMemory,
+                        _logger as Microsoft.Extensions.Logging.ILogger<OAPS.Evolution.SwarmRewardAggregator>
+                        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<OAPS.Evolution.SwarmRewardAggregator>.Instance);
+
+                    _fuguEvolution.Start();
+                    _swarmOrchestrator.Start();
+                    _rewardAggregator.Start();
+
+                    // Initialize SFT trainer
+                    var softBucketStore = new OAPS.Evolution.SoftBucketStore(
+                        _logger as Microsoft.Extensions.Logging.ILogger
+                        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+                    _fuguSftTrainer = new OAPS.Evolution.FuguSftTrainer(
+                        _behaviorEventStore!, softBucketStore,
+                        _logger as Microsoft.Extensions.Logging.ILogger<OAPS.Evolution.FuguSftTrainer>
+                        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<OAPS.Evolution.FuguSftTrainer>.Instance);
+
+                    // SFT training timer: every 10 minutes
+                    _sftTrainingTimer = new Timer(_ =>
+                    {
+                        try
+                        {
+                            if (_fuguSftTrainer.TrainIfNeeded())
+                            {
+                                // Push trained weights to all running orchestrators
+                                foreach (var (_, aiPlayer) in _activePlayers)
+                                {
+                                    if (aiPlayer.Logic?.FuguOrchestrator is { } orch)
+                                    {
+                                        _fuguSftTrainer.LoadIntoRouter(orch.Router);
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "[FuguSFT] Periodic training error");
+                        }
+                    }, null, TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(10));
+
+                    // Bootstrapper: generate non-random initial SFT weights
+                    _fuguBootstrapper = new OAPS.Evolution.FuguColdStartBootstrapper(
+                        _logger as Microsoft.Extensions.Logging.ILogger<OAPS.Evolution.FuguColdStartBootstrapper>
+                        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<OAPS.Evolution.FuguColdStartBootstrapper>.Instance);
+                    var bootWeights = _fuguBootstrapper.BootstrapWeights();
+
+                    // Worker availability tracker
+                    _workerAvailability = new OAPS.Evolution.WorkerAvailabilityService(
+                        _logger as Microsoft.Extensions.Logging.ILogger<OAPS.Evolution.WorkerAvailabilityService>
+                        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<OAPS.Evolution.WorkerAvailabilityService>.Instance);
+
+                    logger.LogInformation("[Fugu] v4.0 components initialized: SharedMemory, Evolution, Orchestrator, Rewards, SFT, Bootstrap, Workers");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[Fugu] Failed to initialize v4.0 components (non-critical)");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[OAPS] Failed to initialize OAPS components");
+            }
+        }
+    }
+
+    /// <summary>Gets the Fugu SharedMemoryLayer (null if not initialized).</summary>
+    public Knowledge.SharedMemoryLayer? SharedMemory => _sharedMemory;
+
+    /// <summary>Gets the FuguEvolutionService (null if not initialized).</summary>
+    public OAPS.Evolution.FuguEvolutionService? FuguEvolution => _fuguEvolution;
+
+    /// <summary>Gets the SwarmOrchestrator (null if not initialized).</summary>
+    public OAPS.Evolution.SwarmOrchestrator? SwarmOrchestrator => _swarmOrchestrator;
+
+    /// <summary>Gets the SwarmRewardAggregator (null if not initialized).</summary>
+    public OAPS.Evolution.SwarmRewardAggregator? RewardAggregator => _rewardAggregator;
+
+    /// <summary>Gets all behavior records from PBO (observed player patterns).</summary>
+    public IReadOnlyDictionary<string, PlayerBehaviorObserver.BehaviorRecord> AllBehaviorRecords
+    {
+        get
+        {
+            EnsureOapsInitialized();
+            return _pbo?.AllBehaviorRecords ?? new Dictionary<string, PlayerBehaviorObserver.BehaviorRecord>(0);
+        }
+    }
+
+    /// <summary>Gets the collective experience memory.</summary>
+    public ExperienceMemory? CollectiveExpMem
+    {
+        get
+        {
+            EnsureOapsInitialized();
+            return _collectiveExpMem;
+        }
+    }
+
+    /// <summary>Gets the global shadow map.</summary>
+    public GlobalShadowMap? GlobalShadowMap
+    {
+        get
+        {
+            EnsureOapsInitialized();
+            return _globalShadowMap;
+        }
+    }
+
+    /// <summary>Gets NPC interaction records for the specified player.</summary>
+    public IReadOnlyList<PlayerBehaviorObserver.NpcInteractionRecord> GetNpcInteractions(string playerName)
+    {
+        EnsureOapsInitialized();
+        return _pbo?.GetNpcInteractions(playerName) ?? Array.Empty<PlayerBehaviorObserver.NpcInteractionRecord>();
+    }
+
+    /// <summary>Exports all behavior records as summaries.</summary>
+    public List<PlayerBehaviorObserver.BehaviorRecordExport> ExportBehaviorRecords()
+    {
+        EnsureOapsInitialized();
+        return _pbo?.ExportAllBehaviorRecords() ?? new List<PlayerBehaviorObserver.BehaviorRecordExport>(0);
+    }
+
+    /// <summary>Gets behavior events for the specified player.</summary>
+    public IReadOnlyList<BehaviorEvent> GetBehaviorEvents(string playerName)
+    {
+        EnsureOapsInitialized();
+        return _behaviorEventStore?.GetEvents(playerName) ?? Array.Empty<BehaviorEvent>();
+    }
+
+    /// <summary>Gets behavior stats summaries for all characters.</summary>
+    public Dictionary<string, string> GetAllBehaviorStats()
+    {
+        EnsureOapsInitialized();
+        var result = new Dictionary<string, string>();
+        if (_behaviorEventStore is null) return result;
+        foreach (var name in _behaviorEventStore.CharacterNames)
+        {
+            result[name] = _behaviorEventStore.GetStatsSummary(name);
+        }
+
+        return result;
+    }
+
+    /// <summary>Gets the max observed levels for all characters.</summary>
+    public Dictionary<string, int> GetBehaviorEventLevels()
+    {
+        EnsureOapsInitialized();
+        return _behaviorEventStore?.GetMaxLevels() ?? new Dictionary<string, int>(0);
+    }
+
+    /// <summary>Gets the behavior plan (leveling plan) for a character.</summary>
+    public LevelingPlan GetBehaviorPlan(string playerName)
+    {
+        EnsureOapsInitialized();
+        var events = _behaviorEventStore?.GetEvents(playerName) ?? Array.Empty<BehaviorEvent>();
+        var characterClass = events.Count > 0 ? events.FirstOrDefault()?.CharacterClass ?? 0 : 0;
+        return BehaviorPlanGenerator.GeneratePlan(playerName, characterClass, events, _logger);
+    }
+
+    /// <summary>Injects a behavior event (for testing via API).</summary>
+    public void InjectBehaviorEvent(BehaviorEvent behaviorEvent)
+    {
+        EnsureOapsInitialized();
+        _behaviorEventStore?.AddEvent(behaviorEvent);
+    }
+
+    /// <summary>Saves behavior events to disk.</summary>
+    public void SaveBehaviorEvents()
+    {
+        EnsureOapsInitialized();
+        _behaviorEventStore?.Save();
     }
 }

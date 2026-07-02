@@ -5,6 +5,7 @@
 namespace MUnique.OpenMU.AIPlayer.Scripting;
 
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -13,10 +14,13 @@ using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.Pathfinding;
 using MUnique.OpenMU.Orchestrator;
+using MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph;
 using MUnique.OpenMU.GameLogic.PlayerActions.Quests;
 using MUnique.OpenMU.DataModel.Entities;
 using MUnique.OpenMU.GameLogic.PlayerActions;
 using MUnique.OpenMU.AIPlayer.Warp;
+
+using MUnique.OpenMU.AIPlayer.Decision;
 
 /// <summary>
 /// Priority-chain script executor — the 1D runtime for AI behavior.
@@ -58,6 +62,26 @@ public sealed class ScriptExecutor
     // Cooldown for merchant attempts (subtask 4)
     private DateTime _lastFailedMerchantAttempt = DateTime.MinValue;
 
+    // Auto equip service + cooldown tracking
+    private readonly EquipmentCompareService _equipService;
+    private DateTime _lastEquipCheck = DateTime.UtcNow;
+
+    // Combat skill strategy service — dynamic AoE/single-target/buff management
+    private readonly CombatSkillService _combatSkill;
+
+    // Cached result of kg_best_farm (set by condition, consumed by subsequent actions)
+    private short? _kgBestFarmMap;
+
+    // RuntimeLearner for recording kills and drops (initialized once from KG)
+    private readonly KnowledgeGraphRuntimeLearner? _runtimeLearner;
+
+    // Zero-damage detection: consecutive attacks that dealt 0 total damage.
+    // When ≥ threshold, the target is considered immune (daily BOSS limit, level gap, etc.)
+    // and the AI gives up rather than spinning forever.
+    private IAttackable? _zeroDamageTarget;
+    private int _zeroDamageStreak;
+    private const int ZeroDamageThreshold = 5;
+
     // Navigation state
     private Point _patrolCenter;
     private int _patrolTickCounter;
@@ -81,7 +105,8 @@ public sealed class ScriptExecutor
     // constantly dropping within scan range.
     private int _pickupCooldownTicksLeft;
 
-    // E1f: script-driven route walking state
+    // Item pickup manager for script mode
+    private readonly Scripting.ItemPickupManager _pickupManager;
     private string? _scriptRouteId;
     private int _scriptRouteStep;
 
@@ -188,11 +213,32 @@ public sealed class ScriptExecutor
     private int _forceThruDeathCount;
     private bool _forceThruActive;
 
-    // General death strategy: tracks consecutive deaths since last kill.
-    // Used to escalate strategies — change hotspot → buy potions → change map.
-    // Reset to 0 on any kill (progress = AI is still effective).
+    // General death strategy: tracks consecutive deaths since last respawn.
+    // Used to escalate strategies — change hotspot → change map.
+    // Reset to 0 on hot-reload or normal script completion.
+    // NOT reset on kill (kill ≠ protection from death loop).
     // Game design: strong monsters patrol hotspots intentionally; AI must adapt.
     private int _consecutiveDeaths;
+
+    // 智能任务难度适配器
+    private readonly QuestDifficultyAdapter _questAdapter;
+
+    // 等级升级跟踪（用于任务难度适配的升级计数）
+    private int _lastRecordedLevel;
+
+    // 路径记录器（每个执行器一个，记录当前任务行走路径）
+    private AiPathRecorder? _pathRecorder;
+
+    // 路径内存存储器（持久化到JSON，每个AI角色终身累积）
+    private PathMemoryStore? _pathMemoryStore;
+
+    // 当前任务临时统计数据（完成时保存到 QuestPathRecord）
+    private int _questStepCount;
+    private int _questMoneyCollected;
+    private int _questItemsCollected;
+    private int _questExcellentItems;
+    private byte _questStartX;
+    private byte _questStartY;
 
     // AR-20: Program Counter (PC) architecture — fetch-execute-advance pipeline
     private int _programCounter;
@@ -252,6 +298,12 @@ public sealed class ScriptExecutor
         this._script = script;
         this._logger = player.Logger;
 
+        // Initialize RuntimeLearner for recording kills/drops into KG
+        if (KnowledgeGraphHolder.Graph is { } kg)
+        {
+            this._runtimeLearner = new KnowledgeGraphRuntimeLearner(kg, this._logger);
+        }
+
         // 初始化角色标签，在所有 [ScriptExec] 日志中带上角色标识
         this._charTag = "[" + (player.SelectedCharacter?.Name ?? "?") + "] ";
 
@@ -303,7 +355,50 @@ public sealed class ScriptExecutor
         this._patrolCenter = context.GameAdapter.GetPlayerPosition();
         this._lastPosition = context.GameAdapter.GetPlayerPosition();
         this._nativeExec = new NativeExecutionService(this._player, this._logger);
+        this._combatSkill = new CombatSkillService(this._player, this._logger);
+        // Initialize skill bar: place learned skills into quick slots (0-9).
+        try { new Decision.SkillBarManager(this._player, this._logger).UpdateSkillBar(); }
+        catch { /* non-critical */ }
+
+        // Override attack range from character build DNA
+        // JSON default is 6.0 (ranged), but melee classes need 2.5
+        var charClass = this._player.SelectedCharacter?.CharacterClass;
+        if (charClass is not null)
+        {
+            var baseClass = StatAllocationStrategy.GetBaseClass(charClass.Number);
+            var dna = Knowledge.CharacterBuildDnaRepository.GetAll()
+                .FirstOrDefault(d => d.BaseClassNumber == baseClass);
+            if (dna is not null && dna.IsMelee)
+                this._script.Parameters.AttackRange = 2.5f;
+        }
+
+        this._pickupManager = new Scripting.ItemPickupManager(this._player, this._context.GameAdapter, this._context, this._logger);
         this._npcService = new NpcInteractionService(player, player.Logger);
+        this._equipService = new EquipmentCompareService(player, this._context.GameAdapter, this._logger);
+
+        // 智能任务难度适配：根据死亡记录动态调整任务策略
+        this._questAdapter = new QuestDifficultyAdapter(
+            this._logger,
+            getLevel: () => this._context.GameAdapter.GetPlayerLevel(),
+            getMaxItemScore: () =>
+            {
+                var equipped = player.Inventory?.EquippedItems;
+                if (equipped is null || !equipped.Any()) return 0;
+                return equipped.Max(i => EquipmentCompareService.ScoreEquipQuality(i));
+            },
+            getPlayer: () => this._player);
+
+        // 初始化路径记录器（用于群体路径学习）
+        this._pathRecorder = new AiPathRecorder(player.SelectedCharacter?.Name ?? "Unknown");
+        try
+        {
+            var dataDir = Path.Combine(Directory.GetCurrentDirectory(), "aiplayer_data");
+            this._pathMemoryStore = new PathMemoryStore(player.SelectedCharacter?.Name ?? "Unknown", dataDir, this._logger);
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning(ex, "[PathMemory] 初始化失败，路径学习功能将不可用");
+        }
     }
 
     /// <summary>
@@ -437,7 +532,7 @@ public sealed class ScriptExecutor
         if (this._lastTarget is Monster killedMonster && !killedMonster.IsAlive)
         {
             this._killCountInWindow++;
-            this._consecutiveDeaths = 0; // progress made — reset death strategy
+            // 击杀 ≠ 死亡保护解除。死亡循环计数器只由死亡策略升级来重置。
             this.ResetIdleTimer(); // 击杀 = 明确进展，重置熔断
         }
 
@@ -551,6 +646,30 @@ public sealed class ScriptExecutor
             this._ticksAtSamePosition = 0;
         }
 
+        // 路径记录：每 tick 记录当前位置到路径数组中
+        if (this._pathRecorder is not null)
+        {
+            var pos = this._context.GameAdapter.GetPlayerPosition();
+            this._pathRecorder.RecordStep(pos);
+        }
+
+        // 升级检测 — 通知任务难度适配器（用于挂起任务的恢复条件计数）
+        var currentLevel = this._context.GameAdapter.GetPlayerLevel();
+        if (currentLevel > this._lastRecordedLevel)
+        {
+            var gained = currentLevel - this._lastRecordedLevel;
+            this._logger.LogDebug(
+                "[LevelUp]{Tag} 升级! Lv{Old}→Lv{New} (+{Gain})",
+                this._charTag, this._lastRecordedLevel, currentLevel, gained);
+            this._lastRecordedLevel = currentLevel;
+            this._questAdapter.RecordLevelUp();
+        }
+        else if (this._lastRecordedLevel == 0)
+        {
+            // 首次初始化
+            this._lastRecordedLevel = currentLevel;
+        }
+
         // 三层熔断保护 (Anti-Idle)
         // 每次 tick 递增空闲计数器；有进展时 ResetIdleTimer() 清零。
         this._idleTickCount++;
@@ -593,6 +712,43 @@ public sealed class ScriptExecutor
             this._context.CurrentTarget = null;
         }
 
+        // Phase 0a: TargetMapNumber set via API → compute warp route
+        if (this._context.ActiveWarpRoute is null && this._context.TargetMapNumber.HasValue)
+        {
+            var targetMap = this._context.TargetMapNumber.Value;
+            var currentMap = this._context.GameAdapter.GetCurrentMap();
+            var currentMapNum = currentMap?.Definition.Number ?? 0;
+
+            if (currentMapNum == targetMap)
+            {
+                // Already at target → clear and continue
+                this._context.TargetMapNumber = null;
+            }
+            else
+            {
+                var planner = this.GetWarpPlanner();
+                var level = this._context.GameAdapter.GetPlayerLevel();
+                var money = this._player.Money;
+                var route = await planner.ComputeRouteWithKgAsync((short)currentMapNum, (short)targetMap, level, money).ConfigureAwait(false);
+
+                if (route is not null && route.IsFeasible)
+                {
+                    this._logger.LogInformation("[ScriptExec] 跨图传送: 计算路线 #{From}→#{To} ({Steps}步, 金币={Gold})",
+                        currentMapNum, targetMap, route.Steps.Count, route.TotalGoldCost);
+                    this._context.ActiveWarpRoute = route;
+                    this._context.ActiveWarpStepIndex = 0;
+                    this._context.WarpInProgress = false;
+                    await this.ExecuteNextWarpStepAsync().ConfigureAwait(false);
+                }
+                else
+                {
+                    var reason = route is null ? "无可行路线" : "等级/金币不足";
+                    this._logger.LogWarning("[ScriptExec] 跨图传送失败: {From}→{To}, {Reason}",
+                        currentMapNum, targetMap, reason);
+                }
+            }
+        }
+
         // Phase 0: Warp route — exclusively drive route until complete
         if (this._context.ActiveWarpRoute is not null)
         {
@@ -631,6 +787,13 @@ public sealed class ScriptExecutor
             this._currentNodeAction = "use_mp_potion";
             await UseMpPotionAsync(this._script.Parameters).ConfigureAwait(false);
             goto BuildResult;
+        }
+
+        // Phase 1.5: Auto-equip check (every 5 seconds in script mode)
+        if ((DateTime.UtcNow - this._lastEquipCheck).TotalSeconds >= 5)
+        {
+            await this._equipService.AutoEquipIfBetterAsync().ConfigureAwait(false);
+            this._lastEquipCheck = DateTime.UtcNow;
         }
 
         // Phase 2: PC fetch-execute-advance — one node per tick
@@ -1068,6 +1231,34 @@ public sealed class ScriptExecutor
                     WalkToNpcResult.Failed => "无法到达任务NPC",
                     _ => "任务NPC交互",
                 };
+
+                // 如果是 BUFF NPC（无 QuestGroup/QuestNumber），对话后自动触发 BUFF 并关闭对话框
+                if (result == WalkToNpcResult.Fallthrough
+                    && p.QuestGroup is null or 0
+                    && p.QuestNumber is null or 0)
+                {
+                    // 尝试触发 Elf Soldier BUFF（NPC 257）
+                    if (p.QuestNpcNumber is 257)
+                    {
+                        try
+                        {
+                            var buffAction = new MUnique.OpenMU.GameLogic.PlayerActions.Quests.ElfSoldierBuffRequestAction();
+                            await buffAction.RequestBuffAsync(this._player).ConfigureAwait(false);
+                            this._logger.LogInformation("[ScriptExec]{Tag} Elf Soldier buff requested for NPC #{Npc}",
+                                this._charTag, p.QuestNpcNumber);
+                        }
+                        catch (Exception ex)
+                        {
+                            this._logger.LogWarning(ex, "[ScriptExec]{Tag} Failed to request Elf Soldier buff",
+                                this._charTag);
+                        }
+                    }
+
+                    await this._closeNpcDialog.CloseNpcDialogAsync(this._player).ConfigureAwait(false);
+                    this._logger.LogInformation("[ScriptExec]{Tag} Buff NPC dialog closed — NPC #{Npc}",
+                        this._charTag, p.QuestNpcNumber);
+                }
+
                 return new NodeExecutionResult(
                     status, nodeName, action, true,
                     result == WalkToNpcResult.Fallthrough,  // PcAdvanced: advance only on fallthrough
@@ -1084,6 +1275,23 @@ public sealed class ScriptExecutor
                 return new NodeExecutionResult(
                     NodeStatusCode.Completed, nodeName, action, true, true, false, false, null,
                     ScriptTaskState.Completed, "script completed via stop");
+            case "relocate_to_hotspot":
+            {
+                var relocateResult = await RelocateToHotspotAsync(p).ConfigureAwait(false);
+                var (status, reason) = relocateResult.Status switch
+                {
+                    // 已到达 / 无热点可换 / 全被占用 → 略过此节点
+                    RelocateStatusCode.AlreadyThere or RelocateStatusCode.NoHotspots or RelocateStatusCode.AllOccupied
+                        => (NodeStatusCode.Skipped, $"relocate: {relocateResult.Status}"),
+                    // 行走中 / 路径阻塞 → 停留在本节点（多 tick 等待抵达）
+                    RelocateStatusCode.Moving or RelocateStatusCode.PathBlocked
+                        => (NodeStatusCode.InProgress, $"relocate: {relocateResult.Status}"),
+                    // 其他（如 Success 刚发起行走）→ 也返回 InProgress
+                    _ => (NodeStatusCode.InProgress, $"relocate: {relocateResult.Status}"),
+                };
+                return new NodeExecutionResult(
+                    status, nodeName, action, true, false, false, false, null, null, reason);
+            }
             default:
                 await ExecuteActionInternalAsync(action, nodeName, p).ConfigureAwait(false);
                 return new NodeExecutionResult(
@@ -1166,6 +1374,28 @@ public sealed class ScriptExecutor
                         // General death tracking: count consecutive deaths since last kill
                         this._consecutiveDeaths++;
 
+                        // 通知任务难度适配器（如果有活跃任务）
+                        if (this._script?.Parameters?.QuestGroup is not null
+                            && this._script?.Parameters?.QuestNumber is not null)
+                        {
+                            // 获取当前目标的怪物信息（如果有）
+                            short? monsterNumber = null;
+                            short? monsterLevel = null;
+                            if (this._context.CurrentTarget is Monster monster)
+                            {
+                                monsterNumber = (short)(monster.Definition?.Number ?? 0);
+                                monsterLevel = (short)(monster.Attributes?[Stats.Level] ?? 0);
+                            }
+
+                            this._questAdapter.RecordQuestDeath(
+                                this._script.Parameters.QuestGroup.Value,
+                                this._script.Parameters.QuestNumber.Value,
+                                monsterNumber, monsterLevel);
+                        }
+
+                        // 通知 HeartbeatService 死亡事件（死亡循环检测用）
+                        this.PublishDeathEvent();
+
                         // Force-through death tracking
                         if (this._forceThruActive)
                         {
@@ -1177,16 +1407,16 @@ public sealed class ScriptExecutor
                         }
                     }
 
-                    // Death > 5 seconds — auto-revive via warp to safezone
-                    if ((DateTime.UtcNow - this._deathStartTime).TotalSeconds >= 5)
+                    // Death > 8 seconds — auto-revive via game engine's natural respawn.
+                    // NOTE: Do NOT use WarpToSafezoneAsync — that causes instant teleportation
+                    // which makes the AI "suddenly disappear and appear" on the observer's screen.
+                    // Natural respawn keeps the client position consistent.
+                    if ((DateTime.UtcNow - this._deathStartTime).TotalSeconds >= 8)
                     {
                         this._logger.LogWarning(
-                            "[ScriptExec]" + this._charTag + " 💀 Death exceeded 5s — auto-reviving...");
-                        await this._player.WarpToSafezoneAsync().ConfigureAwait(false);
-                        this._logger.LogInformation(
-                            "[ScriptExec]" + this._charTag + " ✅ WarpToSafezoneAsync complete");
+                            "[ScriptExec]" + this._charTag + " 💀 Death exceeded 8s — natural respawn...");
 
-                        // Restore HP/MP/AG/SD to full (same pattern as HeartbeatService.RespawnPlayerAsync)
+                        // Restore HP/MP to full (same pattern as HeartbeatService.RespawnPlayerAsync)
                         foreach (var regen in Stats.IntervalRegenerationAttributes)
                         {
                             this._player.Attributes![regen.CurrentAttribute] =
@@ -1194,19 +1424,17 @@ public sealed class ScriptExecutor
                         }
                         this._player.IsAlive = true;
 
-                        // If CurrentMap is null after warp, confirm map change
-                        if (this._player.CurrentMap is null)
-                        {
-                            await this._player.ClientReadyAfterMapChangeAsync().ConfigureAwait(false);
-                            this._logger.LogInformation(
-                                "[ScriptExec]" + this._charTag + " ✅ ClientReadyAfterMapChangeAsync complete (auto-revive)");
-                        }
-
                         this._justRevived = true;
                         this._deathStartTime = DateTime.MinValue;
                         this._deathPosition = default;
                         this._logger.LogWarning(
-                            "[ScriptExec]" + this._charTag + " 💀 Auto-revive complete — HP/MP restored");
+                            "[ScriptExec]" + this._charTag + " 💀 Natural respawn — HP/MP restored");
+
+                        // 通知 HeartbeatService 复活事件
+                        this.PublishRespawnEvent();
+
+                        // 重置 BUFF 冷却
+                        this._combatSkill.ResetCooldowns();
                     }
                 }
                 else
@@ -1217,6 +1445,10 @@ public sealed class ScriptExecutor
                         // Was dead, now alive — game engine revived us
                         this._justRevived = true;
                         this._deathStartTime = DateTime.MinValue;
+
+                        // 引擎复活也重置 BUFF 冷却
+                        this._combatSkill.ResetCooldowns();
+
                         this._logger.LogInformation(
                             "[ScriptExec]" + this._charTag + " Just revived — consecutive deaths: {Count}" +
                             (_consecutiveDeaths >= 5 ? " ⚠️ ESCALATING — considering map change" :
@@ -1266,6 +1498,15 @@ public sealed class ScriptExecutor
                 break;
             case "leave_safezone":
                 await ScriptLeaveSafezoneAsync(p).ConfigureAwait(false);
+                break;
+            case "equip_best_in_slot":
+                this._logger.LogInformation("[ScriptExec]{Tag} equip_best_in_slot action", this._charTag);
+                break;
+            case "allocate_attributes":
+                this._logger.LogInformation("[ScriptExec]{Tag} allocate_attributes action", this._charTag);
+                break;
+            case "learn_skill_from_book":
+                this._logger.LogInformation("[ScriptExec]{Tag} learn_skill_from_book action", this._charTag);
                 break;
             case "discover_trail":
                 await ScriptDiscoverTrailAsync(p).ConfigureAwait(false);
@@ -1367,8 +1608,15 @@ public sealed class ScriptExecutor
             "mp_below_threshold" => EvaluateMpWithHysteresis(p),
             "is_dead" => this._context.GameAdapter.GetCurrentHp() <= 0,
             "inventory_full" => IsInventoryFull(),
+            "inventory_nearly_full" => IsInventoryNearlyFull(),
             "equip_durable_low" => IsEquipDurableLow(p.DurabilityThreshold),
             "has_target_in_range" => HasTargetInRange(p.AttackRange),
+            "monster_nearby" => this._context.WorldState.AttackablesInRange is { Count: > 0 }
+                                 && this._context.WorldState.AttackablesInRange
+                                     .OfType<Monster>()
+                                     .Any(m => m.IsAlive && m.Position.EuclideanDistanceTo(this._context.WorldState.PlayerPosition) <= p.AttackRange * 2),
+            "quest_target_nearby" => p.QuestGroup is not null && p.QuestNumber is not null
+                                     && IsQuestTargetNearby(p.AttackRange * 2),
             "has_target_not_in_range" => HasTargetNotInRange(p.AttackRange),
             "no_target" => this._context.CurrentTarget is null,
             "in_safe_zone" => this._context.WorldState.IsAtSafezone && !this._forceLeaveSafezone,
@@ -1389,8 +1637,30 @@ public sealed class ScriptExecutor
             "can_accept_quest" => EvaluateCanAcceptQuest(p),
             "not_at_hotspot" => !IsNearAnyHotspot(p.PatrolRadius),
             "not_on_hunt_map" => EvaluateNotOnHuntMap(p),
+            "is_surrounded" => EvaluateIsSurrounded(3),
             "has_target" => this._context.CurrentTarget is not null,
+            "has_stat_points" => this._player.SelectedCharacter?.LevelUpPoints > 0,
+            "has_skillbook" => this._player.SelectedCharacter?.Inventory?.Items?
+                .Any(i => i.Definition?.Skill is not null) ?? false,
+            "has_item_in_inventory" => this._player.SelectedCharacter?.Inventory?.Items?.Any() ?? false,
             "quest_completable" => EvaluateQuestCompletable(p),
+            "has_buff_to_cast" => this._combatSkill.GetBuffsToCast().Count > 0,
+            "not_buffed" => !this._player.MagicEffectList.VisibleEffects
+                .Any(e => e.Definition.Number == 3 || e.Definition.Number == 4
+                    || e.Definition.Number == 5 || e.Definition.Number == 6),
+            // Knowledge Graph conditions — uses KnowledgeGraphHolder.Instance
+            "kg_can_craft" => EvaluateKgCanCraft(p),
+            "kg_best_farm" => EvaluateKgBestFarm(p),
+            // 死亡感知: 当前任务是否有过死亡记录
+            "quest_has_deaths" => p.QuestGroup is not null && p.QuestNumber is not null
+                                  && this._questAdapter.HasQuestEverDied(p.QuestGroup.Value, p.QuestNumber.Value),
+            "quest_no_deaths" => p.QuestGroup is null || p.QuestNumber is null
+                                 || !this._questAdapter.HasQuestEverDied(p.QuestGroup.Value, p.QuestNumber.Value),
+            "level_low" => this._context.GameAdapter.GetPlayerLevel() <= 15,
+            "level_mid" => this._context.GameAdapter.GetPlayerLevel() is > 15 and <= 200,
+            "level_high" => this._context.GameAdapter.GetPlayerLevel() > 200,
+            "predator_nearby" => IsPredatorNearby(),
+            "is_walking" => this._player.IsWalking,
             _ => false,
         };
     }
@@ -1498,6 +1768,19 @@ public sealed class ScriptExecutor
 
     private bool IsNearAnyHotspot(float patrolRadius)
     {
+        if (this._hotspotPoints.Count == 0 && this._script?.Parameters?.Hotspots is { Count: > 0 })
+        {
+            foreach (var h in this._script.Parameters.Hotspots)
+            {
+                this._hotspotPoints.Add(new Point(h.X, h.Y));
+            }
+
+            if (this._hotspotPoints.Count > 0)
+            {
+                this._logger.LogInformation("[IsNearAnyHotspot] loaded {Count} hotspot points from script", this._hotspotPoints.Count);
+            }
+        }
+
         if (this._hotspotPoints.Count == 0)
         {
             this._logger.LogDebug("[IsNearAnyHotspot] no hotspot points loaded — returning false (not_at_hotspot=true)");
@@ -1518,6 +1801,23 @@ public sealed class ScriptExecutor
 
         this._logger.LogDebug("[IsNearAnyHotspot] no hotspot in range — returning false (not_at_hotspot=true)");
         return false;
+    }
+
+    /// <summary>
+    /// Checks if the AI is surrounded by too many monsters within <paramref name="closeRange"/> tiles.
+    /// </summary>
+    private bool EvaluateIsSurrounded(int closeRange)
+    {
+        var attackables = this._context.WorldState.AttackablesInRange;
+        if (attackables is null || attackables.Count == 0) return false;
+        var pos = this._context.GameAdapter.GetPlayerPosition();
+        var closeCount = 0;
+        foreach (var a in attackables)
+        {
+            if (a is Monster m && m.IsAlive && pos.EuclideanDistanceTo(m.Position) <= closeRange)
+                closeCount++;
+        }
+        return closeCount >= 4;
     }
 
     private bool EvaluateQuestConditionsMet(ScriptParameters p)
@@ -1616,6 +1916,19 @@ public sealed class ScriptExecutor
             return false;
         }
 
+        // 任务难度适配：如果该任务被挂起或已永久放弃 → 假装没有活跃任务
+        if (this._questAdapter.ShouldSuspendQuest(targetGroup.Value, targetNumber.Value))
+        {
+            // 检查是否可以恢复
+            if (!this._questAdapter.ShouldResumeQuest(targetGroup.Value, targetNumber.Value))
+            {
+                this._logger.LogInformation(
+                    "[QuestAdapt]{Tag} has_active_quest: Q{Group}/{Number} 已被适配器挂起 — 跳过任务段落",
+                    this._charTag, targetGroup.Value, targetNumber.Value);
+                return false;
+            }
+        }
+
         var activeQuests = this._context.GameAdapter.GetActiveQuests();
         var result = activeQuests.Any(q => q.Group == targetGroup.Value && q.Number == targetNumber.Value);
 
@@ -1701,10 +2014,13 @@ public sealed class ScriptExecutor
             return;
         }
 
-        // Deficit-matched potion selection
+        // Potion selection: pick the largest potion available.
+        // Note: low-level characters (< Lv30) have MaxHP smaller than even the smallest
+        // potion heal amount (200). So we use any deficit > 0 as the trigger condition,
+        // matching the OfflinePlayer healing pattern.
         foreach (var (group, number, heal) in HpPotions)
         {
-            if (deficit >= heal)
+            if (deficit > 0)
             {
                 var potion = inventory.Items
                     .FirstOrDefault(i => i.Definition?.Group == group && i.Definition.Number == number);
@@ -1758,9 +2074,13 @@ public sealed class ScriptExecutor
             return;
         }
 
+        // Pick the largest potion whose mana value does not exceed deficit.
+        // If even the smallest potion (70 mana, Number=4) exceeds deficit
+        // (common at low levels where maxMP < 70), we still use it anyway —
+        // partial recovery is better than none.
         foreach (var (group, number, mana) in MpPotions)
         {
-            if (deficit >= mana)
+            if (deficit >= mana || number == 4)
             {
                 var potion = inventory.Items
                     .FirstOrDefault(i => i.Definition?.Group == group && i.Definition.Number == number);
@@ -1914,6 +2234,28 @@ public sealed class ScriptExecutor
         var randomCount = Math.Max(1, p.TargetRandomizationCount);
         var topN = candidates.Take(randomCount).ToList();
 
+        // 孤立优先: 在最近 N 个候选中，优先选周围怪少的。
+        // 计算每个候选目标周围 3 格内的怪物数，加到等效距离中。
+        // 低等级 AI 优先打落单怪，避免走入怪堆被围。
+        if (topN.Count > 1)
+        {
+            var nearbyAttackables = this._context.WorldState.AttackablesInRange;
+            if (nearbyAttackables is { Count: > 0 })
+            {
+                for (var i = 0; i < topN.Count; i++)
+                {
+                    var m = topN[i].Monster;
+                    var nearby = nearbyAttackables.Count(a2 =>
+                        a2 is Monster m2 && m2.IsAlive
+                        && m2 != m
+                        && Math.Abs(m2.Position.X - m.Position.X) <= 3
+                        && Math.Abs(m2.Position.Y - m.Position.Y) <= 3);
+                    topN[i] = (m, topN[i].Distance + nearby);
+                }
+                topN.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+            }
+        }
+
         IAttackable? best;
         if (topN.Count == 1)
         {
@@ -1996,27 +2338,91 @@ public sealed class ScriptExecutor
             return;
         }
 
-        // Use NativeExecutionService for all attacks — this triggers proper damage pipeline
-        // and quest kill count tracking, unlike the old GameAdapter/PacketInjector path.
-        if (p.SkillPriority is { Count: > 0 })
-        {
-            var skillList = this._player.SkillList;
-            if (skillList is not null)
-            {
-                foreach (var skillNumber in p.SkillPriority)
-                {
-                    var skillEntry = skillList.Skills
-                        .FirstOrDefault(s => s.Skill?.Number == skillNumber);
-                    if (skillEntry is null) continue;
+        // Dynamic skill selection via CombatSkillService.
+        var skillEntry = this._combatSkill.SelectAttackSkill(targetCount: 1);
 
-                    await this._nativeExec.SkillAttackAsync(target, skillEntry).ConfigureAwait(false);
-                    return;
+        // Multi-hit: attack up to 5 times per tick.
+        for (int attempt = 0; attempt < 5 && target.IsAlive; attempt++)
+        {
+            // Re-select skill each attempt — if MP ran out, SelectAttackSkill
+            // returns null and we fall through to melee.
+            var currentSkill = this._combatSkill.SelectAttackSkill(targetCount: 1);
+            var skillWasRanged = false;
+            if (currentSkill is not null && currentSkill.Skill is not null)
+            {
+                await this._nativeExec.SkillAttackAsync(target, currentSkill).ConfigureAwait(false);
+                // If the skill is ranged, don't follow up with melee
+                skillWasRanged = currentSkill.Skill.ImplicitTargetRange > 1
+                                 || currentSkill.Skill.SkillType is SkillType.AreaSkillAutomaticHits
+                                 or SkillType.AreaSkillExplicitHits
+                                 or SkillType.AreaSkillExplicitTarget;
+                if (skillWasRanged && currentSkill.Skill.AttackDamage > 0)
+                {
+                    continue; // Skip melee for ranged skills
+                }
+            }
+
+            // Melee fallback — only used by physical classes (DK/Elf with bow).
+            // Magic classes (DW) should NEVER melee: no skill = drink potion + wait for regen.
+            if (target.IsAlive && !skillWasRanged)
+            {
+                // Check if this character has ANY magic/ranged skills. If yes, they're a
+                // magic class — don't melee, wait for MP potion/regen instead.
+                var hasAnySkill = this._player.SkillList?.Skills
+                    .Any(s => s.Skill is not null && s.Skill.SkillType == SkillType.DirectHit) ?? false;
+                if (hasAnySkill && currentSkill is null)
+                {
+                    continue; // Magic class, no MP — skip melee, wait for potion
+                }
+
+                var hitInfo = await this._nativeExec.MeleeAttackAsync(target).ConfigureAwait(false);
+                var totalDmg = (hitInfo?.HealthDamage ?? 0) + (hitInfo?.ShieldDamage ?? 0);
+
+                // Zero-damage: give up after 5 consecutive zeros
+                if (hitInfo is not null && totalDmg == 0)
+                {
+                    if (this._zeroDamageTarget == target)
+                    {
+                        this._zeroDamageStreak++;
+                        if (this._zeroDamageStreak >= ZeroDamageThreshold)
+                        {
+                            this._logger.LogInformation(
+                                "[ScriptExec] AttackTarget: target #{Target} dealt zero damage {Streak}/5 — giving up",
+                                target is Monster mt ? mt.Definition?.Number : 0,
+                                this._zeroDamageStreak);
+                            this._context.CurrentTarget = null;
+                            this._zeroDamageTarget = null;
+                            this._zeroDamageStreak = 0;
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        this._zeroDamageTarget = target;
+                        this._zeroDamageStreak = 1;
+                    }
+                }
+                else
+                {
+                    this._zeroDamageStreak = 0;
                 }
             }
         }
 
-        // Melee fallback
-        await this._nativeExec.MeleeAttackAsync(target).ConfigureAwait(false);
+        // Target died during multi-hit — record kill and clear for next cycle
+        if (!target.IsAlive)
+        {
+            if (target is Monster killedMonster && this._runtimeLearner is not null)
+            {
+                var monsterNum = (short)(killedMonster.Definition?.Number ?? 0);
+                if (monsterNum > 0)
+                {
+                    this._runtimeLearner.RecordMonsterKill(monsterNum);
+                }
+            }
+
+            this._context.CurrentTarget = null;
+        }
     }
 
     private async ValueTask WalkToTargetAsync(ScriptParameters p)
@@ -2245,6 +2651,42 @@ public sealed class ScriptExecutor
                             "[MonsterDanger] #{Monster} Lv{Level} at ({X},{Y}) exceeds AI Lv{MyLevel}+{Thresh} — blocked 3×3",
                             m.Definition.Number, monsterLevel, m.Position.X, m.Position.Y,
                             myLevel, levelThreshold);
+                    }
+
+                    // Monster Cluster Filter: block high-density areas even if individual
+                    // monsters are below the level threshold.  Prevents low-level AIs from
+                    // pathing through packs of 5+ monsters that would overwhelm them.
+                    // 5×5 tile buckets, 4+ monsters → block center 3×3 of that bucket.
+                    var densityBuckets = new System.Collections.Generic.Dictionary<(int bx, int by), int>();
+                    foreach (var a in attackables)
+                    {
+                        if (a is not Monster m || !m.IsAlive) continue;
+                        var bx = m.Position.X / 5;
+                        var by = m.Position.Y / 5;
+                        var key = (bx, by);
+                        densityBuckets[key] = densityBuckets.TryGetValue(key, out var c) ? c + 1 : 1;
+                    }
+
+                    foreach (var kvp in densityBuckets)
+                    {
+                        if (kvp.Value < 4) continue; // need 4+ monsters in one bucket
+
+                        var cx = kvp.Key.bx * 5 + 2; // center of 5×5 bucket
+                        var cy = kvp.Key.by * 5 + 2;
+                        for (var dy = -1; dy <= 1; dy++)
+                        for (var dx = -1; dx <= 1; dx++)
+                        {
+                            var tx = cx + dx;
+                            var ty = cy + dy;
+                            if (tx >= 0 && tx < 256 && ty >= 0 && ty < 256)
+                            {
+                                searchGrid[tx, ty] = 127;
+                            }
+                        }
+
+                        this._logger?.LogDebug(
+                            "[ClusterDensity] {Count} monsters in bucket ({BX},{BY}) — blocked 3×3 around ({CX},{CY})",
+                            kvp.Value, kvp.Key.bx, kvp.Key.by, cx, cy);
                     }
                 }
             }
@@ -2864,9 +3306,67 @@ public sealed class ScriptExecutor
 
     private async ValueTask<bool> PickupNearbyItemsAsync(ScriptParameters p)
     {
-        // Pickup handled by stubs — always return false here
-        await Task.CompletedTask.ConfigureAwait(false);
-        return false;
+        var picked = await this._pickupManager.TryPickupNearbyItemsAsync().ConfigureAwait(false);
+        if (picked)
+        {
+            this._logger.LogInformation("[ScriptExec]{Tag} pickup_nearby: 拾取了物品或金钱 ✓", this._charTag);
+
+            // Record drop observation in RuntimeLearner when we pick up a non-money item
+            // and have a current monster target (most likely dropped by it).
+            RecordPickupAsDrop();
+        }
+        else
+        {
+            this._logger.LogTrace("[ScriptExec]{Tag} pickup_nearby: 无物品可拾取", this._charTag);
+        }
+
+        return picked;
+    }
+
+    private void RecordPickupAsDrop()
+    {
+        if (this._runtimeLearner is null)
+        {
+            return;
+        }
+
+        // Determine the monster we're currently fighting — it's the most likely drop source
+        var currentTarget = this._context.CurrentTarget;
+        short? monsterNumber = null;
+        if (currentTarget is Monster m)
+        {
+            monsterNumber = (short)(m.Definition?.Number ?? 0);
+        }
+
+        if (monsterNumber is null or 0)
+        {
+            return;
+        }
+
+        // Check what items are now in inventory (we just picked something up)
+        var inventory = this._player.SelectedCharacter?.Inventory;
+        if (inventory?.Items is null)
+        {
+            return;
+        }
+
+        // Get the last picked item (highest item slot — most recently added)
+        Item? lastItem = null;
+        foreach (var item in inventory.Items)
+        {
+            if (item.Definition is null) continue;
+            if (lastItem is null || item.ItemSlot > lastItem.ItemSlot)
+            {
+                lastItem = item;
+            }
+        }
+
+        if (lastItem?.Definition is null)
+        {
+            return;
+        }
+
+        this._runtimeLearner.RecordObservedDrop(monsterNumber.Value, lastItem.Definition.Group, lastItem.Definition.Number);
     }
 
     /// <summary>
@@ -2947,8 +3447,33 @@ public sealed class ScriptExecutor
     /// </summary>
     private async ValueTask UseBuffAsync(ScriptParameters p)
     {
-        // SkillService-based auto-buff is no longer available — skip.
-        await Task.CompletedTask.ConfigureAwait(false);
+        var buffs = this._combatSkill.GetBuffsToCast();
+        if (buffs.Count == 0)
+        {
+            return;
+        }
+
+        // Cast only one buff per tick to avoid saturating the tick
+        var buff = buffs[0];
+        if (buff.Skill is null)
+        {
+            return;
+        }
+
+        this._logger.LogInformation(
+            "[ScriptExec]{Tag} Casting buff skill #{Number} ({Name})",
+            this._charTag,
+            buff.Skill.Number,
+            buff.Skill.Name);
+
+        // Buff skills target self
+        await this._player.AttackByAsync(this._player, buff, false).ConfigureAwait(false);
+
+        // Record cooldown so it isn't re-cast next tick
+        this._combatSkill.MarkBuffCast((ushort)buff.Skill.Number);
+
+        // Update current behavior label
+        this.CurrentBehavior = $"加Buff#{buff.Skill.Number}";
     }
 
     /// <summary>
@@ -3022,6 +3547,58 @@ public sealed class ScriptExecutor
         return maxMp > 0 ? (float)mp / maxMp : 1f;
     }
 
+    /// <summary>
+    /// 检查任务目标怪物是否在附近指定距离内。
+    /// 用于 quest_hunt 段行走时只打任务怪，绕开非任务怪。
+    /// </summary>
+    /// <summary>
+    /// 检查附近是否有等级远超玩家的高危险性怪物（探索式寻径用）。
+    /// 当 predator_nearby 为 true 时，AI 应快速通过/绕路，不与之战斗。
+    /// 判断标准：怪物等级 > 玩家等级 + 15。
+    /// </summary>
+    private bool IsPredatorNearby()
+    {
+        var myLevel = this._context.GameAdapter.GetPlayerLevel();
+        var dangerThreshold = myLevel + 15;
+        var pos = this._context.WorldState.PlayerPosition;
+        const float dangerRange = 8f;
+
+        return this._context.WorldState.AttackablesInRange
+            .OfType<Monster>()
+            .Any(m => m.IsAlive
+                      && m.Attributes is not null
+                      && (int)(m.Attributes[Stats.Level]) > dangerThreshold
+                      && pos.EuclideanDistanceTo(m.Position) <= dangerRange);
+    }
+
+    private bool IsQuestTargetNearby(float range)
+    {
+        var quest = this._context.GameAdapter.GetActiveQuests()
+            .FirstOrDefault(q => q.Group == (this._script?.Parameters?.QuestGroup ?? 0)
+                              && q.Number == (this._script?.Parameters?.QuestNumber ?? 0));
+        if (quest?.RequiredKills is null || quest.RequiredKills.Count == 0)
+        {
+            return false;
+        }
+
+        var targetNumbers = quest.RequiredKills
+            .Where(k => k.Current < k.Required)
+            .Select(k => k.MonsterNumber)
+            .ToHashSet();
+        if (targetNumbers.Count == 0)
+        {
+            return false;
+        }
+
+        var pos = this._context.WorldState.PlayerPosition;
+        return this._context.WorldState.AttackablesInRange
+            .OfType<Monster>()
+            .Any(m => m.IsAlive
+                      && m.Definition is not null
+                      && targetNumbers.Contains((short)m.Definition.Number)
+                      && pos.EuclideanDistanceTo(m.Position) <= range);
+    }
+
     private bool HasTargetInRange(float attackRange)
     {
         var target = this._context.CurrentTarget;
@@ -3055,6 +3632,22 @@ public sealed class ScriptExecutor
         }
 
         return !inventory.FreeSlots.Any();
+    }
+
+    /// <summary>
+    /// 背包超过 80% → 回城卖装备买药。
+    /// </summary>
+    private bool IsInventoryNearlyFull()
+    {
+        var inventory = this._player.Inventory;
+        if (inventory is null) return false;
+
+        // 计算背包总格数（通常 64 格）和已用格数
+        const int totalBackpackSlots = 64;
+        const int equipSlots = 12;
+        var occupied = inventory.Items.Count(i => i.ItemSlot >= equipSlots);
+        var ratio = (double)occupied / totalBackpackSlots;
+        return ratio >= 0.80;
     }
 
     private bool IsEquipDurableLow(float threshold)
@@ -3117,6 +3710,12 @@ public sealed class ScriptExecutor
             SkillPriority = local.SkillPriority ?? global.SkillPriority,
             ReturnCooldownSec = local.ReturnCooldownSec != 60 ? local.ReturnCooldownSec : global.ReturnCooldownSec,
             PotionCooldownMs = local.PotionCooldownMs != 2000 ? local.PotionCooldownMs : global.PotionCooldownMs,
+            StuckDetectionTicks = local.StuckDetectionTicks != 25 ? local.StuckDetectionTicks : global.StuckDetectionTicks,
+            IdleSoftLimitTicks = local.IdleSoftLimitTicks != 300 ? local.IdleSoftLimitTicks : global.IdleSoftLimitTicks,
+            IdleHardLimitTicks = local.IdleHardLimitTicks != 900 ? local.IdleHardLimitTicks : global.IdleHardLimitTicks,
+            IdleRecoveryTicks = local.IdleRecoveryTicks != 75 ? local.IdleRecoveryTicks : global.IdleRecoveryTicks,
+            CraftTargetItemGroup = local.CraftTargetItemGroup ?? global.CraftTargetItemGroup,
+            CraftTargetItemNumber = local.CraftTargetItemNumber ?? global.CraftTargetItemNumber,
         };
     }
 
@@ -3823,32 +4422,42 @@ public sealed class ScriptExecutor
 
         if (this._hotspotPoints.Count == 0)
         {
-            this._logger.LogTrace("[ScriptExec]" + this._charTag + " relocate_to_hotspot: no hotspots configured");
+            this._logger.LogInformation("[ScriptExec]" + this._charTag + " relocate_to_hotspot: no hotspots, falling back to random hunt map");
+            var warpResult = await WarpToRandomHuntMapAsync(p).ConfigureAwait(false);
+            if (warpResult)
+            {
+                return new RelocateResult(RelocateStatusCode.Moving, -1, null, playerPos, 0, "warping to random hunt map");
+            }
+
+            this._logger.LogTrace("[ScriptExec]" + this._charTag + " relocate_to_hotspot: no hotspots configured and fallback failed");
             return new RelocateResult(RelocateStatusCode.NoHotspots, -1, null, playerPos, 0, "no hotspots configured");
         }
 
-        // === 跨地图 warp: 当前热点在另一地图时 warp 过去 ===
+        // === 跨地图 warp: 当前热点在另一地图时优先 warp ===
+        // 放在行走守卫之前：即使已在行走中也要纠正地图错误，
+        // 否则 AI 会在错误的地图走到错误的位置。
         if (p.Hotspots is { Count: > 0 })
         {
-            // 获取当前要前往的热点索引（与下方逻辑保持一致）
             var targetIdx = this._pendingHotspotIndex >= 0 ? this._pendingHotspotIndex
                 : (this._currentHotspotIndex + 1) % this._hotspotPoints.Count;
             if (targetIdx < p.Hotspots.Count)
             {
                 var hd = p.Hotspots[targetIdx];
-                if (hd.MapNumber != ushort.MaxValue)
-                {
-                    var currentMap = this._context.GameAdapter.GetCurrentMap();
-                    if (currentMap is not null && currentMap.Definition.Number != hd.MapNumber)
+                // Use last known map from snapshot as fallback when CurrentMap is null (transitional state)
+                var chkCurrentMap = this._context.GameAdapter.GetCurrentMap()
+                    ?? this._context.WorldState.CurrentMap;
+                var chkMapNum = chkCurrentMap?.Definition?.Number;
+                this._logger.LogDebug(
+                    "[ScriptExec]" + this._charTag + " RelocMapCheck: targetIdx={Idx} hd.MapNumber={HdMap} currentMapNumber={CurMap} currentMap={Map} hd.Name={Name}",
+                    targetIdx, hd.MapNumber, chkMapNum, chkCurrentMap?.Definition?.Number, hd.Name);
+                if (hd.MapNumber != ushort.MaxValue && chkCurrentMap?.Definition is not null && chkMapNum != hd.MapNumber)
                     {
                         this._logger.LogInformation(
                             "[ScriptExec]" + this._charTag + " Hotspot #{Idx} ({X},{Y}) on map #{Map}, current is #{CurMap} — warping...",
-                            targetIdx, hd.X, hd.Y, hd.MapNumber, currentMap.Definition.Number);
-                        // 使用完整命名空间前缀（WarpResult 是 record，没有 using）
+                            targetIdx, hd.X, hd.Y, hd.MapNumber, chkCurrentMap.Definition.Number);
                         var warpResult = await this._context.GameAdapter.WarpToMapAsync(hd.MapNumber).ConfigureAwait(false);
                         if (warpResult.Status == MUnique.OpenMU.AIPlayer.WarpStatusCode.Success || warpResult.Status == MUnique.OpenMU.AIPlayer.WarpStatusCode.AlreadyOnTarget)
                         {
-                            // 重置状态以便在新地图重新开始
                             this._currentHotspotIndex = targetIdx;
                             this._pendingHotspotIndex = -1;
                             this._context.CurrentTarget = null;
@@ -3865,9 +4474,8 @@ public sealed class ScriptExecutor
                     }
                 }
             }
-        }
 
-        // 已在行走中 — 不中断当前寻路，不推进索引
+        // 已在行走中 — 不覆盖当前寻路（避免每 tick 重算路径导致抖动）
         if (this._player.IsWalking)
         {
             return new RelocateResult(RelocateStatusCode.Moving, this._currentHotspotIndex,
@@ -3884,18 +4492,36 @@ public sealed class ScriptExecutor
 
         // Death strategy escalation: adapt hotspot selection based on consecutive deaths.
         // Game design: strong monsters patrol hotspots intentionally to drive player progression.
-        if (this._consecutiveDeaths >= 5)
+        if (this._consecutiveDeaths >= 4)
         {
+            var playerLevel = this._context.GameAdapter.GetPlayerLevel();
             this._logger.LogWarning(
-                "[DeathStrategy] {Count} consecutive deaths — all hotspots too dangerous, considering map change",
-                this._consecutiveDeaths);
+                "[DeathStrategy] {Count} consecutive deaths at Lv.{Level} — ESCALATING to map #3 (Devias)",
+                this._consecutiveDeaths, playerLevel);
 
-            // Mark ALL hotspots as DangerZone for 15 minutes to force strategy change
-            // AiMap not available — danger zone marking skipped.
+            // ESCALATE: force the AI to retreat to a safer low-level map (Devias #3).
+            // This breaks the death loop: the AI respawns in safezone, then the
+            // heartbeat picks up TargetMapNumber and triggers ExecuteCrossMapWarpAsync.
+            this._context.TargetMapNumber = 3;
+
+            // For very low-level characters (< Lv10), clear the death-stuck flag
+            // so the script can fall through to regular hunting instead of quest hunting.
+            if (playerLevel < 10)
+            {
+                this._logger.LogWarning(
+                    "[DeathStrategy] Lv.{Level} too low for current zone — retreating to safe map",
+                    playerLevel);
+            }
 
             // Reset counter so we don't spam this every tick
             this._consecutiveDeaths = 0;
             this._forceThruDeathCount = 0;
+        }
+        else if (this._consecutiveDeaths >= 2 && this._context.GameAdapter.GetPlayerLevel() < 10)
+        {
+            this._logger.LogWarning(
+                "[DeathStrategy] {Count} consecutive deaths at Lv.{Level} — will cycle hotspot more aggressively",
+                this._consecutiveDeaths, this._context.GameAdapter.GetPlayerLevel());
         }
         else if (this._consecutiveDeaths >= 3)
         {
@@ -4027,6 +4653,62 @@ public sealed class ScriptExecutor
             this._context.GameAdapter.GetPlayerPosition(), checkedCount, "all hotspots occupied");
     }
 
+    /// <summary>Fallback relocation: warps to a random hunting map when no hotspots are configured.
+    /// Picks a map appropriate for the player's level, then uses the WarpPlanner to route.
+    /// </summary>
+    private async ValueTask<bool> WarpToRandomHuntMapAsync(ScriptParameters p)
+    {
+        var level = this._context.GameAdapter.GetPlayerLevel();
+        var currentMap = this._context.GameAdapter.GetCurrentMap();
+        var currentMapNum = currentMap?.Definition.Number ?? 0;
+
+        Span<(ushort Map, int Min, int Max)> huntMaps = stackalloc (ushort, int, int)[]
+        {
+            ((ushort)3, 1, 30),    // Noria
+            ((ushort)1, 15, 50),   // Dungeon
+            ((ushort)2, 20, 60),   // Devias
+            ((ushort)4, 30, 80),   // Lost Tower
+            ((ushort)7, 50, 100),  // Atlans
+            ((ushort)8, 60, 120),  // Tarkan
+        };
+
+        ushort targetMap = 0;
+        var candidates = new List<ushort>();
+        foreach (var (map, min, max) in huntMaps)
+        {
+            if (level >= min && level <= max && map != currentMapNum)
+                candidates.Add(map);
+        }
+
+        if (candidates.Count == 0)
+        {
+            foreach (var (map, _, _) in huntMaps)
+                if (map != currentMapNum) candidates.Add(map);
+        }
+
+        if (candidates.Count == 0) return false;
+
+        targetMap = candidates[Random.Shared.Next(candidates.Count)];
+
+        var planner = this.GetWarpPlanner();
+        var money = this._player.Money;
+        var route = await planner.ComputeRouteWithKgAsync((short)currentMapNum, (short)targetMap, level, money).ConfigureAwait(false);
+
+        if (route is null || !route.IsFeasible)
+        {
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " random_hunt: no feasible route from #{From} to #{To}", currentMapNum, targetMap);
+            return false;
+        }
+
+        this._logger.LogInformation("[ScriptExec]" + this._charTag + " random_hunt: routing #{From}→#{To} ({Steps} steps, gold={Gold})", currentMapNum, targetMap, route.Steps.Count, route.TotalGoldCost);
+        this._context.ActiveWarpRoute = route;
+        this._context.ActiveWarpStepIndex = 0;
+        this._context.WarpInProgress = false;
+        this._context.TargetMapNumber = targetMap;
+        await this.ExecuteNextWarpStepAsync().ConfigureAwait(false);
+        return true;
+    }
+
     /// <summary>
     /// Returns to the recorded death position after revival.
     /// Walks to _deathPosition and resets it after arrival.
@@ -4094,7 +4776,7 @@ public sealed class ScriptExecutor
         var level = this._context.GameAdapter.GetPlayerLevel();
         var money = this._player.Money;
 
-        var route = planner.ComputeRoute((short)fromMap, (short)targetMap, level, money);
+        var route = await planner.ComputeRouteWithKgAsync((short)fromMap, (short)targetMap, level, money).ConfigureAwait(false);
         if (route is null)
         {
             this._logger.LogWarning("[ScriptExec]" + this._charTag + " warp_to_hunt_map: no route from map {From} to {To}", fromMap, targetMap);
@@ -4141,13 +4823,141 @@ public sealed class ScriptExecutor
             return false;
         }
 
-        var currentMap = this._context.GameAdapter.GetCurrentMap();
+        var currentMap = this._context.GameAdapter.GetCurrentMap()
+            ?? this._context.WorldState.CurrentMap;
         if (currentMap is null)
         {
             return true; // no map context → need warp
         }
 
         return currentMap.Definition.Number != hotspotMap;
+    }
+
+    private bool EvaluateKgCanCraft(ScriptParameters p)
+    {
+        // Returns true if the AI has all required materials to craft the target item.
+        // Uses KnowledgeGraph to find the item's recipe and check inventory.
+        if (KnowledgeGraphHolder.Instance is null)
+        {
+            return false;
+        }
+
+        if (p.CraftTargetItemGroup is null || p.CraftTargetItemNumber is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var targetNode = NodeId.ForItem(p.CraftTargetItemGroup.Value, p.CraftTargetItemNumber.Value);
+
+            // Backward dependency: find materials required through recipe
+            var chain = KnowledgeGraphHolder.Instance.ResolveDependencies(targetNode, DependencyDirection.Backward, maxDepth: 3);
+            if (chain is null || chain.Steps.Count == 0)
+            {
+                return false;
+            }
+
+            // Check each step for material requirements.
+            // Steps are material items linked via RequiresMaterial edges.
+            foreach (var step in chain.Steps)
+            {
+                if (step.NodeId.Type != NodeType.Item || step.NodeId == targetNode)
+                {
+                    continue;
+                }
+
+                // Extract required quantity from edge properties (set by KG builder)
+                var requiredQty = 1;
+                if (step.Edge.Properties is not null
+                    && step.Edge.Properties.TryGetValue("Quantity", out var qtyObj))
+                {
+                    requiredQty = Convert.ToInt32(qtyObj);
+                }
+
+                // Extract item group/number from NodeId (ForItem packs group<<32 | number)
+                var itemGroup = (int)(step.NodeId.DomainId >> 32);
+                var itemNumber = (int)(step.NodeId.DomainId & 0xFFFFFFFF);
+
+                var count = this._player.SelectedCharacter?.Inventory?.Items
+                    .Count(i => i.Definition?.Group == itemGroup && i.Definition?.Number == itemNumber) ?? 0;
+
+                if (count < requiredQty)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " kg_can_craft error: {Ex}", ex.Message);
+            return false;
+        }
+    }
+
+    private bool EvaluateKgBestFarm(ScriptParameters p)
+    {
+        // Finds the best farming map for the player's current level.
+        // Caches result in _kgBestFarmMap so subsequent actions can warp there.
+        if (KnowledgeGraphHolder.Instance is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var playerLevel = this._context.GameAdapter.GetPlayerLevel();
+            var config = this._player.GameContext?.Configuration;
+            if (config is null) return false;
+
+            // Score each map by monster level appropriateness
+            var mapNodes = config.Maps.Where(m => m.Number > 0).ToList();
+
+            var mapScores = new System.Collections.Generic.Dictionary<int, double>();
+
+            foreach (var mapDef in mapNodes)
+            {
+                var mapNumber = mapDef.Number;
+                var mapNodeId = NodeId.ForMap(mapNumber);
+
+                // Query KG for monsters on this map via SpawnsOn edges
+                var spawnEdges = KnowledgeGraphHolder.Instance.FindAllReachable(
+                    mapNodeId,
+                    new HashSet<EdgeType> { EdgeType.SpawnsOn },
+                    maxDepth: 1);
+
+                var monsterCount = spawnEdges?.Count ?? 0;
+                if (monsterCount == 0)
+                {
+                    continue;
+                }
+
+                // Heuristic score: more monsters = better hunting ground.
+                // Higher-level maps (larger map number) get a slight bonus
+                // since they tend to have better drops.
+                var score = monsterCount * 10.0;
+                mapScores[mapNumber] = score;
+            }
+
+            if (mapScores.Count == 0)
+            {
+                return false;
+            }
+
+            var best = mapScores.OrderByDescending(kvp => kvp.Value).First();
+            this._kgBestFarmMap = (short)best.Key;
+            this._logger.LogInformation(
+                "[ScriptExec]" + this._charTag + " kg_best_farm: recommend map #{Map} (score={Score})",
+                this._kgBestFarmMap, best.Value);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning("[ScriptExec]" + this._charTag + " kg_best_farm error: {Ex}", ex.Message);
+            return false;
+        }
     }
 
     /// <summary>
@@ -4168,6 +4978,8 @@ public sealed class ScriptExecutor
     {
         this._deathPosition = default;
         this._justRevived = false;
+        this._consecutiveDeaths = 0; // 复活时重置死亡计数
+        this._forceThruDeathCount = 0;
         this.ResetIdleTimer(); // 复活 = 状态复位，清零熔断
     }
 
@@ -4572,5 +5384,30 @@ public sealed class ScriptExecutor
         }
 
         return new WarpBlockReason { IsBlocked = false };
+    }
+
+    /// <summary>
+    /// 发布死亡事件到 EventBus，通知 HeartbeatService 的死亡循环检测。
+    /// </summary>
+    private void PublishDeathEvent()
+    {
+        if (this._context.GameAdapter is GameAdapter ga && ga.EventPublisher is not null)
+        {
+            ga.EventPublisher(new DeathEvent(null));
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " 已发布 DeathEvent");
+        }
+    }
+
+    /// <summary>
+    /// 发布复活事件到 EventBus，通知 HeartbeatService 的死亡循环检测。
+    /// </summary>
+    private void PublishRespawnEvent()
+    {
+        if (this._context.GameAdapter is GameAdapter ga && ga.EventPublisher is not null)
+        {
+            var pos = this._context.GameAdapter.GetPlayerPosition();
+            ga.EventPublisher(new RespawnEvent(pos));
+            this._logger.LogDebug("[ScriptExec]" + this._charTag + " 已发布 RespawnEvent at ({X},{Y})", pos.X, pos.Y);
+        }
     }
 }

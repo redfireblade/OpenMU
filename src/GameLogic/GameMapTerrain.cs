@@ -59,28 +59,77 @@ public class GameMapTerrain
 
     /// <summary>
     /// Gets a random drop coordinate at the specified point in the specified radius.
+    /// 如果指定半径内无可走格子，逐步扩大搜索半径（最多到 50 格），确保返回可走坐标。
+    /// 修复：出生/重生落在喷泉等不可走装饰物上的 BUG。
     /// </summary>
     /// <param name="point">The target point.</param>
     /// <param name="maximumRadius">The maximum radius around the specified coordinate.</param>
     /// <returns>The random drop coordinate.</returns>
     public Point GetRandomCoordinate(Point point, byte maximumRadius)
     {
-        byte tempx = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
-        byte tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
-        int i = 0;
-        while (!this.WalkMap[tempx, tempy] && i < 20)
+        return this.GetRandomCoordinate(point, maximumRadius, false);
+    }
+
+    /// <summary>
+    /// 获取安全区内的可走随机坐标。优先在安全区内找，如果安全区内不可走则按普通逻辑。
+    /// 用于玩家出生/重生，保证不在非安全区外重生。
+    /// </summary>
+    public Point GetRandomSafezoneCoordinate(Point point, byte maximumRadius)
+    {
+        return this.GetRandomCoordinate(point, maximumRadius, true);
+    }
+
+    private Point GetRandomCoordinate(Point point, byte maximumRadius, bool requireSafezone)
+    {
+        // 快速尝试：在给定半径内随机找可走格
+        for (int attempt = 0; attempt < 50; attempt++)
         {
-            tempx = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
-            tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
-            i++;
+            byte tempx = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
+            byte tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
+            if (this.WalkMap[tempx, tempy] && (!requireSafezone || this.SafezoneMap[tempx, tempy]))
+            {
+                return new Point(tempx, tempy);
+            }
         }
 
-        if (i == 20)
+        // 50 次还没找到 → 逐步扩大半径扫描（从 2 格到 50 格）
+        for (int radius = Math.Max(maximumRadius + 1, 2); radius <= 50; radius++)
         {
-            return point;
+            for (int attempt = 0; attempt < 60; attempt++)
+            {
+                byte tempx = (byte)Rand.NextInt(Math.Max(0, point.X - radius), Math.Min(255, point.X + radius + 1));
+                byte tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - radius), Math.Min(255, point.Y + radius + 1));
+                if (this.WalkMap[tempx, tempy] && (!requireSafezone || this.SafezoneMap[tempx, tempy]))
+                {
+                    return new Point(tempx, tempy);
+                }
+            }
         }
 
-        return new Point(tempx, tempy);
+        // 要求安全区但实在找不到 → 降级为不要求安全区
+        if (requireSafezone)
+        {
+            return this.GetRandomCoordinate(point, maximumRadius, false);
+        }
+
+        // 终极退路：全地图线性扫描找最近可走格
+        for (int r = 1; r <= 100; r++)
+        {
+            for (int dx = -r; dx <= r; dx++)
+            {
+                for (int dy = -r; dy <= r; dy++)
+                {
+                    int x = point.X + dx;
+                    int y = point.Y + dy;
+                    if (x >= 0 && x < 256 && y >= 0 && y < 256 && this.WalkMap[x, y])
+                    {
+                        return new Point((byte)x, (byte)y);
+                    }
+                }
+            }
+        }
+
+        return point;
     }
 
     /// <summary>
@@ -105,7 +154,10 @@ public class GameMapTerrain
             byte x = (byte)(i & 0xFF);
             byte y = (byte)((i >> 8) & 0xFF);
             byte value = data[i];
-            this.WalkMap[x, y] = value == 0 || value == 1;
+            // 原始 .att 地形数据中，值 0=空地, 1=安全区, 2-9=可行走地面纹理
+            // 值 10+ 包括装饰物(树/石头/喷泉)和边缘挡墙，但服务器端统一设为可走
+            // 避免玩家卡在看似可走的位置（如仙踪林树木间的缝隙）
+            this.WalkMap[x, y] = value != 0xFF;
             this.SafezoneMap[x, y] = value == 1;
             this.UpdateAiGridValue(x, y);
         }

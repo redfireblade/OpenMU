@@ -208,6 +208,22 @@ public sealed class ScriptParameters
     [JsonPropertyName("searchRange")]
     public int SearchRange { get; set; } = 20;
 
+    /// <summary>Strength allocation weight (0.0-1.0).</summary>
+    [JsonPropertyName("strWeight")]
+    public float StrWeight { get; set; }
+
+    /// <summary>Agility allocation weight (0.0-1.0).</summary>
+    [JsonPropertyName("agiWeight")]
+    public float AgiWeight { get; set; }
+
+    /// <summary>Vitality allocation weight (0.0-1.0).</summary>
+    [JsonPropertyName("vitWeight")]
+    public float VitWeight { get; set; }
+
+    /// <summary>Energy allocation weight (0.0-1.0).</summary>
+    [JsonPropertyName("eneWeight")]
+    public float EneWeight { get; set; }
+
     /// <summary>Potion cooldown in milliseconds. Default 2000 (2 seconds).</summary>
     [JsonPropertyName("potionCooldownMs")]
     public int PotionCooldownMs { get; set; } = 2000;
@@ -387,6 +403,14 @@ public sealed class ScriptParameters
     /// </summary>
     [JsonPropertyName("idleRecoveryTicks")]
     public int IdleRecoveryTicks { get; set; } = 75;
+
+    /// <summary>Target item group for kg_can_craft condition.</summary>
+    [JsonPropertyName("craftTargetItemGroup")]
+    public int? CraftTargetItemGroup { get; set; }
+
+    /// <summary>Target item number for kg_can_craft condition.</summary>
+    [JsonPropertyName("craftTargetItemNumber")]
+    public int? CraftTargetItemNumber { get; set; }
 }
 
 /// <summary>

@@ -1160,7 +1160,8 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
         this.IsAlive = true;
 
         await this.CurrentMap!.AddAsync(this).ConfigureAwait(false);
-        if (!this.CurrentMap.Terrain.WalkMap[this.SelectedCharacter.PositionX, this.SelectedCharacter.PositionY])
+        if (!this.CurrentMap.Terrain.WalkMap[this.SelectedCharacter.PositionX, this.SelectedCharacter.PositionY]
+            || !this.CurrentMap.Terrain.SafezoneMap[this.SelectedCharacter.PositionX, this.SelectedCharacter.PositionY])
         {
             await this.WarpToSafezoneAsync().ConfigureAwait(false);
         }
@@ -1974,8 +1975,36 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
 
     private void PlaceAtGate(ExitGate gate)
     {
-        this.SelectedCharacter!.PositionX = (byte)Rand.NextInt(gate.X1, gate.X2);
-        this.SelectedCharacter.PositionY = (byte)Rand.NextInt(gate.Y1, gate.Y2);
+        var x = (byte)Rand.NextInt(gate.X1, gate.X2);
+        var y = (byte)Rand.NextInt(gate.Y1, gate.Y2);
+
+        // 使用地形数据确保出生点在安全区+可走区域
+        // SafezoneMap + WalkMap 来自 .att 地图文件，标记了喷泉等不可走区域
+        if (this.CurrentMap?.Terrain is { } terrain)
+        {
+            // AIgrid: bit0=walkable(1), bit7=safezone(128)
+            // 值129=可走安全区, 值1=可走非安全区, 值0/128=不可走
+            if ((terrain.AIgrid[x, y] & 0b1000_0001) != 0b1000_0001)
+            {
+                // 不是可走安全区 → 用地形系统的安全区寻址找到最近的可走安全格
+                var safePoint = terrain.GetRandomSafezoneCoordinate(new Point(x, y), 5);
+                if ((terrain.AIgrid[safePoint.X, safePoint.Y] & 0b1000_0001) == 0b1000_0001)
+                {
+                    x = safePoint.X;
+                    y = safePoint.Y;
+                }
+                else
+                {
+                    // 扩大搜索半径再试一次
+                    safePoint = terrain.GetRandomSafezoneCoordinate(new Point(x, y), 30);
+                    x = safePoint.X;
+                    y = safePoint.Y;
+                }
+            }
+        }
+
+        this.SelectedCharacter!.PositionX = x;
+        this.SelectedCharacter.PositionY = y;
         this.SelectedCharacter.CurrentMap = gate.Map;
         this.Rotation = gate.Direction;
 
