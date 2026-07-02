@@ -184,14 +184,10 @@ internal sealed class Program : IDisposable
                         return;
                     }
 
-                    // Use script-driven mode (1D) for predictable behavior
-                    var scriptsDir = System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "aiplayer_data");
-                    var scriptPath = System.IO.Path.Combine(scriptsDir, "basic_hunting_loop.json");
-                    var scriptPathArg = System.IO.File.Exists(scriptPath) ? scriptPath : null;
-                    if (scriptPathArg is null)
-                    {
-                        this._logger.Warning("Script {Path} not found; DebugBots will use DAG module mode.", scriptPath);
-                    }
+                    // v4.0 Fugu: AI bots use DAG mode (HeartbeatService + DecisionCore)
+                    // Observer learns → RuleEngine → DecisionCore(T1Rule/T2Script/T3SoftRouter)
+                    var scriptPathArg = (string?)null;
+                    this._logger.Information("OAPS v4.0 Fugu: AI bots in DAG mode (DecisionCore + RuleEngine)");
 
                     var bots = new List<(string Name, int ClassId, ushort MapId, string? Script, BuildDirection? Dir, int Level)>();
 
@@ -210,7 +206,7 @@ internal sealed class Program : IDisposable
                             var (classId, dir, prefix) = classDefs[aiIndex % 3];
                             aiIndex++;
                             var name = $"AI{prefix}{mapId:D2}M{i:D2}";
-                            bots.Add((name, classId, mapId, scriptPath, dir, 1));
+                            bots.Add((name, classId, mapId, (string?)null, dir, 1));
                         }
                     }
                     this._logger.Information("Generating {Count} AI bots across {Maps} maps...", bots.Count, maps.Length);
