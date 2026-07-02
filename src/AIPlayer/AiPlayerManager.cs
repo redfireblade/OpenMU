@@ -294,6 +294,14 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
                 aiPlayer.Position.X,
                 aiPlayer.Position.Y);
 
+            // F7: Register FuguOrchestrator with CMA-ES evolution service
+            if (_fuguEvolution is not null && aiPlayer.Logic?.FuguOrchestrator is not null)
+            {
+                _fuguEvolution.RegisterOrchestrator(aiPlayer.Logic.FuguOrchestrator);
+                this._logger.LogDebug("[FuguEvolution] Registered {Char} for CMA-ES swarm",
+                    config.CharacterName);
+            }
+
             return new AiPlayerCreateResult(true, playerId, null);
         }
         catch (Exception ex)
@@ -377,6 +385,12 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
                 aiPlayer.CurrentMap?.Definition.Number,
                 aiPlayer.Position.X,
                 aiPlayer.Position.Y);
+
+            // F7: Register with CMA-ES
+            if (_fuguEvolution is not null && aiPlayer.Logic?.FuguOrchestrator is not null)
+            {
+                _fuguEvolution.RegisterOrchestrator(aiPlayer.Logic.FuguOrchestrator);
+            }
 
             return new AiPlayerCreateResult(true, playerId, null);
         }
