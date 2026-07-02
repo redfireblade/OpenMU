@@ -62,6 +62,9 @@ public sealed class AiPlayerLogic : IDisposable
     /// <summary>Fugu v4.0 shared memory layer (set from AiPlayerManager after construction).</summary>
     private Knowledge.SharedMemoryLayer? _sharedMemory;
 
+    /// <summary>Fugu v4.0 DAG script executor — parallel candidate evaluation.</summary>
+    private Scripting.DagScriptExecutor? _dagExecutor;
+
     /// <summary>AI behavior collector — feeds AI events into BehaviorEventStore for continuous learning.</summary>
     private AiBehaviorCollector? _behaviorCollector;
 
@@ -242,17 +245,27 @@ public sealed class AiPlayerLogic : IDisposable
     public Scripting.FuguScriptBridge? FuguBridge => _fuguBridge;
 
     /// <summary>Initializes Fugu v4.0 components. Called by AiPlayerManager after AiPlayerLogic creation.</summary>
-    public void InitializeFuguComponents(Knowledge.SharedMemoryLayer sharedMemory, string? sftWeightsPath = null)
+    public void InitializeFuguComponents(Knowledge.SharedMemoryLayer sharedMemory, Decision.FuguKanbanBoard? kanban = null, string? sftWeightsPath = null)
     {
         _sharedMemory = sharedMemory;
         var workerId = this._player.SelectedCharacter?.Name ?? $"ai_{System.Guid.NewGuid():N}";
         var logger = this._player.Logger;
         try
         {
-            // Prefer bootstrapped SFT weights over random initialization
             var weightsPath = sftWeightsPath ?? this._player.SftWeightsPath;
             _fuguOrchestrator = new OAPS.Mind.FuguOrchestrator(weightsPath, workerId, sharedMemory, logger);
             _fuguBridge = new Scripting.FuguScriptBridge(_fuguOrchestrator, logger);
+
+            // F9: DAG ScriptExecutor — parallel candidate evaluation + SoftRouter aggregation
+            if (_fuguOrchestrator.Router is not null && kanban is not null)
+            {
+                _dagExecutor = new Scripting.DagScriptExecutor(
+                    _fuguOrchestrator.Router, kanban,
+                    logger as Microsoft.Extensions.Logging.ILogger<Scripting.DagScriptExecutor>
+                    ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<Scripting.DagScriptExecutor>.Instance);
+                logger.LogInformation("[Fugu] DAG executor initialized for {Worker}", workerId);
+            }
+
             logger.LogInformation("[Fugu] v4.0 orchestrator initialized for {Worker}{Bootstrap}",
                 workerId, weightsPath is not null ? " (bootstrapped)" : "");
         }

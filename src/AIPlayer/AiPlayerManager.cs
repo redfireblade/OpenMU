@@ -252,10 +252,11 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
             }
 
             // Initialize Fugu v4.0 + AiCollector before AI logic starts
-            if (_sharedMemory is not null)
-            {
-                aiPlayer.SharedMemory = _sharedMemory;
-            }
+            aiPlayer.SharedMemory = _sharedMemory;
+            aiPlayer.FuguKanban = _kanbanBoard;
+
+            // F11: Access Control List — agent isolation per Fugu design
+            aiPlayer.Acl = new Knowledge.AccessControlList(config.CharacterName ?? playerId.ToString("N"));
 
             aiPlayer.BehaviorEventStore = _behaviorEventStore;
             aiPlayer.SftWeightsPath = Path.Combine(AppContext.BaseDirectory, "scripts", "learned", "fugu_sft_weights_bootstrap.bin");
@@ -365,10 +366,11 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
         try
         {
             // Initialize Fugu v4.0 + AiCollector before AI logic starts
-            if (_sharedMemory is not null)
-            {
-                aiPlayer.SharedMemory = _sharedMemory;
-            }
+            aiPlayer.SharedMemory = _sharedMemory;
+            aiPlayer.FuguKanban = _kanbanBoard;
+
+            // F11: Access Control List — agent isolation per Fugu design
+            aiPlayer.Acl = new Knowledge.AccessControlList(characterName ?? playerId.ToString("N"));
 
             aiPlayer.BehaviorEventStore = _behaviorEventStore;
             aiPlayer.SftWeightsPath = Path.Combine(AppContext.BaseDirectory, "scripts", "learned", "fugu_sft_weights_bootstrap.bin");
@@ -395,7 +397,7 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
             }
 
             // F10: SwarmOrchestrator worker registration
-            _swarmOrchestrator?.RegisterWorker(characterName, _kanbanBoard!);
+            _swarmOrchestrator?.RegisterWorker(characterName ?? "unknown", _kanbanBoard!);
 
             return new AiPlayerCreateResult(true, playerId, null);
         }

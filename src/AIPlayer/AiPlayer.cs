@@ -76,8 +76,14 @@ public sealed class AiPlayer : Player
     /// </summary>
     public ExperienceLearner? ExperienceLearner { get; internal set; }
 
-    /// <summary>Gets the Fugu v4.0 shared memory layer for this AI character.</summary>
+    /// <summary>Fugu v4.0 shared memory layer for this AI character.</summary>
     public Knowledge.SharedMemoryLayer? SharedMemory { get; internal set; }
+
+    /// <summary>Fugu v4.0 Kanban board (set by AiPlayerManager).</summary>
+    public Decision.FuguKanbanBoard? FuguKanban { get; internal set; }
+
+    /// <summary>Fugu v4.0 Access Control List — agent isolation (F11).</summary>
+    public Knowledge.AccessControlList? Acl { get; set; }
 
     /// <summary>Gets or sets the behavior event store for AI event collection.</summary>
     public BehaviorEventStore? BehaviorEventStore { get; internal set; }
@@ -193,7 +199,7 @@ public sealed class AiPlayer : Player
             // Initialize Fugu v4.0 routing if shared memory is available
             if (this.SharedMemory is not null)
             {
-                this.Logic.InitializeFuguComponents(this.SharedMemory);
+                this.Logic.InitializeFuguComponents(this.SharedMemory, this.FuguKanban);
             }
 
             this.Logger.LogDebug(

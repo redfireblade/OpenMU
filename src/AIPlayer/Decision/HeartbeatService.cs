@@ -183,6 +183,18 @@ public sealed class HeartbeatService : IEventBroadcaster
         if (KnowledgeGraphHolder.Graph is { } kg)
         {
             this._runtimeLearner = new KnowledgeGraphRuntimeLearner(kg, logger);
+
+            // F13: Upsert worker profile in KG for swarm task assignment
+            try
+            {
+                var wp = new Knowledge.KnowledgeGraph.WorkerProfileNode(
+                    kg, logger as Microsoft.Extensions.Logging.ILogger<Knowledge.KnowledgeGraph.WorkerProfileNode>
+                    ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<Knowledge.KnowledgeGraph.WorkerProfileNode>.Instance);
+                var name = player.SelectedCharacter?.Name ?? "unknown";
+                wp.UpsertProfile(name, "combat", 0.5f);
+                wp.UpsertProfile(name, "survival", 0.5f);
+            }
+            catch { /* non-critical */ }
         }
 
         this._marketPrice = new MarketPriceService(logger);
