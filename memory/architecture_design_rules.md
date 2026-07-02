@@ -1,8 +1,8 @@
 # 架构设计规则 (Architecture Design Rules)
 
-> 版本: 1.3
+> 版本: 1.4
 > 状态: 生效
-> 最后更新: 2026-06-02
+> 最后更新: 2026-06-18
 
 ## AR-01 至 AR-18 (略)
 
@@ -137,7 +137,7 @@ ProcessGoto (paragraph switch):
 
 ## AR-30: 死亡重生规则 (Death Respawn Rule)
 
-**状态: 生效** · 2026-06-16
+**状态: 生效** · 2026-06-16 · 更新: 2026-06-16 (双路径协调 + 死亡循环保护)
 
 ### 规则
 
@@ -148,6 +148,44 @@ ProcessGoto (paragraph switch):
 5. **执行器重置** — 重生后必须清空 `_scriptExecutor = null`，防止旧脚本上下文干扰新周期。
 6. **死亡计时器** — `_deathStartTime` 在死亡瞬间记录 `DateTime.UtcNow`，5 秒后仍未复活 → 调用 `RespawnPlayerAsync()` 手动触发。
 7. **卡死绕过** — 当 `hp > 0` 但 `IsAlive = false` 或 `PlayerState == Dead/Disconnected` 时（如通过 API set-hp 强行补血后），心跳循环应强制恢复 Alive 状态并推进到 EnteredWorld。
+
+### AR-30a: 双复活路径协调规则
+
+**状态: 生效** · 2026-06-17
+
+**背景**: AIPlayer 系统存在两条独立的复活路径，必须协调工作：
+
+| 路径 | 触发者 | 执行者 | 方式 |
+|------|--------|--------|------|
+| **ScriptExecutor wait_respawn** | 脚本节点 | ScriptExecutor.TickAsync | 5秒后 WarpToSafezoneAsync + 满血 |
+| **HeartbeatService BeatAsync** | 心跳主循环 | HeartbeatService.RespawnPlayerAsync | 5秒后 WarpToSafezoneAsync + 满血 |
+
+**规则**:
+1. **ScriptExecutor 必须先于 HeartbeatService 执行复活** — 因为 ScriptExecutor 在 TickCoreAsync 内部被调用，先于 HeartbeatService.BeatAsync。
+2. **两条路径必须发布事件** — ScriptExecutor 复活后必须通过 `PublishDeathEvent()/PublishRespawnEvent()` 通知 HeartbeatService，保证 `_respawnDeathStreak` 正确更新。
+3. **不论哪条路径复活，结果相同** — 都是 `WarpToSafezoneAsync` → `ClientReadyAfterMapChangeAsync` → HP 满 → `IsAlive=true`。
+4. **HeartbeatService 的死亡循环检测依赖事件** — `_respawnDeathStreak` 在 OnDeath 中递增、OnMonsterKilled 中归零、OnRespawn 中检查 ≥3 次触发换图。
+5. **HeartbeatService 的 PostRespawnSupplyAsync 只在 HeartbeatService 复活路径运行** — ScriptExecutor 复活后不补给药水/修装备（脚本通常有独立的补给逻辑）。
+
+### AR-30b: 死亡循环保护规则 (Death Loop Protection)
+
+**状态: 生效** · 2026-06-17
+
+**问题**: AI 在同一高危地图反复死亡 — 复活 → 回到同一热点 → 再次死亡。
+
+**保护机制**:
+
+| 层 | 阈值 | 动作 | 拥有者 |
+|----|------|------|--------|
+| L1 | 连续死 3 次 | 设置 TargetMapNumber=3 (Devias) | ScriptExecutor + HeartbeatService |
+| L2 | 连续死 5 次 | 强制停止当前脚本 + 换图 Devias | ScriptExecutor |
+| L3 | 快速死亡 ≥3 次 (30秒窗口) | 清空看板 + 换图 Devias | HeartbeatService OnRespawn |
+
+**关键约束**:
+1. **`_consecutiveDeaths` 不在击杀时重置** — 击杀不等于打破死亡循环。`_consecutiveDeaths` 只在 `ResetDeathState()`（hot-reload/脚本正常完成）时归零。
+2. **`_respawnDeathStreak` 由 HeartbeatService 的 OnDeath/OnMonsterKilled 管理** — 成功击杀怪物自动归零（HP 归零 → 破环证明）。
+3. **ScriptExecutor 必须发布死亡/复活事件** — 否则 HeartbeatService 看不到任何状态变化。
+4. **换图后不保证存活** — 只是打破当前死亡循环。AI 决策系统需要自行评估新地图的生存能力（见 AR-31 热点选择规则）。
 8. **不跨地图复活** — 禁止使用 `WarpToAsync(newGate)` 跨图传送。只使用当前地图的 `SafeZoneSpawnGate`。
 9. **复活后补给** — 复活后执行 `PostRespawnSupplyAsync()`：找附近商店NPC → 修理全部装备 → 购买药水 → 关闭对话框。
 
@@ -156,3 +194,118 @@ ProcessGoto (paragraph switch):
 不遵守此规则（跨地图复活、出生在不可行走格、HP未恢复满）将导致 AI 在安全区也无法正常活动，反复死亡或卡在地形中。
 
 ---
+
+## AR-32: 双客户路径数据源抽象 (Dual-Client Data Source Abstraction)
+
+**状态: 生效** · 2026-06-18
+
+### 背景
+
+AIPlayer 系统面向两类客户：
+
+| 客户类型 | 数据源 | 接入方式 | 信息完整度 |
+|---------|--------|---------|-----------|
+| **游戏厂商/运营商 (OEM)** | 服务器内部 API | hook `GameContext`、`PeriodicTaskBasePlugIn` 状态机 | 结构化数据全量（MapId、怪物列表、配置参数等） |
+| **玩家/陪玩 (End-User)** | 客户端可见信息 | 屏幕识别/封包解析/日志分析 | 纯文本消息 + 客户端状态 |
+
+**核心约束**: 决策和执行层必须统一，只有数据源感知层（绿色层）分叉。
+
+### 规则
+
+1. **红色层（数据源感知层）可互换** — AI 系统与游戏世界的接口必须抽象为 `IGameEventSource`，OEM 模式下由服务器内部事件驱动，玩家模式下由客户端信息驱动。**上层（决策、执行、经验）完全不知道下层数据来源。**
+
+2. **黄色层（公告/事件识别层）随模式不同实现复杂度不同** — OEM 模式下直接收到结构化 `InvasionGameServerState`，玩家模式下需要从文本解析 → 匹配公告模式 → 经经验库辅助确认，才能得到相同的结构化事件。
+
+3. **绿色层（决策+执行+经验）完全统一** — 不论 OEM 还是玩家模式，规则引擎、脚本执行器、经验积累系统、群体学习系统完全一致。
+
+### 架构分层
+
+```
+OEM 模式                             玩家模式
+─────────                            ────────
+                                         屏幕识别/封包解析/日志
+                                             ↓
+IGameEventSource (OEM 实现)           IGameEventSource (玩家实现)
+  ┌──────────────────┐                 ┌──────────────────────┐
+  │ PeriodicTask     │                 │ 文本公告 → 公告模式库  │
+  │ BasePlugIn hook  │                 │ → 公告日志 → 经验辅助  │
+  │ → 结构化事件     │                 │ → 推测结构化事件       │
+  └──────────────────┘                 └──────────────────────┘
+           ↓ 结构化事件                          ↓ 结构化事件(推测)
+┌──────────────────────────────────────────────────────────────┐
+│                     AI 核心层 (统一)                          │
+│                                                              │
+│  Event → EventHandlers → BoardState → RuleEngine              │
+│       → MissionItem → 执行 → ActionLog                        │
+│       → 群体经验库 → 规则提炼                                  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 接口定义
+
+```csharp
+/// <summary>
+/// 事件源抽象 ── OEM模式/玩家模式共用此接口。
+/// 实现者负责将原始数据（结构化或文本）转换为标准结构化事件。
+/// </summary>
+public interface IGameEventSource
+{
+    /// <summary>入侵事件（黄金怪/红龙等户外定时刷怪事件）</summary>
+    event Action<InvasionEvent>? OnInvasion;
+    
+    /// <summary>副本入口开放事件（血色/恶魔/死亡城堡）</summary>
+    event Action<MiniGameEvent>? OnMiniGameOpen;
+    
+    /// <summary>增益事件（欢乐时光等全局加成）</summary>
+    event Action<BuffEvent>? OnBuffActive;
+    
+    /// <summary>BOSS 刷新事件（由公告或扫描触发）</summary>
+    event Action<BossSpawnEvent>? OnBossSpawn;
+    
+    /// <summary>系统公告（无法解析为以上类型时 fallback）</summary>
+    event Action<SystemMessageEvent>? OnSystemMessage;
+}
+```
+
+### OEM 实现要点
+
+- 直接 hook `PeriodicTaskBasePlugIn` 基类加 `StateChanged` 事件
+- `InvasionEvent` 直接从 `InvasionGameServerState` + `InvasionMobSpawn[]` 提取
+- `MiniGameEvent` 直接从 `MiniGameDefinition` 配置提取
+- 所有字段 100% 精确（怪物编号、地图编号、等级范围、时长）
+
+### 玩家模式实现要点
+
+- 从 `IShowMessagePlugIn.ShowMessageAsync()` 流入的文本或屏幕 OCR 文字出发
+- 公告模式库收集常见文本模板：`"[{mapName}] Golden Invasion!"`、`"Blood Castle entrance..."` 
+- 第一次遇到新公告 → 记录到公告日志 → 无法结构化时由经验系统逐步总结
+- 公告模式的识别准确度随样本量增加（见 `02_KNOWLEDGE/ai_experience_system.md`）
+- 公告日志累积足够后，出 `RuleCandidate` 补到公告模式库
+
+### 经验系统的双路径价值
+
+| | OEM 模式 | 玩家模式 |
+|---|---------|---------|
+| 公告解析 | 不需要经验，直接读结构化数据 | **需要经验系统**来识别文本公告的模式 |
+| 掉落知识 | 读 DropItemGroups 即知 | 击杀后才知，靠日志积累 |
+| 地图知识 | 读 MapDefinition 即知 | 走过才知，靠影子地图层 |
+| 怪物属性 | 读 MonsterDefinition 即知 | 攻击后采集，靠观察记录 |
+| 规则生成 | 基于完整数据分析 | 基于概率统计，置信度较低 |
+
+### 文件清单
+
+| 文件 | 说明 |
+|------|------|
+| `src/AIPlayer/EventSource/IGameEventSource.cs` | 事件源接口定义 |
+| `src/AIPlayer/EventSource/OemEventSource.cs` | OEM 模式实现（hook 服务器 API） |
+| `src/AIPlayer/EventSource/ClientEventSource.cs` | 玩家模式实现（文本解析+经验辅助） |
+| `src/AIPlayer/EventSource/Models/InvasionEvent.cs` | 标准化事件模型 |
+| `src/AIPlayer/EventSource/Models/MiniGameEvent.cs` | (同上) |
+| `src/AIPlayer/EventSource/Models/BuffEvent.cs` | (同上) |
+| `src/AIPlayer/EventSource/Models/BossSpawnEvent.cs` | (同上) |
+
+### 关联文档
+
+- `memory/02_KNOWLEDGE/game_announcement_system.md` — 游戏公告体系分析
+- `memory/02_KNOWLEDGE/ai_experience_system.md` — 经验积累与群体学习
+- `memory/knowledge_to_rules_analysis.md` — 规则化需求总览
