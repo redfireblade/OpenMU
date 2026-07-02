@@ -82,6 +82,9 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
     /// <summary>Fugu v4.0 冷启动引导器 — 从领域知识生成初始 SFT 权重。</summary>
     private OAPS.Evolution.FuguColdStartBootstrapper? _fuguBootstrapper;
 
+    /// <summary>Fugu v4.0 五列看板 — 监视所有 AI 任务状态(TODO/IN_PROG/REVIEW/DONE/BLOCKED)。</summary>
+    private Decision.FuguKanbanBoard? _kanbanBoard;
+
     /// <summary>Fugu v4.0 Worker 可用性追踪 — 死亡/断线检测 + 动态聚合器选择。</summary>
     private OAPS.Evolution.WorkerAvailabilityService? _workerAvailability;
 
@@ -1145,6 +1148,14 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
                     _fuguEvolution.Start();
                     _swarmOrchestrator.Start();
                     _rewardAggregator.Start();
+
+                    // ═══ Fugu v4.0 五列看板 — REVIEW列体现 reward 反馈机制 ═══
+                    _kanbanBoard = new Decision.FuguKanbanBoard(
+                        _logger as Microsoft.Extensions.Logging.ILogger<Decision.FuguKanbanBoard>
+                        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<Decision.FuguKanbanBoard>.Instance);
+                    _rewardAggregator.SetKanban(_kanbanBoard);
+
+                    logger.LogInformation("[OAPS-v4] Fugu 组件已启动: SharedMemory + FuguEvolution + SwarmOrchestrator + RewardAggregator + KanbanBoard");
 
                     // Initialize SFT trainer
                     var softBucketStore = new OAPS.Evolution.SoftBucketStore(

@@ -52,9 +52,38 @@ public sealed class OapsKnowledgeBridge
             foreach (var seg in segments)
                 seg.CapacityLabel ??= InferCapacity(seg);
 
-            // 3. 归桶
+            // 3. 硬归桶
             _bucketStore.BucketSegments(segments);
             _logger.LogInformation("[OAPS] {P}: {Seg}段 → {Buck}桶", playerName, segments.Count, _bucketStore.GetAllBuckets().Count);
+
+            // 3.5 v4.0 软蒸馏 — 将每段行为转换为7维概率分布
+            // {combat, patrol, pickup, flee, interact, restock, quest}
+            // 3.5 v4.0 软蒸馏 — 将行为段转为概率分布并训练分类器
+            var softBucketStore = new SoftBucketStore(
+                _logger as Microsoft.Extensions.Logging.ILogger<SoftBucketStore>
+                ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<SoftBucketStore>.Instance);
+            foreach (var seg in segments.Take(100))
+            {
+                var entry = new SoftBucketEntry
+                {
+                    SegmentId = seg.SegmentId,
+                    Distribution = new float[7], // 7维: combat/patrol/pickup/flee/interact/restock/quest
+                    Context = new OAPS.Mind.StateVector(),
+                    Reward = seg.KillCount * 10f,
+                };
+                // 根据段类型填充分布
+                var idx = seg.SegmentType switch
+                {
+                    SegmentType.Hunting => 0,
+                    SegmentType.Restock => 5,
+                    SegmentType.Quest => 6,
+                    _ => 1,
+                };
+                for (int d = 0; d < 7; d++) entry.Distribution[d] = d == idx ? 0.7f : 0.05f;
+                softBucketStore.AddEntry(entry);
+            }
+            var loss = softBucketStore.TrainFromEntries(0.01f, 5, 32);
+            _logger.LogInformation("[OAPS-v4] 软蒸馏完成: loss={Loss:F4}", loss);
 
             // 4. 合并
             foreach (var m in segments.Select(s => s.MapNumber).Distinct())
