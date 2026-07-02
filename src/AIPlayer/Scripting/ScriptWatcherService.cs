@@ -80,6 +80,9 @@ public sealed class ScriptWatcherService : IDisposable
         {
             foreach (var file in Directory.EnumerateFiles(this._scriptsDirectoryPath, "*.json", SearchOption.AllDirectories))
             {
+                // 排除学习脚本 — 学习脚本是旁观者系统的输出记录，
+                // 应通过 RuleEngine → DecisionCore 路径执行，而非 1D ScriptExecutor
+                if (Path.GetFileName(file).StartsWith("learned_", StringComparison.OrdinalIgnoreCase)) continue;
                 this.TryRegisterScript(file);
             }
 
@@ -239,6 +242,9 @@ public sealed class ScriptWatcherService : IDisposable
     {
         try
         {
+            // 排除学习脚本 — learned_*.json 由 RuleEngine/DecisionCore 路径执行
+            if (Path.GetFileName(filePath).StartsWith("learned_", StringComparison.OrdinalIgnoreCase)) return;
+
             if (!File.Exists(filePath))
             {
                 return;
