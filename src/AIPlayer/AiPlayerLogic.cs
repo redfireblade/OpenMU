@@ -581,7 +581,7 @@ public sealed class AiPlayerLogic : IDisposable
             catch (Exception ex)
             {
                 logger.LogWarning(ex, "[OAPS] CognitiveLoop.ThinkAsync failed");
-                mindResult = new DecisionResult { Action = DecisionAction.Wait, Reason = "exception" };
+                mindResult = DecisionResult.NoAction();
             }
 
             if (mindResult.Action != DecisionAction.Wait)

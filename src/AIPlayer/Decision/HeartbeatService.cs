@@ -40,6 +40,7 @@ public sealed class HeartbeatService : IEventBroadcaster
     private readonly ILogger _logger;
     private readonly NpcInteractionService _npcService;
     private readonly BehaviorContext _context;
+    private readonly OAPS.Mind.DecisionCore _decisionCore; // v4.0 Fugu 三轨决策核心
 
     private readonly SurvivalMode _survival;
     private readonly PetHandlerModule _petHandler;
@@ -211,6 +212,7 @@ public sealed class HeartbeatService : IEventBroadcaster
 
         // 规则引擎初始化
         this._ruleEngine = new RuleEngine(this._scriptLib, logger);
+        this._decisionCore = new OAPS.Mind.DecisionCore(logger);
 
         // 行为日志服务（引用群体经验服务）
         this._expService = this._context.ExpService ?? new Decision.Experience.ExperienceService(AppContext.BaseDirectory, logger);
@@ -734,7 +736,17 @@ public sealed class HeartbeatService : IEventBroadcaster
             // 不像旧的同步模式那样 return 阻塞 tick
         }
 
-        // === 6) 决策：选当前任务 ===
+        // === 6) v4.0 决策核心：三轨评估 → 选任务 ===
+        // T1(RuleEngine)→T2(ScriptExecutor)→T3(SoftRouter) 三轨评估
+        var dCoreResult = await this._decisionCore.DecideAsync(
+            this._player, this._adapter, this._ruleEngine, this._scriptLib).ConfigureAwait(false);
+
+        // 学习规则匹配且执行成功 → 记录决策，继续看板任务选择
+        if (dCoreResult.IsLearnedRule)
+        {
+            this._context.RecordDecision(dCoreResult.ActionName, TimeSpan.Zero);
+        }
+
         var current = await this._decisionSystem.SelectCurrentTaskAsync().ConfigureAwait(false);
         if (current is null)
         {
