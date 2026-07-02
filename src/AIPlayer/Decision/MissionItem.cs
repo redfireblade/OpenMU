@@ -6,6 +6,7 @@ namespace MUnique.OpenMU.AIPlayer.Decision;
 
 using MUnique.OpenMU.DataModel.Configuration.Quests;
 using MUnique.OpenMU.AIPlayer.Scripting;
+using MUnique.OpenMU.GameLogic.MiniGames;
 
 /// <summary>
 /// 看板任务条目 — "今天要做的一件事"。
@@ -54,6 +55,12 @@ public sealed class MissionItem
 
     /// <summary>模块自定义上下文数据 (如 material_farm 用到的 ItemGroup/MonsterNumber 等)。</summary>
     public Dictionary<string, object> Context { get; set; } = new();
+
+    /// <summary>目标物品等级 (如 material_farm 刷取的材料等级)。</summary>
+    public int TargetLevel { get; set; }
+
+    /// <summary>目标迷你游戏类型 (关联的副本类型上下文)。</summary>
+    public MiniGameType TargetType { get; set; }
 
     /// <summary>脚本引用 — 看板不生成脚本，只引用已存在的脚本。</summary>
     public BehaviorScript? Script { get; set; }
@@ -105,6 +112,20 @@ public sealed class MissionItem
 
     /// <summary>最大重复次数 (-1 = 无限, 0 = 单次不可重复)。</summary>
     public int MaxRepeatCount { get; set; } = -1;
+
+    // ========== 每日次数限制 ==========
+
+    /// <summary>当天最大执行次数 (0=不限制, 默认0)。</summary>
+    public int DailyMaxCount { get; set; }
+
+    /// <summary>当天已执行次数。每次进入 Completed 时递增，跨天重置。</summary>
+    public int DailyCount { get; set; }
+
+    /// <summary>当天是否已达上限。</summary>
+    public bool IsDailyLimitReached => this.DailyMaxCount > 0 && this.DailyCount >= this.DailyMaxCount;
+
+    /// <summary>上次执行日期(UTC Date)，用于跨天重置 DailyCount。</summary>
+    public DateTime? LastExecutedDay { get; set; }
 
     // ========== AR-25 失败重试字段 ==========
 
@@ -177,6 +198,7 @@ public enum MissionType
     Survival,    // 生存刷怪
     ItemFarm,    // 物品收集
     Emergency,   // 紧急事件 (死亡/卡住)
+    Exploration, // 探索任务 — 旁观者学习的热点狩猎/巡逻/寻路规则
 }
 
 /// <summary>任务状态。</summary>

@@ -121,11 +121,11 @@ public sealed class RuleEngine
             .OrderBy(m => m.Rule.Priority)
             .FirstOrDefault();
 
-        if (best != default)
+        if (best.Rule is not null)
         {
             this._logger.LogDebug(
-                "[RuleEngine] Learned rule matched: {RuleId} -> {ScriptId} ({Description}) confidence={Conf}",
-                best.Rule.RuleId, best.Rule.ScriptId, best.Rule.Description, best.Rule.Confidence);
+                "[RuleEngine] Learned rule matched: {RuleId} -> {ScriptId} confidence={Conf}",
+                best.Rule.RuleId, best.Rule.ScriptId, best.Rule.Confidence);
             return new RuleMatchResult(best.Rule, best.Mission);
         }
 
@@ -322,10 +322,12 @@ public sealed class RuleEngine
         var missionType = rule.Category.ToLowerInvariant() switch
         {
             "craft" or "quest" => MissionType.Quest,
+            "learned" or "experience" => MissionType.Exploration, // 学习规则 → 探索任务
             _ => MissionType.Survival,
         };
 
         // Survival 类规则由心跳服务直接处理，不需要生成独立任务
+        // 但 learned/experience 规则是旁观者学习的经验，必须生成Mission任务
         if (missionType == MissionType.Survival)
         {
             return null;
