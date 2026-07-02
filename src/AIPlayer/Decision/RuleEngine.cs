@@ -427,6 +427,10 @@ public sealed class RuleEngine
             "gold_lt" => player.Money < GetIntParam(rule, "amount"),
             "has_item_by_name" => HasItemByName(inventory, GetStringParam(rule, "itemName")),
             "level_range" => player.Level >= GetIntParam(rule, "min") && player.Level <= GetIntParam(rule, "max"),
+            // Learned rule conditions: "on_map_N" → check if AI is on map N
+            _ when rule.Condition.StartsWith("on_map_") =>
+                int.TryParse(rule.Condition["on_map_".Length..], out var mapNum)
+                && adapter.GetCurrentMap()?.Definition.Number == mapNum,
             _ => false,
         };
     }
