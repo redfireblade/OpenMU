@@ -28,7 +28,7 @@ public sealed class CombatHandler
     private const short DrainLifeStrengthenerSkillId = 458;
     private const short DrainLifeMasterySkillId = 462;
 
-    private readonly OfflinePlayer _player;
+    private readonly Player _player;
     private readonly IMuHelperSettings? _config;
     private readonly MovementHandler _movementHandler;
     private readonly BuffHandler _buffHandler;
@@ -48,7 +48,7 @@ public sealed class CombatHandler
     /// <param name="movementHandler">The movement handler.</param>
     /// <param name="buffHandler">The buff handler.</param>
     /// <param name="originPosition">The original position to hunt around.</param>
-    public CombatHandler(OfflinePlayer player, IMuHelperSettings? config, MovementHandler movementHandler, BuffHandler buffHandler, Point originPosition)
+    public CombatHandler(Player player, IMuHelperSettings? config, MovementHandler movementHandler, BuffHandler buffHandler, Point originPosition)
     {
         this._player = player;
         this._config = config;
@@ -251,8 +251,11 @@ public sealed class CombatHandler
     {
         await target.AttackByAsync(this._player, null, false).ConfigureAwait(false);
 
+        // AT_ATTACK1 = 120 in client _enum.h — the standard melee attack animation.
+        // See mu103/src/source/Core/Globals/_enum.h line 3355
+        const byte meleeAttackAnimation = 120;
         await this._player.ForEachWorldObserverAsync<IShowAnimationPlugIn>(
-            p => p.ShowAnimationAsync(this._player, 120, target, this._player.Rotation),
+            p => p.ShowAnimationAsync(this._player, meleeAttackAnimation, target, this._player.Rotation),
             includeThis: true).ConfigureAwait(false);
     }
 
@@ -298,12 +301,20 @@ public sealed class CombatHandler
             return null;
         }
 
-        // If no skills are configured at all, don't attack.
+        // If no skills are configured at all, auto-detect from player's skill list.
+        // This ensures AI characters with learned skills (e.g. Dark Wizard Energy Ball)
+        // actually use them instead of always punching.
         if (this._config.BasicSkillId == 0
             && this._config.ActivationSkill1Id == 0
             && this._config.ActivationSkill2Id == 0)
         {
-            return null;
+            return this._player.SkillList?.Skills
+                .FirstOrDefault(s => s.Skill is not null
+                    && (s.Skill.SkillType == SkillType.DirectHit
+                        || s.Skill.SkillType == SkillType.AreaSkillAutomaticHits
+                        || s.Skill.SkillType == SkillType.AreaSkillExplicitTarget
+                        || s.Skill.SkillType == SkillType.AreaSkillExplicitHits)
+                    && this.HasEnoughResources(s));
         }
 
         foreach (var slot in this._conditionalSkillSlots)

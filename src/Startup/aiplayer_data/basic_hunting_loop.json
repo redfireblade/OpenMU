@@ -15,8 +15,8 @@
     "mpThreshold": 0.20,
     "maxLevelDiff": 30,
     "patrolRadius": 15,
-    "attackRange": 3.0,
-    "pickupFilter": "rare_and_above",
+    "attackRange": 6.0,
+    "pickupFilter": "all",
     "returnWhenInventoryFull": false,
     "searchRange": 20,
     "potionCooldownMs": 2000,
@@ -29,10 +29,9 @@
     "questNumber": 1,
     "questNpcNumber": 257,
     "hotspots": [
-      { "x": 130, "y": 110, "name": "出生点" },
-      { "x": 150, "y": 140, "name": "中央区域" },
-      { "x": 170, "y": 120, "name": "右侧区域" },
-      { "x": 110, "y": 140, "name": "左侧区域" }
+      { "x": 190, "y": 200, "map": 3, "name": "蜘蛛区1", "x1": 130, "y1": 200, "x2": 195, "y2": 235 },
+      { "x": 160, "y": 220, "map": 3, "name": "蜘蛛区2", "x1": 130, "y1": 200, "x2": 195, "y2": 235 },
+      { "x": 140, "y": 210, "map": 3, "name": "蜘蛛区3", "x1": 130, "y1": 200, "x2": 195, "y2": 235 }
     ]
   },
 
@@ -54,6 +53,12 @@
         },
         {
           "name": "inventory_check",
+          "condition": "inventory_nearly_full",
+          "action": "goto @restock",
+          "comment": "背包>80%→回城卖物补药"
+        },
+        {
+          "name": "inventory_full_check",
           "condition": "inventory_full",
           "action": "goto @restock",
           "comment": "背包满→跳转补给段"
@@ -71,16 +76,16 @@
           "comment": "任务条件满足→交任务"
         },
         {
-          "name": "accept_if_none",
-          "condition": "no_active_quest",
-          "action": "goto @accept_quest",
-          "comment": "无活跃任务→接任务"
+          "name": "level_gate",
+          "condition": "level_low",
+          "action": "goto @hunt",
+          "comment": "≤Lv15→不做任务，直接安全区巡逻练级"
         },
         {
-          "name": "has_quest_go_hunt",
-          "condition": "has_active_quest",
-          "action": "goto @hunt",
-          "comment": "有活跃任务→狩猎"
+          "name": "need_quest",
+          "condition": "no_active_quest",
+          "action": "goto @accept_quest",
+          "comment": "Lv15+没有活跃任务→去接任务"
         },
         {
           "name": "enter_hunt",
@@ -95,68 +100,110 @@
       "label": "hunt",
       "nodes": [
         {
+          "name": "death_check",
+          "condition": "is_dead",
+          "action": "goto @recover",
+          "comment": "P0 死亡→跳转恢复段"
+        },
+        {
+          "name": "revived_check",
+          "condition": "just_revived",
+          "action": "goto @recover",
+          "comment": "P0.1 刚复活→跳转恢复段"
+        },
+        {
           "name": "quest_check",
           "condition": "quest_conditions_met",
           "action": "goto @submit_quest",
-          "comment": "P0 任务完成检查"
+          "comment": "P0.2 任务完成检查"
         },
         {
-          "name": "hp_check",
-          "condition": "hp_below_threshold",
-          "action": "use_hp_potion",
-          "comment": "P0 生存: HP低于阈值喝药"
+          "name": "quest_hunt_redirect",
+          "condition": "has_active_quest",
+          "action": "goto @quest_hunt",
+          "comment": "P0.3 有未完成任务→去任务区"
         },
         {
-          "name": "mp_check",
+          "name": "map_check",
+          "condition": "not_on_hunt_map",
+          "action": "warp_to_map",
+          "parameters": { "targetMapNumber": 3 },
+          "comment": "P0.5 地图检查: 不在Noria→直接传送"
+        },
+        {
+          "name": "regen_before_combat",
           "condition": "mp_below_threshold",
-          "action": "use_mp_potion",
-          "comment": "P1 续航: MP低于阈值喝蓝"
+          "action": "sit_regen",
+          "comment": "P0.6 打之前蓝不够→坐下回蓝"
         },
         {
-          "name": "leave_safezone",
-          "condition": "in_safe_zone",
-          "action": "leave_safezone",
-          "comment": "P2 脱安全区"
+          "name": "walking_guard",
+          "condition": "is_walking",
+          "action": "goto @hunt",
+          "comment": "行走中→重新开始段落，不打断走路"
         },
         {
-          "name": "attack_current",
-          "condition": "has_target_in_range",
-          "action": "attack_target",
-          "comment": "P3 战斗: 目标在攻击范围内→攻击"
+          "name": "emergency_combat",
+          "condition": "monster_nearby",
+          "action": "goto @combat",
+          "comment": "附近有怪→停下战斗"
         },
         {
-          "name": "approach_current",
-          "condition": "has_target_not_in_range",
-          "action": "approach_target",
-          "comment": "P3 战斗: 目标不在范围内→接近"
+          "name": "target_shortcut",
+          "condition": "has_target",
+          "action": "goto @combat",
+          "comment": "P1 有目标→跳转战斗段（跳过巡逻/拾取等非战斗节点）"
         },
         {
           "name": "find_target",
           "condition": "no_target",
           "action": "find_nearest_monster",
-          "comment": "P3 战斗: 无目标→索敌"
+          "comment": "P2 无目标→索敌"
+        },
+        {
+          "name": "hp_check",
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "P3 喝红"
+        },
+        {
+          "name": "mp_check",
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "comment": "P4 喝蓝"
+        },
+        {
+          "name": "leave_safezone",
+          "condition": "in_safe_zone",
+          "action": "leave_safezone",
+          "comment": "P5 脱安全区"
         },
         {
           "name": "pickup_items",
           "condition": "always",
           "action": "pickup_nearby",
-          "comment": "P3.5 拾取地上的物品"
+          "comment": "P6 拾取物品"
         },
         {
           "name": "no_monsters_relocate",
           "condition": "no_monsters_recently",
           "action": "relocate_to_hotspot",
-          "comment": "P4 换点: 长时间无怪→换到下一个热点"
+          "comment": "P7 长时间无怪→继续换热点"
         },
         {
           "name": "patrol",
           "condition": "always",
           "action": "random_patrol",
-          "comment": "P5 空闲: 在热点周边巡逻"
+          "comment": "P8 巡逻"
+        },
+        {
+          "name": "buff_check",
+          "condition": "has_buff_to_cast",
+          "action": "use_buff",
+          "comment": "P99 最后加Buff（不干扰战斗）"
         }
       ]
     },
-
     {
       "label": "accept_quest",
       "nodes": [
@@ -177,8 +224,8 @@
         {
           "name": "check_accepted",
           "condition": "has_active_quest",
-          "action": "goto @hunt",
-          "comment": "已接任务→去狩猎"
+          "action": "goto @quest_hunt",
+          "comment": "已接任务先去蜘蛛区再狩猎"
         },
         {
           "name": "try_accept",
@@ -190,8 +237,246 @@
         {
           "name": "fallback",
           "condition": "always",
-          "action": "stop",
-          "comment": "安全兜底→停止脚本(防无限循环)"
+          "action": "goto @start",
+          "comment": "回到主循环(接任务或未接成都要继续)"
+        }
+      ]
+    },
+    {
+      "label": "combat",
+      "nodes": [
+        {
+          "name": "death_check",
+          "condition": "is_dead",
+          "action": "goto @recover",
+          "comment": "P0 战斗中死亡→跳转恢复"
+        },
+        {
+          "name": "acquire_target",
+          "condition": "no_target",
+          "action": "find_nearest_monster",
+          "comment": "P0.5 无目标→先索敌"
+        },
+        {
+          "name": "pre_mp_check",
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "comment": "P0.6 开打前先补蓝"
+        },
+        {
+          "name": "pre_hp_check",
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "P0.7 开打前先补血"
+        },
+        {
+          "name": "attack",
+          "condition": "has_target_in_range",
+          "action": "attack_target",
+          "comment": "P1 攻击范围内目标（每次5连击）"
+        },
+        {
+          "name": "hp_check",
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "P3 战斗中喝红"
+        },
+        {
+          "name": "mp_check",
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "comment": "P4 战斗中喝蓝"
+        },
+        {
+          "name": "mp_regen",
+          "condition": "mp_below_threshold",
+          "action": "sit_regen",
+          "comment": "P4.5 没蓝也没药了→坐下回蓝"
+        },
+        {
+          "name": "target_alive_check",
+          "condition": "has_target",
+          "action": "goto @combat",
+          "comment": "P6 目标还活着→继续战斗循环"
+        },
+        {
+          "name": "return_to_hunt",
+          "condition": "always",
+          "action": "goto @hunt",
+          "comment": "P99 目标死亡→回狩猎段"
+        }
+      ]
+    },
+    {
+      "label": "quest_hunt",
+      "nodes": [
+        {
+          "name": "death_check",
+          "condition": "is_dead",
+          "action": "goto @recover",
+          "comment": "P0 死亡→跳转恢复段"
+        },
+        {
+          "name": "revived_check",
+          "condition": "just_revived",
+          "action": "goto @recover",
+          "comment": "P0.1 刚复活→跳转恢复段"
+        },
+        {
+          "name": "quest_check",
+          "condition": "quest_conditions_met",
+          "action": "goto @submit_quest",
+          "comment": "P0.2 任务完成→交任务"
+        },
+        {
+          "name": "map_check",
+          "condition": "not_on_hunt_map",
+          "action": "warp_to_map",
+          "parameters": { "targetMapNumber": 3 },
+          "comment": "P0.5 先确保在Noria，再导航到热点"
+        },
+        {
+          "name": "death_aware_skip_hotspot",
+          "condition": "quest_has_deaths",
+          "action": "goto @single_hunt",
+          "comment": "死过→跳过密集热点，安全点寻单怪"
+        },
+        {
+          "name": "quest_walking_guard",
+          "condition": "is_walking",
+          "action": "goto @quest_hunt",
+          "comment": "行走中→重新开始段落，不打断走路"
+        },
+        {
+          "name": "predator_check",
+          "condition": "predator_nearby",
+          "action": "relocate_to_hotspot",
+          "comment": "附近有高等级怪→快速通过/绕路"
+        },
+        {
+          "name": "quest_combat",
+          "condition": "quest_target_nearby",
+          "action": "goto @combat",
+          "comment": "遇任务怪→停下打(高等级非任务怪绕开)"
+        },
+        {
+          "name": "go_to_spider_zone",
+          "condition": "not_at_hotspot",
+          "action": "relocate_to_hotspot",
+          "comment": "继续导航到热点(探索式寻径绕开高怪)"
+        },
+        {
+          "name": "find_target",
+          "condition": "no_target",
+          "action": "find_nearest_monster",
+          "comment": "P10 搜索怪物(优先任务目标)"
+        },
+        {
+          "name": "target_shortcut",
+          "condition": "has_target",
+          "action": "goto @combat",
+          "comment": "P15 有目标→跳转战斗段（先到热点再打）"
+        },
+        {
+          "name": "hp_check",
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "P3 喝红"
+        },
+        {
+          "name": "mp_check",
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "comment": "P4 喝蓝"
+        },
+        {
+          "name": "pickup_items",
+          "condition": "always",
+          "action": "pickup_nearby",
+          "comment": "P5 拾取物品"
+        },
+        {
+          "name": "no_monsters_relocate",
+          "condition": "no_monsters_recently",
+          "action": "relocate_to_hotspot",
+          "comment": "P6 长时间无怪→继续换热点"
+        },
+        {
+          "name": "patrol",
+          "condition": "always",
+          "action": "random_patrol",
+          "comment": "P7 在热点周围巡逻"
+        },
+        {
+          "name": "buff_check",
+          "condition": "has_buff_to_cast",
+          "action": "use_buff",
+          "comment": "P99 最后加Buff（不干扰战斗）"
+        }
+      ]
+    },
+    {
+      "label": "single_hunt",
+      "nodes": [
+        {
+          "name": "death_check",
+          "condition": "is_dead",
+          "action": "goto @recover",
+          "comment": "死亡→跳转恢复段"
+        },
+        {
+          "name": "quest_check",
+          "condition": "quest_conditions_met",
+          "action": "goto @submit_quest",
+          "comment": "任务完成→交任务"
+        },
+        {
+          "name": "safe_find",
+          "condition": "always",
+          "action": "find_nearest_monster",
+          "comment": "安全模式→寻单怪(避免密集热点)"
+        },
+        {
+          "name": "target_shortcut",
+          "condition": "has_target",
+          "action": "goto @combat",
+          "comment": "有目标→跳转战斗段"
+        },
+        {
+          "name": "find_target",
+          "condition": "no_target",
+          "action": "find_nearest_monster",
+          "comment": "无目标→安全索敌(优先任务怪)"
+        },
+        {
+          "name": "hp_check",
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "comment": "喝红"
+        },
+        {
+          "name": "mp_check",
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "comment": "喝蓝"
+        },
+        {
+          "name": "pickup_items",
+          "condition": "always",
+          "action": "pickup_nearby",
+          "comment": "拾取掉落"
+        },
+        {
+          "name": "patrol",
+          "condition": "always",
+          "action": "random_patrol",
+          "comment": "在当前区域巡逻等怪刷新"
+        },
+        {
+          "name": "buff_check",
+          "condition": "has_buff_to_cast",
+          "action": "use_buff",
+          "comment": "最后加Buff"
         }
       ]
     },
@@ -222,6 +507,13 @@
           "condition": "is_dead",
           "action": "wait_respawn",
           "comment": "等待重生"
+        },
+        {
+          "name": "warp_to_hunt_map",
+          "condition": "not_on_hunt_map",
+          "action": "warp_to_map",
+          "parameters": { "targetMapNumber": 3 },
+          "comment": "死后回 Noria (重生可能在其他地图)"
         },
         {
           "name": "hp_recover",
@@ -294,8 +586,8 @@
         {
           "name": "check_done",
           "condition": "no_active_quest",
-          "action": "stop",
-          "comment": "已交→停止脚本(标记Completed)"
+          "action": "goto @start",
+          "comment": "已交→回到开始检查下个任务"
         },
         {
           "name": "try_submit",

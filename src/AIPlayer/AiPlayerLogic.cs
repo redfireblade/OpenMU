@@ -8,9 +8,12 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using MUnique.OpenMU.GameLogic;
+using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.Pathfinding;
 using MUnique.OpenMU.AIPlayer.Scripting;
+using OAPS.AccessLayer;
+using OAPS.Mind;
 
 /// <summary>
 /// Drives an <see cref="AiPlayer"/> with periodic behavior ticks.
@@ -31,6 +34,42 @@ public sealed class AiPlayerLogic : IDisposable
     private readonly Decision.MissionBoardService? _missionBoard;
     private readonly bool _stepMode;
     private int _tickCounter;
+
+    /// <summary>游戏引擎内挂助手（替代脚本级战斗/拾取/巡逻）。</summary>
+    private AiOfflineHelper? _offlineHelper;
+
+    /// <summary>经验学习器 — 每 tick 收集战斗/拾取/死亡数据。</summary>
+    private ExperienceLearner? _experienceLearner;
+
+    /// <summary>OAPS 认知循环 — 心智引擎主控器，每 400ms 执行感知→记忆→情感→决策循环。</summary>
+    private CognitiveLoop? _cognitiveLoop;
+
+    /// <summary>OAPS 三层记忆系统（感觉/工作/长期记忆）。</summary>
+    private MemorySystem? _memorySystem;
+
+    /// <summary>OAPS 个性与情感引擎 — 8 维个性 + OCC 情感模型。</summary>
+    private PersonalityEngine? _personalityEngine;
+
+    /// <summary>原生执行服务 — 用于 OpenMuActionExecutor 执行原子操作。</summary>
+    private readonly NativeExecutionService? _nativeExec;
+
+    /// <summary>Fugu v4.0 orchestrator — dynamic per-step routing (null if not initialized).</summary>
+    private OAPS.Mind.FuguOrchestrator? _fuguOrchestrator;
+
+    /// <summary>Fugu v4.0 script bridge — translates Fugu routing to script actions.</summary>
+    private Scripting.FuguScriptBridge? _fuguBridge;
+
+    /// <summary>Fugu v4.0 shared memory layer (set from AiPlayerManager after construction).</summary>
+    private Knowledge.SharedMemoryLayer? _sharedMemory;
+
+    /// <summary>AI behavior collector — feeds AI events into BehaviorEventStore for continuous learning.</summary>
+    private AiBehaviorCollector? _behaviorCollector;
+
+    /// <summary>Previous experience value for kill detection.</summary>
+    private long _prevExperience;
+
+    /// <summary>上次已知等级 — 用于检测升级事件。</summary>
+    private int _lastKnownLevel;
 
     /// <summary>断线检测计数 — 连续检测到断线次数。</summary>
     private int _disconnectStreak;
@@ -65,10 +104,10 @@ public sealed class AiPlayerLogic : IDisposable
         // Ensure algorithm selector is ready
         selector?.RegisterAlgorithms();
 
-        // Create shared context
+        // Create shared context — uses the SAME adapter instance
         this._context = new BehaviorContext(player)
         {
-            GameAdapter = new GameAdapter(player),
+            GameAdapter = this._adapter,
         };
 
         // Load behavior execution engine: ScriptExecutor (1D) or Heartbeat (Decision)
@@ -78,14 +117,57 @@ public sealed class AiPlayerLogic : IDisposable
             this._scriptExecutor = new Scripting.ScriptExecutor(player, this._context, script, player.ScriptPath);
             player.Logger.LogInformation("[AiPlayerLogic] Script-driven mode: {ScriptId} v{Version}",
                 script.Id, script.Version);
+
+            // Initialize game engine's built-in auto-bot (内挂) for combat/pickup/healing.
+            // Set MuHelperSettings on the player so OfflinePlayer handlers work correctly.
+            var muSettings = new DefaultMuHelperSettings();
+            player.MuHelperSettings = muSettings;
+            this._offlineHelper = new AiOfflineHelper(player, muSettings, player.Position, player.Logger);
+            player.Logger.LogInformation("[AiPlayerLogic] OfflineHelper initialized at ({X},{Y})", player.Position.X, player.Position.Y);
+
+            // Initialize experience learning system
+            if (player.ExperienceMemory is { } expMem && player.CharacterMemory is { } charMem)
+            {
+                this._experienceLearner = new ExperienceLearner(player, expMem, charMem, player.Logger);
+                player.ExperienceLearner = this._experienceLearner;
+                player.Logger.LogInformation("[AiPlayerLogic] ExperienceLearner initialized for {Char}", player.SelectedCharacter?.Name);
+            }
+
+            // Initialize native execution service for OAPS action executor
+            this._nativeExec = new NativeExecutionService(player, player.Logger);
         }
         else if (script is null && player.SelectedCharacter is not null)
         {
             // Decision mode: Heartbeat + MissionBoard drives behavior autonomously
-            var nativeExec = new NativeExecutionService(player, player.Logger);
+            this._nativeExec = new NativeExecutionService(player, player.Logger);
             this._missionBoard = new Decision.MissionBoardService(player, this._adapter, player.Logger);
             this._heartbeat = new Decision.HeartbeatService(player, this._context, this._missionBoard, this._adapter, player.Logger);
             player.Logger.LogInformation("[AiPlayerLogic] Decision mode: Heartbeat-driven (no script)");
+        }
+
+        // 初始化 OAPS 心智引擎（认知循环）
+        this._memorySystem = new MemorySystem();
+        this._personalityEngine = new PersonalityEngine();
+        var oapsSensor = new OpenMuWorldSensor(player);
+        var oapsExecutor = new OpenMuActionExecutor(player, this._adapter, this._nativeExec!);
+        var oapsDecision = new DecisionCore(null);
+        this._cognitiveLoop = new CognitiveLoop(oapsSensor, this._memorySystem, this._personalityEngine, oapsDecision);
+        this._lastKnownLevel = player.Level;
+        this._prevExperience = player.SelectedCharacter?.Experience ?? 0;
+        player.Logger.LogInformation("[OAPS] CognitiveLoop initialized for {Char}", player.SelectedCharacter?.Name);
+
+        // Initialize AI behavior collector (feeds events into PBO pipeline)
+        if (player.BehaviorEventStore is not null)
+        {
+            this._behaviorCollector = new AiBehaviorCollector(
+                player.BehaviorEventStore,
+                player.SelectedCharacter?.Name ?? "unknown",
+                player.Logger);
+            this._behaviorCollector.SetInitialState(
+                player.SelectedCharacter?.Experience ?? 0,
+                player.Level,
+                0); // Map will be set on first tick
+            player.Logger.LogInformation("[AiCollector] Initialized for {Char}", player.SelectedCharacter?.Name);
         }
 
         // Start the adaptive tick loop
@@ -147,10 +229,38 @@ public sealed class AiPlayerLogic : IDisposable
     /// </summary>
     public Decision.HeartbeatService? GetHeartbeat() => this._heartbeat;
 
-    /// <summary>
-    /// Gets the MissionBoardService, or null if not in Decision mode.
-    /// </summary>
+    /// <summary>Gets whether in Script-driven (1D) mode or Decision mode.</summary>
+    public bool IsScriptMode => this._scriptExecutor is not null;
+
+    /// <summary>Gets the MissionBoardService, or null if not in Decision mode.</summary>
     public Decision.MissionBoardService? GetMissionBoard() => this._missionBoard;
+
+    /// <summary>Gets the FuguOrchestrator, or null if not initialized.</summary>
+    public OAPS.Mind.FuguOrchestrator? FuguOrchestrator => _fuguOrchestrator;
+
+    /// <summary>Gets the FuguScriptBridge, or null if not initialized.</summary>
+    public Scripting.FuguScriptBridge? FuguBridge => _fuguBridge;
+
+    /// <summary>Initializes Fugu v4.0 components. Called by AiPlayerManager after AiPlayerLogic creation.</summary>
+    public void InitializeFuguComponents(Knowledge.SharedMemoryLayer sharedMemory, string? sftWeightsPath = null)
+    {
+        _sharedMemory = sharedMemory;
+        var workerId = this._player.SelectedCharacter?.Name ?? $"ai_{System.Guid.NewGuid():N}";
+        var logger = this._player.Logger;
+        try
+        {
+            // Prefer bootstrapped SFT weights over random initialization
+            var weightsPath = sftWeightsPath ?? this._player.SftWeightsPath;
+            _fuguOrchestrator = new OAPS.Mind.FuguOrchestrator(weightsPath, workerId, sharedMemory, logger);
+            _fuguBridge = new Scripting.FuguScriptBridge(_fuguOrchestrator, logger);
+            logger.LogInformation("[Fugu] v4.0 orchestrator initialized for {Worker}{Bootstrap}",
+                workerId, weightsPath is not null ? " (bootstrapped)" : "");
+        }
+        catch (System.Exception ex)
+        {
+            logger.LogWarning(ex, "[Fugu] Init failed for {Worker} (non-critical)", workerId);
+        }
+    }
 
     /// <summary>
     /// Gets the formatted execution statistics from the ScriptExecutor.
@@ -274,16 +384,12 @@ public sealed class AiPlayerLogic : IDisposable
         var logger = this._player.Logger;
         this._context.BeginTickRecording(this._tickCounter, this._adapter.GetPlayerPosition());
 
-        // 行走中的tick不创建新snapshot（保留上一tick的决策日志）
-        if (this._adapter.IsPlayerWalking())
-        {
-            return;
-        }
-
-        // ScriptExecutor mode: allow NpcDialogOpened so quest accept/submit can interact with NPC dialog
+        // ScriptExecutor mode: allow NpcDialogOpened (quest dialogs) and Dead (death recovery)
+        // so is_dead/wait_respawn/just_revived script conditions can fire.
         // Decision mode (Heartbeat): allow all states, HeartbeatService handles state filtering internally
         if (this._player.PlayerState.CurrentState != GameLogic.PlayerState.EnteredWorld
-            && !(this._scriptExecutor is not null && this._player.PlayerState.CurrentState == GameLogic.PlayerState.NpcDialogOpened)
+            && !(this._scriptExecutor is not null && (this._player.PlayerState.CurrentState == GameLogic.PlayerState.NpcDialogOpened
+                                                      || this._player.PlayerState.CurrentState == GameLogic.PlayerState.Dead))
             && this._heartbeat is null)
         {
             this.RecordEndOfTickSnapshot();
@@ -291,7 +397,7 @@ public sealed class AiPlayerLogic : IDisposable
         }
 
         var map = this._adapter.GetCurrentMap();
-        if (map is null)
+        if (map is null && this._player.PlayerState.CurrentState != GameLogic.PlayerState.Dead)
         {
             this.RecordEndOfTickSnapshot();
             return;
@@ -307,7 +413,7 @@ public sealed class AiPlayerLogic : IDisposable
                 this._player.SelectedCharacter?.Name ?? "?",
                 this._tickCounter,
                 this._adapter.GetPlayerPosition().X, this._adapter.GetPlayerPosition().Y,
-                map.Definition.Number,
+                map?.Definition.Number ?? 0,
                 this._adapter.IsPlayerWalking(),
                 atkCount,
                 this._adapter.GetCurrentHp(),
@@ -330,14 +436,15 @@ public sealed class AiPlayerLogic : IDisposable
         var timing = this._context.Timing;
         var worldSw = Stopwatch.StartNew();
 
-        this._context.WorldState = new WorldState
+        // 死亡状态下 map 可能为 null，跳过世界刷新但继续执行脚本（is_dead → wait_respawn）
+        if (map is not null)
         {
-            CurrentMap = map,
-            PlayerPosition = this._adapter.GetPlayerPosition(),
-            AttackablesInRange = map.GetAttackablesInRange(this._adapter.GetPlayerPosition(), SearchRange),
-            DropsInRange = map.GetDropsInRange(this._adapter.GetPlayerPosition(), 10)
-                .OfType<DroppedItem>()
-                .Take(50)
+            this._context.WorldState = new WorldState
+            {
+                CurrentMap = map,
+                PlayerPosition = this._adapter.GetPlayerPosition(),
+                AttackablesInRange = map.GetAttackablesInRange(this._adapter.GetPlayerPosition(), SearchRange),
+            DropsInRange = map.GetDropsInRange(this._adapter.GetPlayerPosition(), SearchRange)
                 .ToList(),
             IsAtSafezone = false,
             OtherPlayersInRange = map.GetAttackablesInRange(this._adapter.GetPlayerPosition(), 100)
@@ -346,13 +453,63 @@ public sealed class AiPlayerLogic : IDisposable
                 .Take(20)
                 .ToList(),
         };
+        }
+
         worldSw.Stop();
         timing.WorldRefreshUs = worldSw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
 
-        // 2. Execute behavior engine: ScriptExecutor (1D) or Heartbeat (Decision)
+        // 1.5 Fugu v4.0: Record state + route decision (learns from actual behavior, does not yet override)
+        if (_fuguBridge is not null && _fuguBridge.IsEnabled)
+        {
+            try
+            {
+                var pos = this._adapter.GetPlayerPosition();
+                var attackables = this._context.WorldState?.AttackablesInRange;
+                var drops = this._context.WorldState?.DropsInRange;
+                var ctx = new Scripting.FuguStateContext
+                {
+                    Hp = this._adapter.GetCurrentHp(),
+                    MaxHp = this._adapter.GetMaxHp(),
+                    Mp = this._adapter.GetCurrentMp(),
+                    MaxMp = this._adapter.GetMaxMp(),
+                    Level = this._player.Level,
+                    IsAtSafeZone = false,
+                    FreeSlots = 64,
+                    IsSurrounded = (attackables?.Count ?? 0) >= 3,
+                    TargetCount = attackables?.Count ?? 0,
+                    NearestMonsterLevel = (int)(attackables?.FirstOrDefault()?.Attributes?[GameLogic.Attributes.Stats.Level] ?? 0),
+                    NearbyItems = drops?.Count ?? 0,
+                    HotspotDistance = 255f,
+                    TimeSinceLastKill = 0,
+                    IsDebuffed = false,
+                    PositionX = pos.X,
+                    PositionY = pos.Y,
+                    PersonalityTemperature = 1.0f,
+                };
+                _fuguBridge.Route(ctx);
+            }
+            catch (Exception ex)
+            {
+                this._player.Logger.LogDebug(ex, "[Fugu] Route step error (non-critical)");
+            }
+        }
+
+        // 2. Run game engine's built-in auto-bot (OfflinePlayer 内挂 handlers)
+        // Handles combat, healing, pickup, buff, repair — all at the engine level.
+        // This replaces the script-level combat/pickup/patrol with battle-tested GameLogic code.
+        if (this._offlineHelper is not null
+            && this._player.PlayerState.CurrentState == GameLogic.PlayerState.EnteredWorld)
+        {
+            var offlineSw = Stopwatch.StartNew();
+            await this._offlineHelper.TickAsync().ConfigureAwait(false);
+            offlineSw.Stop();
+            timing.OfflineHelperUs = offlineSw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
+        }
+
+        // 3. Execute behavior engine: ScriptExecutor (1D) or Heartbeat (Decision)
+        // ScriptExecutor now handles HIGH-LEVEL flow only (quests, death, restock, map nav)
         if (this._scriptExecutor is not null)
         {
-            // 1D Script-driven mode
             var scriptSw = Stopwatch.StartNew();
             var tickResult = await this._scriptExecutor.TickAsync().ConfigureAwait(false);
             scriptSw.Stop();
@@ -360,10 +517,16 @@ public sealed class AiPlayerLogic : IDisposable
             this._context.RecordDecision("script", scriptSw.Elapsed);
             if (tickResult.State == MUnique.OpenMU.AIPlayer.ScriptTaskState.Stuck)
                 this._player.Logger.LogWarning("[AiPlayer] Script watchdog: PC={Pc} stuck", tickResult.PC);
+
+            // Drain HeartbeatService EventBus
+            if (this._heartbeat is not null)
+            {
+                this._heartbeat.DrainEventBus();
+            }
         }
         else if (this._heartbeat is not null)
         {
-            // Decision mode: Heartbeat-driven (no script)
+            // Decision mode: Heartbeat-driven
             var hbSw = Stopwatch.StartNew();
             await this._heartbeat.BeatAsync().ConfigureAwait(false);
             hbSw.Stop();
@@ -378,11 +541,67 @@ public sealed class AiPlayerLogic : IDisposable
         // 3. Non-module periodic tasks — stat allocation
         var now = DateTime.UtcNow;
 
-        // Stat allocation (every 5 seconds)
-        if (this._lastStatTick.AddSeconds(5) < now)
+        // Stat allocation (every 2 seconds — fast enough for low-level stat ramp-up)
+        if (this._lastStatTick.AddSeconds(2) < now)
         {
             this._lastStatTick = now;
             await this.AllocateStatsWithGatingAsync().ConfigureAwait(false);
+        }
+
+        // Experience learner — record kills/drops/deaths each tick
+        this._experienceLearner?.Tick();
+
+        // AI Behavior Collector — feed events into PBO pipeline for continuous learning
+        if (this._behaviorCollector is not null && this._tickCounter % 25 == 0)
+        {
+            try
+            {
+                var charExp = this._player.SelectedCharacter?.Experience ?? 0;
+                var charLevel = this._player.Level;
+                var mapId = this._adapter.GetCurrentMap()?.Definition.Number ?? 0;
+                var pos = this._adapter.GetPlayerPosition();
+                if (charLevel > this._lastKnownLevel) this._lastKnownLevel = charLevel;
+
+                this._behaviorCollector.Collect(charExp, charLevel, mapId, pos.X, pos.Y);
+            }
+            catch (Exception ex)
+            {
+                this._player.Logger.LogDebug(ex, "[AiCollector] Collection error (non-critical)");
+            }
+        }
+
+        // OAPS 心智引擎 tick（并行于现有行为系统）
+        if (this._cognitiveLoop is not null)
+        {
+            DecisionResult mindResult;
+            try
+            {
+                mindResult = await this._cognitiveLoop.ThinkAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "[OAPS] CognitiveLoop.ThinkAsync failed");
+                mindResult = new DecisionResult { Action = DecisionAction.Wait, Reason = "exception" };
+            }
+
+            if (mindResult.Action != DecisionAction.Wait)
+            {
+                logger.LogDebug("[OAPS] CognitiveLoop decision: {Action} ({Reason})",
+                    mindResult.Action, mindResult.Reason);
+            }
+        }
+
+        // 检测升级 → 记录经历
+        var currentLevel = this._adapter.GetPlayerLevel();
+        if (currentLevel > this._lastKnownLevel)
+        {
+            this._lastKnownLevel = currentLevel;
+            this._cognitiveLoop?.RecordExperience(new ExperienceEvent
+            {
+                IsLevelUp = true,
+                IsSuccess = true,
+                Timestamp = DateTime.UtcNow,
+            });
         }
 
         // Record end-of-tick snapshot for debug state API.
@@ -393,66 +612,49 @@ public sealed class AiPlayerLogic : IDisposable
 
     private async ValueTask AllocateStatsWithGatingAsync()
     {
-        var character = this._player.SelectedCharacter;
-        if (character is null || character.LevelUpPoints <= 0)
+        try
         {
-            return;
-        }
-
-        var classNumber = character.CharacterClass?.Number ?? 0;
-        var baseClass = StatAllocationStrategy.GetBaseClass(classNumber);
-
-        if (!StatAllocationStrategy.ClassBuilds.TryGetValue(baseClass, out var phases))
-        {
-            return;
-        }
-
-        var level = this._adapter.GetPlayerLevel();
-
-        // Find the ideal phase for the current level
-        (int MinLevel, int MaxLevel, float Str, float Agi, float Vit, float Ene) phase = default;
-        var phaseIndex = -1;
-        for (var i = 0; i < phases.Length; i++)
-        {
-            var p = phases[i];
-            if (level >= p.MinLevel && level <= p.MaxLevel)
+            var character = this._player.SelectedCharacter;
+            if (character is null || character.LevelUpPoints <= 0)
             {
-                phase = p;
-                phaseIndex = i;
+                return;
             }
-        }
 
-        if (phaseIndex < 0)
-        {
-            return;
-        }
+            // Use per-player BuildDirection if set, otherwise fall back to default
+            var direction = this._player.BuildDirection
+                ?? StatAllocationStrategy.GetDefaultDirection(character.CharacterClass?.Number ?? 0);
+            var phase = StatAllocationStrategy.GetPhase(direction, this._adapter.GetPlayerLevel());
+            if (phase is null)
+            {
+                return;
+            }
 
-        // Allocate up to 5 points per tick
-        var points = character.LevelUpPoints;
-        var toAllocate = Math.Min(points, 5);
-        if (toAllocate <= 0)
-        {
-            return;
-        }
+            // Allocate up to 5 points per tick
+            var points = character.LevelUpPoints;
+            var toAllocate = Math.Min(points, 5);
+            if (toAllocate <= 0)
+            {
+                return;
+            }
 
-        var strPoints = (ushort)(toAllocate * phase.Str);
-        var agiPoints = (ushort)(toAllocate * phase.Agi);
-        var vitPoints = (ushort)(toAllocate * phase.Vit);
-        var enePoints = (ushort)(toAllocate * phase.Ene);
+            var strPoints = (ushort)(toAllocate * phase.StrWeight);
+            var agiPoints = (ushort)(toAllocate * phase.AgiWeight);
+            var vitPoints = (ushort)(toAllocate * phase.VitWeight);
+            var enePoints = (ushort)(toAllocate * phase.EneWeight);
 
-        // Distribute remainder to the highest-weight stat
-        var allocated = strPoints + agiPoints + vitPoints + enePoints;
-        if (allocated < toAllocate)
-        {
-            var remaining = (ushort)(toAllocate - allocated);
-            var maxWeight = Math.Max(phase.Str, Math.Max(phase.Agi, Math.Max(phase.Vit, phase.Ene)));
-            if (maxWeight == phase.Str) { strPoints += remaining; }
-            else if (maxWeight == phase.Agi) { agiPoints += remaining; }
-            else if (maxWeight == phase.Vit) { vitPoints += remaining; }
-            else { enePoints += remaining; }
-        }
+            // Distribute remainder to the highest-weight stat
+            var allocated = strPoints + agiPoints + vitPoints + enePoints;
+            if (allocated < toAllocate)
+            {
+                var remaining = (ushort)(toAllocate - allocated);
+                var maxWeight = Math.Max(phase.StrWeight, Math.Max(phase.AgiWeight, Math.Max(phase.VitWeight, phase.EneWeight)));
+                if (maxWeight == phase.StrWeight) { strPoints += remaining; }
+                else if (maxWeight == phase.AgiWeight) { agiPoints += remaining; }
+                else if (maxWeight == phase.VitWeight) { vitPoints += remaining; }
+                else { enePoints += remaining; }
+            }
 
-        var increaseStats = new MUnique.OpenMU.GameLogic.PlayerActions.Character.IncreaseStatsAction();
+            var increaseStats = new MUnique.OpenMU.GameLogic.PlayerActions.Character.IncreaseStatsAction();
         if (strPoints > 0) { await increaseStats.IncreaseStatsAsync(this._player, MUnique.OpenMU.GameLogic.Attributes.Stats.BaseStrength, strPoints).ConfigureAwait(false); }
 
         if (agiPoints > 0) { await increaseStats.IncreaseStatsAsync(this._player, MUnique.OpenMU.GameLogic.Attributes.Stats.BaseAgility, agiPoints).ConfigureAwait(false); }
@@ -460,6 +662,11 @@ public sealed class AiPlayerLogic : IDisposable
         if (vitPoints > 0) { await increaseStats.IncreaseStatsAsync(this._player, MUnique.OpenMU.GameLogic.Attributes.Stats.BaseVitality, vitPoints).ConfigureAwait(false); }
 
         if (enePoints > 0) { await increaseStats.IncreaseStatsAsync(this._player, MUnique.OpenMU.GameLogic.Attributes.Stats.BaseEnergy, enePoints).ConfigureAwait(false); }
+        }
+        catch (Exception ex)
+        {
+            this._player.Logger.LogWarning(ex, "[StatAlloc] 分配属性点异常（静态构造器未就绪？）");
+        }
     }
 
     private void RecordEndOfTickSnapshot()
@@ -515,16 +722,98 @@ public sealed class AiPlayerLogic : IDisposable
     }
 
     /// <summary>
-    /// Gets a recommended hunting map based on the player's experience.
-    /// Simplified to return the current map (hotspot-based recommendations
-    /// have been removed in the cleanup).
+    /// Gets a recommended hunting map based on the player's level.
+    /// Scans all configured maps and calculates average monster level from MonsterSpawns.
+    /// Recommends the lowest-numbered map whose average monster level is within
+    /// the player's reach (player level + 5).
     /// </summary>
-    /// <param name="topN">Ignored in simplified version.</param>
-    /// <returns>The current map number with a default score of 0.</returns>
+    /// <param name="topN">Ignored; we return the single best match.</param>
+    /// <returns>The recommended map number with a score, or (0, 0) for Lorencia as fallback.</returns>
     public (ushort MapNumber, double Score) GetRecommendedMap(int topN = 3)
     {
-        var currentMapNum = (ushort)(this._adapter.GetCurrentMap()?.Definition.Number ?? 0);
-        return (currentMapNum, 0.0);
+        try
+        {
+            var config = this._player.GameContext?.Configuration;
+            if (config?.Maps is null)
+            {
+                return (0, 0.0); // Lorencia fallback
+            }
+
+            var playerLevel = this._adapter.GetPlayerLevel();
+            ushort bestMap = 0;
+            double bestScore = 0.0;
+
+            foreach (var mapDef in config.Maps)
+            {
+                if (mapDef is null || mapDef.MonsterSpawns is null || mapDef.MonsterSpawns.Count == 0)
+                {
+                    continue;
+                }
+
+                // Calculate average monster level for this map from spawns
+                double totalLevel = 0;
+                int count = 0;
+
+                foreach (var spawn in mapDef.MonsterSpawns)
+                {
+                    var monster = spawn?.MonsterDefinition;
+                    if (monster is null || monster.Attributes is null)
+                    {
+                        continue;
+                    }
+
+                    // Try to read the Level attribute via the indexer; if the monster
+                    // doesn't have a Level attribute, try FirstOrDefault on the collection.
+                    float monsterLevel;
+                    try
+                    {
+                        monsterLevel = monster[Stats.Level];
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        var attr = monster.Attributes.FirstOrDefault(a => a.AttributeDefinition == Stats.Level);
+                        if (attr is null)
+                        {
+                            continue;
+                        }
+
+                        monsterLevel = attr.Value;
+                    }
+
+                    totalLevel += monsterLevel;
+                    count++;
+                }
+
+                if (count == 0)
+                {
+                    continue;
+                }
+
+                var avgLevel = totalLevel / count;
+
+                // Only recommend maps where average monster level is within reach
+                if (avgLevel <= playerLevel + 5)
+                {
+                    // Score: higher is better. Prefer lower map numbers (closer to safezone).
+                    // Score = 100 - monster_level_diff gives 100 for perfectly matched maps.
+                    // Among equal-score maps, lower map number wins (first encountered
+                    // in ascending iteration order, which is the natural map order).
+                    var score = 100.0 - avgLevel;
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestMap = (ushort)mapDef.Number;
+                    }
+                }
+            }
+
+            return (bestMap, bestScore);
+        }
+        catch (Exception ex)
+        {
+            this._player.Logger.LogWarning(ex, "[GetRecommendedMap] Failed to scan maps, falling back to Lorencia");
+            return (0, 0.0);
+        }
     }
 
 }

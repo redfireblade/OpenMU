@@ -70,6 +70,17 @@ public sealed record TickResult(
 {
     /// <summary>兼容外部队本：PC = ProgramCounter。</summary>
     public int PC => this.ProgramCounter;
+
+    /// <summary>
+    /// Implicit conversion to bool. Returns true when any condition was met or
+    /// an interrupt/goto action was handled during this tick.
+    /// Supports existing test assertions like <c>Assert.True(result)</c> and <c>Assert.False(result)</c>.
+    /// </summary>
+    /// <param name="result">The tick result to evaluate.</param>
+    public static implicit operator bool(TickResult result) =>
+        result.NodeResult?.ConditionMet == true
+        || result.NodeName?.StartsWith("interrupt:", StringComparison.Ordinal) == true
+        || result.NodeAction?.StartsWith("goto ", StringComparison.Ordinal) == true;
 }
 
 /// <summary>节点执行状态码。</summary>

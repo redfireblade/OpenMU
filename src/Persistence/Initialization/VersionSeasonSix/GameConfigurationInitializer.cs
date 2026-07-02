@@ -70,6 +70,26 @@ public class GameConfigurationInitializer : GameConfigurationInitializerBase
         new Weapons(this.Context, this.GameConfiguration).Initialize();
         new Potions(this.Context, this.GameConfiguration).Initialize();
         new Jewels(this.Context, this.GameConfiguration).Initialize();
+
+        // 宝石物品现在已创建，填充到宝石掉落组
+        var jewelDropGroup = this.GameConfiguration.DropItemGroups.FirstOrDefault(g => g.ItemType == SpecialItemType.Jewel);
+        if (jewelDropGroup is not null)
+        {
+            var allJewels = this.GameConfiguration.Items.Where(i =>
+                (i.Group == 12 && i.Number == 15) || // Jewel of Chaos (玛雅)
+                (i.Group == 14 && i.Number == 13) || // Jewel of Bless
+                (i.Group == 14 && i.Number == 14) || // Jewel of Soul
+                (i.Group == 14 && i.Number == 136) || // Jewel of Life
+                (i.Group == 14 && i.Number == 137));   // Jewel of Creation
+            foreach (var jewel in allJewels)
+            {
+                if (!jewelDropGroup.PossibleItems.Contains(jewel))
+                {
+                    jewelDropGroup.PossibleItems.Add(jewel);
+                }
+            }
+        }
+
         new Misc(this.Context, this.GameConfiguration).Initialize();
         new PackedJewels(this.Context, this.GameConfiguration).Initialize();
         new Jewelery(this.Context, this.GameConfiguration).Initialize();

@@ -1,0 +1,214 @@
+{
+  "id": "lost_tower_hunting",
+  "name": "失落之塔狩猎脚本",
+  "version": "1.0.0",
+  "status": "candidate",
+  "dslSource": "失落之塔狩猎脚本：适用于80-150级，在失落之塔区域自动打怪。优先攻击高经验/高掉落收益的怪物。被多个怪物围攻时自动撤退到安全位置。使用大血瓶且阈值提升至50%以应对高伤害环境。段落模式：start→combat→emergency→loot",
+  "parameters": {
+    "searchRange": 18,
+    "healThreshold": 0.5,
+    "potionThreshold": 0.4,
+    "huntingRange": 15,
+    "pickupRange": 8,
+    "dangerMonsterCount": 3
+  },
+  "priorityChain": [],
+  "paragraphs": [
+    {
+      "label": "start",
+      "nodes": [
+        {
+          "condition": "just_revived",
+          "action": "relocate_to_hotspot",
+          "description": "复活后返回失落之塔热点区域",
+          "goto": "start"
+        },
+        {
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "parameters": {
+            "healThreshold": 0.5
+          },
+          "description": "HP低于50%立即喝大血瓶",
+          "goto": "start"
+        },
+        {
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "description": "MP低于阈值喝蓝恢复",
+          "goto": "start"
+        },
+        {
+          "condition": "inventory_full",
+          "action": "travel_to_map",
+          "parameters": {
+            "mapId": 0
+          },
+          "description": "背包已满，回城清理"
+        },
+        {
+          "condition": "equip_durable_low",
+          "action": "travel_to_map",
+          "parameters": {
+            "mapId": 0
+          },
+          "description": "装备耐久不足，回城修理"
+        },
+        {
+          "condition": "potion_count_below_threshold",
+          "action": "travel_to_map",
+          "parameters": {
+            "mapId": 0
+          },
+          "description": "药水不足，回城补给"
+        },
+        {
+          "condition": "has_buff_to_cast",
+          "action": "relocate_to_hotspot",
+          "description": "战前需要释放Buff增益"
+        },
+        {
+          "condition": "has_target",
+          "action": "attack_target",
+          "description": "发现高收益目标，进入战斗",
+          "goto": "combat"
+        },
+        {
+          "condition": "no_monsters_recently",
+          "action": "relocate_to_hotspot",
+          "description": "当前区域无怪，切换到高收益热点",
+          "goto": "start"
+        },
+        {
+          "condition": "always",
+          "action": "random_patrol",
+          "description": "巡逻搜索高收益怪物",
+          "goto": "combat"
+        }
+      ]
+    },
+    {
+      "label": "combat",
+      "nodes": [
+        {
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "description": "战斗中血量低喝大血瓶",
+          "goto": "combat"
+        },
+        {
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "description": "战斗中蓝量低喝蓝",
+          "goto": "combat"
+        },
+        {
+          "condition": "inventory_full",
+          "action": "travel_to_map",
+          "parameters": {
+            "mapId": 0
+          },
+          "description": "战斗中背包满回城",
+          "goto": "maintenance"
+        },
+        {
+          "condition": "equip_durable_low",
+          "action": "travel_to_map",
+          "parameters": {
+            "mapId": 0
+          },
+          "description": "战斗中耐久低回城"
+        },
+        {
+          "condition": "variable",
+          "action": "relocate_to_hotspot",
+          "parameters": {
+            "varName": "danger_detected"
+          },
+          "description": "危险检测：被多个怪物围攻，紧急撤退到安全位置",
+          "goto": "emergency"
+        },
+        {
+          "condition": "has_target_in_range",
+          "action": "attack_target",
+          "description": "目标在攻击范围内，持续输出高收益怪物"
+        },
+        {
+          "condition": "has_target_not_in_range",
+          "action": "random_patrol",
+          "description": "目标超出攻击范围，追击"
+        },
+        {
+          "condition": "no_target",
+          "action": "pickup_nearby",
+          "description": "目标已消灭，准备拾取战利品",
+          "goto": "loot"
+        },
+        {
+          "condition": "always",
+          "action": "random_patrol",
+          "description": "兜底逻辑：巡逻搜索下一个目标",
+          "goto": "start"
+        }
+      ]
+    },
+    {
+      "label": "emergency",
+      "nodes": [
+        {
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "description": "紧急状态：优先喝血保命",
+          "goto": "emergency"
+        },
+        {
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "description": "紧急状态：喝蓝维持技能释放",
+          "goto": "emergency"
+        },
+        {
+          "condition": "has_target_in_range",
+          "action": "relocate_to_hotspot",
+          "description": "仍有近身目标，继续撤退到安全热点"
+        },
+        {
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "description": "二次血量检查，确保安全",
+          "goto": "emergency"
+        },
+        {
+          "condition": "always",
+          "action": "random_patrol",
+          "description": "脱离危险区域，恢复巡逻模式",
+          "goto": "start"
+        }
+      ]
+    },
+    {
+      "label": "loot",
+      "nodes": [
+        {
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "description": "拾取时血量低喝药确保安全"
+        },
+        {
+          "condition": "has_target",
+          "action": "attack_target",
+          "description": "拾取时发现新目标，立即进入战斗",
+          "goto": "combat"
+        },
+        {
+          "condition": "always",
+          "action": "pickup_nearby",
+          "description": "拾取附近高价值掉落物品",
+          "goto": "start"
+        }
+      ]
+    }
+  ],
+  "branchHitCounts": {},
+  "orchestrator": null
+}

@@ -1,0 +1,108 @@
+{
+  "_meta": {
+    "format_version": "1.0.0",
+    "description": "WIKI 规范 → 自动化检查映射清单。每项 spec 定义一个可从 WIKI 文档自动验证的规则。",
+    "last_updated": "2026-05-25"
+  },
+  "specs": [
+    {
+      "id": "DZ-S-001",
+      "wiki": "WIKI/10-dangerous-zones.md §10.2",
+      "severity": "error",
+      "title": "S级危险区禁止引用：Network 命名空间",
+      "description": "AIPlayer 及 AI 扩展代码不得引用 MUnique.OpenMU.Network 命名空间的任何类型",
+      "check": "MUnique.OpenMU.SpecAnalyzer.DangerousZoneAnalyzer",
+      "scope": "src/AIPlayer/**/*.cs"
+    },
+    {
+      "id": "DZ-S-002",
+      "wiki": "WIKI/10-dangerous-zones.md §10.2",
+      "severity": "error",
+      "title": "S级危险区禁止引用：Startup 命名空间",
+      "description": "AIPlayer 及 AI 扩展代码不得引用 MUnique.OpenMU.Startup 命名空间的任何类型",
+      "check": "MUnique.OpenMU.SpecAnalyzer.DangerousZoneAnalyzer",
+      "scope": "src/AIPlayer/**/*.cs"
+    },
+    {
+      "id": "DZ-S-003",
+      "wiki": "WIKI/10-dangerous-zones.md §10.2",
+      "severity": "error",
+      "title": "S级危险区禁止引用：RemoteView 序列化层",
+      "description": "AIPlayer 不得引用 GameServer.RemoteView 序列化类型，破坏后客户端渲染异常",
+      "check": "MUnique.OpenMU.SpecAnalyzer.DangerousZoneAnalyzer",
+      "scope": "src/AIPlayer/**/*.cs"
+    },
+    {
+      "id": "DZ-A-001",
+      "wiki": "WIKI/10-dangerous-zones.md §10.3",
+      "severity": "warning",
+      "title": "A级危险区谨慎引用：ConnectServer",
+      "description": "AIPlayer 应避免引用 ConnectServer 类型，除非绝对必要",
+      "check": "MUnique.OpenMU.SpecAnalyzer.DangerousZoneAnalyzer",
+      "scope": "src/AIPlayer/**/*.cs"
+    },
+    {
+      "id": "DZ-A-002",
+      "wiki": "WIKI/10-dangerous-zones.md §10.3",
+      "severity": "warning",
+      "title": "A级危险区谨慎引用：ChatServer",
+      "description": "AIPlayer 应避免引用 ChatServer 类型",
+      "check": "MUnique.OpenMU.SpecAnalyzer.DangerousZoneAnalyzer",
+      "scope": "src/AIPlayer/**/*.cs"
+    },
+    {
+      "id": "DZ-A-003",
+      "wiki": "WIKI/10-dangerous-zones.md §10.3",
+      "severity": "warning",
+      "title": "A级危险区谨慎引用：FriendServer/GuildServer",
+      "description": "AIPlayer 应避免引用 FriendServer 或 GuildServer 类型",
+      "check": "MUnique.OpenMU.SpecAnalyzer.DangerousZoneAnalyzer",
+      "scope": "src/AIPlayer/**/*.cs"
+    },
+    {
+      "id": "CR-003",
+      "wiki": "CODING_RULES.md §3",
+      "severity": "warning",
+      "title": "无硬编码值",
+      "description": "数字、字符串、路径、尺寸、定时器、颜色应定义为常量/枚举/配置值，而非字面量",
+      "check": "MUnique.OpenMU.SpecAnalyzer.MagicNumberAnalyzer",
+      "scope": "src/AIPlayer/**/*.cs"
+    },
+    {
+      "id": "CR-001",
+      "wiki": "CODING_RULES.md §1",
+      "severity": "warning",
+      "title": "函数保持简短专注",
+      "description": "函数应做一件事，超过 40 行应提取子函数",
+      "check": "MUnique.OpenMU.SpecAnalyzer.FunctionLengthAnalyzer",
+      "scope": "src/AIPlayer/**/*.cs"
+    },
+    {
+      "id": "ME-001",
+      "wiki": "WIKI/29-ai-mind-engine.md §3",
+      "severity": "warning",
+      "title": "认知循环顺序",
+      "description": "AIMindEngine.Think 必须按 感知→记忆→情感→个性→决策→写入 顺序执行",
+      "check": "MUnique.OpenMU.SpecAnalyzer.MethodStructureAnalyzer",
+      "scope": "src/AIPlayer/MindEngine/AIMindEngine.cs"
+    },
+    {
+      "id": "ME-002",
+      "wiki": "WIKI/29-ai-mind-engine.md §4",
+      "severity": "warning",
+      "title": "生存规则优先",
+      "description": "Decide 入口必须先调用 EvaluateSurvival，生存行动不可被覆盖",
+      "check": "MUnique.OpenMU.SpecAnalyzer.MethodStructureAnalyzer",
+      "scope": "src/AIPlayer/MindEngine/DecisionCore.cs"
+    },
+    {
+      "id": "ME-003",
+      "wiki": "WIKI/29-ai-mind-engine.md §5",
+      "severity": "info",
+      "title": "个性维度完整",
+      "description": "PersonalityProfile 必须包含 Caution/Aggression/Greed/Sociability/Loyalty/Efficiency/Exploration 七维度",
+      "check": "MUnique.OpenMU.SpecAnalyzer.TypeStructureAnalyzer",
+      "scope": "src/AIPlayer/PersonalityProfile.cs"
+    }
+  ]
+}

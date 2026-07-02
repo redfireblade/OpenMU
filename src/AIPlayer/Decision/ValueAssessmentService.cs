@@ -4,6 +4,7 @@
 
 namespace MUnique.OpenMU.AIPlayer.Decision;
 
+using System;
 using MUnique.OpenMU.DataModel.Configuration.Items;
 using MUnique.OpenMU.DataModel.Entities;
 using MUnique.OpenMU.GameLogic;
@@ -34,6 +35,32 @@ public sealed class ValueAssessmentService
         this._logger = logger;
         this._marketPrice = marketPrice;
     }
+
+    // ========================================================================
+    // 【拾取策略配置】参考 OfflinePlayer.ItemPickupHandler
+    // ========================================================================
+
+    /// <summary>
+    /// 是否拾取所有物品（忽略价值评估）。默认 false。
+    /// 启用后 AI 玩家会无条件拾取所有掉落的物品（相当于离线挂机捡物模式）。
+    /// </summary>
+    public bool PickAllItems { get; set; }
+
+    /// <summary>
+    /// 是否拾取金钱（Zen）。默认 true。
+    /// 启用后 AI 玩家会拾取地上掉落的金钱。
+    /// </summary>
+    public bool PickZen { get; set; } = true;
+
+    /// <summary>
+    /// 额外物品名称列表：按物品名称子串匹配，匹配到的物品强制拾取（不经过价值评估）。
+    /// 例如: {"血色", "恶魔", "果实"} 会匹配所有名称中包含这些关键词的物品。
+    /// 参考 OfflinePlayer.ExtraItemNames 逻辑。
+    /// </summary>
+    public IReadOnlyList<string> ExtraItemNames { get; set; } = Array.Empty<string>();
+
+    /// <summary>拾取金钱的最低数量阈值。</summary>
+    private const int MinPickupZen = 100;
 
     /// <summary>评估道具价值。</summary>
     public ValueAssessment Evaluate(Item item)
@@ -226,8 +253,46 @@ public sealed class ValueAssessmentService
         };
     }
 
-    /// <summary>该物品是否应该被捡起。</summary>
-    public bool ShouldPickup(Item item) => Evaluate(item).Tier >= ValueTier.E;
+    /// <summary>
+    /// 该物品是否应该被捡起。
+    /// 先检查 PickAllItems / ExtraItemNames 等外部配置，再走价值评估。
+    /// S/A/B 级拾取，D/E/Junk 不捡（绿色卓越=S/A/B，任务道具=C级）。
+    /// </summary>
+    public bool ShouldPickup(Item item)
+    {
+        // 【1】PickAllItems 模式：无条件拾取所有物品
+        if (PickAllItems)
+            return true;
+
+        // 【2】ExtraItemNames 按名称匹配：匹配到的物品强制拾取
+        if (ExtraItemNames.Count > 0 && item.Definition is not null)
+        {
+            var itemNameStr = item.Definition.Name.ToString();
+            if (!string.IsNullOrEmpty(itemNameStr))
+            {
+                foreach (var name in ExtraItemNames)
+                {
+                    if (itemNameStr.Contains(name, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+        }
+
+        // 【3】走价值评估：S/A/B 级拾取
+        return Evaluate(item).Tier <= ValueTier.B;
+    }
+
+    /// <summary>
+    /// 判断指定数量的金钱（Zen）是否应该被拾取。
+    /// 参考 OfflinePlayer.PickZen 逻辑。
+    /// </summary>
+    public bool ShouldPickupMoney(int amount)
+    {
+        if (!PickZen)
+            return false;
+
+        return amount >= MinPickupZen;
+    }
 
     /// <summary>
     /// 该物品是否应该卖给NPC商店。

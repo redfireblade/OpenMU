@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "openmu-proxy",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["E:/MU_AI/MU_VER_1/SERVERS/OPENMU/start-openmu.sh"],
+      "port": 55900
+    }
+  ]
+}

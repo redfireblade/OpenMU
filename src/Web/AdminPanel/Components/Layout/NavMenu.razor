@@ -73,6 +73,11 @@
                         <span class="oi oi-bug" aria-hidden="true"></span> AI Debug
                     </NavLink>
                 </li>
+                <li>
+                    <NavLink href="aidebug/kg" @onclick="() => NavigationHistory.Clear()">
+                        <span class="oi oi-share" aria-hidden="true"></span> KG 浏览器
+                    </NavLink>
+                </li>
             }
             @if (UserService.IsAvailable)
             {

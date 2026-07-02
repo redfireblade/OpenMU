@@ -20,7 +20,7 @@ public sealed class ItemPickupHandler
 
     private static readonly PickupItemAction PickupAction = new();
 
-    private readonly OfflinePlayer _player;
+    private readonly Player _player;
     private readonly IMuHelperSettings? _config;
 
     /// <summary>
@@ -28,7 +28,7 @@ public sealed class ItemPickupHandler
     /// </summary>
     /// <param name="player">The offline player.</param>
     /// <param name="config">The MU Helper configuration.</param>
-    public ItemPickupHandler(OfflinePlayer player, IMuHelperSettings? config)
+    public ItemPickupHandler(Player player, IMuHelperSettings? config)
     {
         this._player = player;
         this._config = config;

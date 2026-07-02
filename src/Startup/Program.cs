@@ -19,13 +19,17 @@ using Microsoft.Extensions.Logging;
 using MUnique.OpenMU.ChatServer;
 using MUnique.OpenMU.ConnectServer;
 using MUnique.OpenMU.DataModel.Configuration;
+using MUnique.OpenMU.DataModel; // InventoryConstants
 using MUnique.OpenMU.FriendServer;
 using MUnique.OpenMU.GameLogic;
+using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.GuildServer;
 using MUnique.OpenMU.Interfaces;
 using MUnique.OpenMU.LoginServer;
 using MUnique.OpenMU.Network;
 using MUnique.OpenMU.Persistence;
+using MUnique.OpenMU.AIPlayer.Knowledge;
+using MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph;
 using MUnique.OpenMU.Persistence.EntityFramework;
 using MUnique.OpenMU.Persistence.EntityFramework.Json;
 using MUnique.OpenMU.Persistence.Initialization;
@@ -143,6 +147,7 @@ internal sealed class Program : IDisposable
                         || !this.IsAdminPanelEnabled(args);
 
         if (_systemConfiguration is { }
+            && !args.Any(a => a.StartsWith("-resolveIP:", StringComparison.InvariantCultureIgnoreCase))
             && this._serverHost.Services.GetService<IIpAddressResolver>() is ConfigurableIpResolver resolver)
         {
             resolver.Configure(_systemConfiguration.IpResolver, _systemConfiguration.IpResolverParameter);
@@ -188,43 +193,54 @@ internal sealed class Program : IDisposable
                         this._logger.Warning("Script {Path} not found; DebugBots will use DAG module mode.", scriptPath);
                     }
 
-                    var bots = new[]
-                    {
-                        ("DebugBot1",    0, (ushort)2,  Path.Combine(scriptsDir, "basic_hunting_loop.json")),   // Devias (map 2), 狩猎
-                        ("DebugBot2",    0, (ushort)1,  Path.Combine(scriptsDir, "basic_hunting_loop.json")),   // Dungeon (map 1), 狩猎
-                        ("DebugBot3",    0, (ushort)0,  Path.Combine(scriptsDir, "basic_hunting_loop.json")),   // Lorencia (map 0), 狩猎
-                        ("DecisionTest", 0, (ushort)3,  null),                                                  // Noria, Decision模式
+                    var bots = new List<(string Name, int ClassId, ushort MapId, string? Script, BuildDirection? Dir, int Level)>();
+
+                    // === AI 机器人：多地图分散 ===
+                    var classDefs = new[] { (0, BuildDirection.IntWizard, "DW"), (4, BuildDirection.BalancedKnight, "DK"), (8, BuildDirection.AgilityElf, "Elf") };
+                    // Map distribution: Lorencia(0)=3, Dungeon(1)=4, Devias(2)=4, LostTower(4)=4, Atlans(7)=4, Tarkan(8)=4, Aida(10)=4, Icarus(33)=3 → 30 total
+                    var maps = new (ushort MapId, int Count)[] {
+                        (0, 3), (1, 4), (2, 4), (4, 4), (7, 4), (8, 4), (10, 4), (33, 3)
                     };
-                    foreach (var (name, classId, mapId, botScriptPath) in bots)
+                    int aiIndex = 0;
+
+                    foreach (var (mapId, count) in maps)
                     {
-                        var config = new MUnique.OpenMU.AIPlayer.AiPlayerCreateConfig(name, classId, mapId, botScriptPath);
+                        for (int i = 0; i < count; i++)
+                        {
+                            var (classId, dir, prefix) = classDefs[aiIndex % 3];
+                            aiIndex++;
+                            var name = $"AI{prefix}{mapId:D2}M{i:D2}";
+                            bots.Add((name, classId, mapId, scriptPath, dir, 1));
+                        }
+                    }
+                    this._logger.Information("Generating {Count} AI bots across {Maps} maps...", bots.Count, maps.Length);
+                    foreach (var (name, classId, mapId, botScriptPath, direction, level) in bots)
+                    {
+                        var config = new MUnique.OpenMU.AIPlayer.AiPlayerCreateConfig(name, classId, mapId, botScriptPath, direction);
                         var result = await aiService.CreateAiPlayerAsync(config).ConfigureAwait(false);
                         if (result.Success && result.PlayerId.HasValue)
                         {
-                            // Raise level so bot can fight monsters (default is Lv.1)
-                            var debugService = this._serverHost.Services.GetService<MUnique.OpenMU.AIPlayer.IAiDebugService>();
-                            if (debugService is not null)
-                            {
-                                var level = name == "DecisionTest" ? 150 : 80;
-                                await debugService.SetLevelAsync(result.PlayerId.Value, level).ConfigureAwait(false);
-                                // Assign vitality for HP:
-                                var baseVitalityGuid = new Guid("6CA5C3A6-B109-45A5-87A7-FDCB107B4982");
-                                await debugService.SetStatAttributeAsync(result.PlayerId.Value, baseVitalityGuid, 400).ConfigureAwait(false);
-                                // Assign strength for attack power (关键: 不加力量则攻击力≈0, 打怪永远掉1HP)
-                                var baseStrengthGuid = new Guid("123282FE-FEAD-448E-AD2C-BAECE939B4B1");
-                                await debugService.SetStatAttributeAsync(result.PlayerId.Value, baseStrengthGuid, 800).ConfigureAwait(false);
-                                var baseAgilityGuid = new Guid("D0B5A988-1DCD-4D9D-9D07-77E6C35E27B3");
-                                await debugService.SetStatAttributeAsync(result.PlayerId.Value, baseAgilityGuid, 200).ConfigureAwait(false);
-                                await debugService.SetHpAsync(result.PlayerId.Value, 3000).ConfigureAwait(false);
-                                await debugService.SetMpAsync(result.PlayerId.Value, 2000).ConfigureAwait(false);
-                            }
-
-                            this._logger.Information("Auto-created AI player {Name} ID {Id} Lv.80 on map {Map} script={Script}.", name, result.PlayerId, mapId, botScriptPath ?? "none");
+                            this._logger.Information("Auto-created AI player {Name}(class={ClassId}) ID {Id} Lv.{Level} on map {Map} dir={Dir} script={Script}.",
+                                name, classId, result.PlayerId, level, mapId, direction, botScriptPath ?? "none");
                         }
                         else
                         {
                             this._logger.Warning("Failed to auto-create AI player {Name}: {Error}", name, result.ErrorMessage);
                         }
+                    }
+
+                    // Log KG status from DI-registered singleton
+                    try
+                    {
+                        var graph = this._serverHost.Services.GetService<KnowledgeGraph>();
+                        if (graph is not null)
+                        {
+                            this._logger.Information("[KG] DI Knowledge Graph: {Nodes} nodes, {Edges} edges", graph.NodeCount, graph.EdgeCount);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        this._logger.Warning("[KG] Could not read KG status: {Error}", ex.Message);
                     }
                 }
                 catch (Exception ex)
@@ -387,6 +403,42 @@ internal sealed class Program : IDisposable
             .AddHostedService<MUnique.OpenMU.AIPlayer.Scripting.ScriptReloadBridge>(provider =>
                 provider.GetRequiredService<MUnique.OpenMU.AIPlayer.Scripting.ScriptReloadBridge>());
 
+            // Register Knowledge Graph as singleton (lazy init via GameConfiguration)
+            builder.Services.AddSingleton<MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.KnowledgeGraph>(provider =>
+            {
+                try
+                {
+                    var aiService = provider.GetService<MUnique.OpenMU.AIPlayer.IAiService>();
+                    if (aiService?.GameConfiguration is { } config)
+                    {
+                        var loggerFactory = provider.GetService<ILoggerFactory>();
+                        Microsoft.Extensions.Logging.ILogger? kgLogger = loggerFactory?.CreateLogger("KnowledgeGraph");
+                        var logger = kgLogger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+                        var knowledge = new MUnique.OpenMU.AIPlayer.Knowledge.GameKnowledgeService(config, logger);
+                        var builder = new MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.KnowledgeGraphBuilder(logger);
+                        var graph = builder.Build(config, knowledge);
+                        var log = provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.KnowledgeGraph>>();
+                        log.LogInformation("[KG] Knowledge Graph initialized: {Nodes} nodes, {Edges} edges", graph.NodeCount, graph.EdgeCount);
+                        return graph;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    var log = provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.KnowledgeGraph>>();
+                    log.LogWarning(ex, "[KG] Failed to initialize Knowledge Graph, using empty graph.");
+                }
+                return new MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.KnowledgeGraph();
+            })
+            .AddSingleton<MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.IKnowledgeGraphQuery>(provider =>
+            {
+                var graph = provider.GetRequiredService<MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.KnowledgeGraph>();
+                var query = new MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.KnowledgeGraphQuery(graph);
+                // Expose to AI via static holder to avoid circular DI during startup
+                MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.KnowledgeGraphHolder.Instance = query;
+                MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph.KnowledgeGraphHolder.Graph = graph;
+                return query;
+            });
+
             if (addAdminPanel)
             {
                 builder.Services.AddScoped<MUnique.OpenMU.Web.AdminPanel.AiDebugStateProvider>()
@@ -432,7 +484,7 @@ internal sealed class Program : IDisposable
         this._logger.Information("Host created");
 
         // Add AI debug API endpoints (for testing without game client)
-        _ = host.MapGet("/api/ai/create", async (string name, int classId, ushort mapId, string? mode) =>
+        _ = host.MapGet("/api/ai/create", async (string name, int classId, ushort mapId, string? mode, int level = 9) =>
         {
             var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
             string? scriptPath = null;
@@ -452,7 +504,7 @@ internal sealed class Program : IDisposable
                 }
             }
 
-            var config = new MUnique.OpenMU.AIPlayer.AiPlayerCreateConfig(name, classId, mapId, scriptPath);
+            var config = new MUnique.OpenMU.AIPlayer.AiPlayerCreateConfig(name, classId, mapId, scriptPath, Level: level);
             var result = await aiService.CreateAiPlayerAsync(config);
             return result.Success
                 ? Results.Ok(new { success = true, playerId = result.PlayerId })
@@ -531,6 +583,27 @@ internal sealed class Program : IDisposable
             return Results.Ok(new { success = false, error = "Invalid player ID" });
         });
 
+        // AI set-level endpoint: change player level for testing
+        _ = host.MapGet("/api/ai/set-level", async (string id, int level) =>
+        {
+            var debugService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiDebugService>();
+            if (Guid.TryParse(id, out var playerId))
+            {
+                await debugService.SetLevelAsync(playerId, level);
+                return Results.Ok(new { success = true, playerId = playerId.ToString(), level });
+            }
+
+            return Results.Ok(new { success = false, error = "Invalid player ID" });
+        });
+
+        // AI set-target-map endpoint: triggers cross-map teleport
+        _ = host.MapGet("/api/ai/set-target-map", async (string id, ushort map) =>
+        {
+            var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
+            var result = await aiService.SetAiPlayerTargetMapAsync(Guid.Parse(id), map);
+            return Results.Ok(new { success = result, playerId = id, targetMap = map });
+        });
+
         // Script hot-reload endpoint: reload all scripts from disk
         // ScriptExecutors with EnableHotReload=true will pick up changes on next tick
         _ = host.MapGet("/api/ai/reload-scripts", async () =>
@@ -563,6 +636,21 @@ internal sealed class Program : IDisposable
                 })
                 .ToList();
             return Results.Ok(new { count = stats.Count, players = stats });
+        });
+
+        // Stop AI player by GUID
+        _ = host.MapGet("/api/ai/stop", async (string id) =>
+        {
+            if (!Guid.TryParse(id, out var playerId))
+            {
+                return Results.Ok(new { success = false, error = "Invalid player ID format." });
+            }
+
+            var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
+            var stopped = await aiService.StopAiPlayerAsync(playerId).ConfigureAwait(false);
+            return stopped
+                ? Results.Ok(new { success = true, playerId })
+                : Results.Ok(new { success = false, error = "AI player not found." });
         });
 
         // AiMap overlay API endpoints (Phase E0)
@@ -616,6 +704,674 @@ internal sealed class Program : IDisposable
             return Results.Ok(new { mapId, groups = data });
         });
 
+        // AI test endpoint: list all AI players' inventory and quest states
+        _ = host.MapGet("/api/ai/test", async () =>
+        {
+            var sb = new System.Text.StringBuilder();
+            var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
+            var manager = (MUnique.OpenMU.AIPlayer.AiPlayerManager)aiService;
+            var players = manager.GetActivePlayers();
+
+            sb.AppendLine($"共 {players.Count()} 个AI角色\n");
+
+            foreach (var player in players)
+            {
+                if (player.SelectedCharacter is null) continue;
+                var name = player.SelectedCharacter.Name ?? "?";
+                var inv = player.Inventory;
+                var itemStorage = inv?.ItemStorage;
+                var itemCount = itemStorage?.Items.Count ?? 0;
+                var questCount = player.SelectedCharacter.QuestStates?.Count ?? 0;
+
+                sb.AppendLine($"【{name}】Lv{player.Level} 地图#{player.CurrentMap?.Definition.Number} 背包{itemCount}件 任务{questCount}个");
+
+                // 列出背包物品
+                if (itemStorage is not null)
+                {
+                    foreach (var item in itemStorage.Items.OrderBy(i => i.ItemSlot))
+                    {
+                        var slot = item.ItemSlot;
+                        var def = item.Definition;
+                        var slotType = slot <= 11 ? "装备" : "背包";
+                        var itemName = def is not null ? def.Name.ToString() ?? "?" : "?";
+                        sb.AppendLine($"  [{slotType} Slot={slot}] {itemName} (G{def?.Group}N{def?.Number}) Lv{item.Level}");
+                    }
+                }
+
+                // 列出任务状态
+                if (player.SelectedCharacter.QuestStates is not null)
+                {
+                    foreach (var qs in player.SelectedCharacter.QuestStates)
+                    {
+                        var aq = qs.ActiveQuest;
+                        var activeText = aq is not null ? $"Active=#{aq.Number} {aq.Name}" : "无活跃";
+                        sb.AppendLine($"  任务: G{qs.Group} {activeText}");
+                    }
+                }
+
+                sb.AppendLine();
+            }
+
+            // 输出规则引擎状态
+            var debugService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiDebugService>();
+            var allDebug = debugService.GetAllDebugData();
+            foreach (var d in allDebug)
+            {
+                sb.AppendLine($"  [{d.CharacterName}] 行为={d.CurrentBehavior} 脚本行={d.ScriptLineNumber}");
+            }
+
+            return Results.Content(sb.ToString(), "text/plain");
+        });
+
+        // AI give-item endpoint: inject items into AI player inventory for testing
+        _ = host.MapGet("/api/ai/give-item", async (string id, int group, int number, int? slot) =>
+        {
+            var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
+            var manager = (MUnique.OpenMU.AIPlayer.AiPlayerManager)aiService;
+
+            if (!Guid.TryParse(id, out var playerId))
+                return Results.Ok(new { success = false, error = "Invalid player ID" });
+
+            var player = manager.GetActivePlayers().FirstOrDefault(p => p.AiPlayerId == playerId);
+            if (player is null)
+                return Results.Ok(new { success = false, error = "Player not found" });
+
+            var gameCtx = player.GameContext;
+            if (gameCtx?.Configuration is null)
+                return Results.Ok(new { success = false, error = "No game config" });
+
+            // 找物品定义
+            var itemDef = gameCtx.Configuration.Items
+                .FirstOrDefault(i => i.Group == group && i.Number == number);
+            if (itemDef is null)
+                return Results.Ok(new { success = false, error = $"Item G{group}N{number} not found" });
+
+            // 创建物品
+            var ctx = player.PersistenceContext;
+            var newItem = ctx.CreateNew<MUnique.OpenMU.DataModel.Entities.Item>();
+            newItem.Definition = itemDef;
+            newItem.Durability = itemDef.Durability;
+
+            // 找背包空格（0-11装备格，12+背包格，最大到75格）
+            byte targetSlot;
+            if (slot.HasValue)
+            {
+                targetSlot = (byte)slot.Value;
+            }
+            else
+            {
+                var inventorySlots = player.Inventory?.ItemStorage.Items
+                    .Select(i => (int)i.ItemSlot) ?? Enumerable.Empty<int>();
+                var occupied = new HashSet<int>(inventorySlots);
+                targetSlot = 12;
+                for (byte s = 12; s < 76; s++)
+                {
+                    if (!occupied.Contains(s))
+                    {
+                        targetSlot = s;
+                        break;
+                    }
+                }
+            }
+
+            newItem.ItemSlot = targetSlot;
+
+            player.Inventory?.ItemStorage.Items.Add(newItem);
+            await ctx.SaveChangesAsync().ConfigureAwait(false);
+
+            return Results.Ok(new { success = true, item = $"{itemDef.Name}(G{group}N{number})", slot = newItem.ItemSlot });
+        });
+
+        // AI self-test endpoint (async mode): injects items, sets PendingTest on BoardState.
+        // Tests are executed by the heartbeat thread (BeatAsync) — no more ForceHeartbeatTicks.
+        // Results available at /api/ai/test-result.
+        _ = host.MapGet("/api/ai/test-run", async (string? type) =>
+        {
+            var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
+            var manager = (MUnique.OpenMU.AIPlayer.AiPlayerManager)aiService;
+            var logger = host.Services.GetRequiredService<ILogger<Program>>();
+
+            var results = new List<object>();
+            var players = manager.GetActivePlayers().ToList();
+            if (players.Count == 0)
+                return Results.Ok(new { tests = results, summary = "0 tests - no AI players" });
+
+            // 优先选有心跳服务的角色（Lv150 DecisionTest），其次是 Lv80 脚本角色
+            var testPlayer = players
+                .Where(p => p.SelectedCharacter is not null)
+                .OrderByDescending(p => p.Logic?.GetHeartbeat() is not null ? 1 : 0)
+                .ThenBy(p => p.Level)
+                .FirstOrDefault();
+            if (testPlayer is null)
+                return Results.Ok(new { tests = results, summary = "no suitable player" });
+
+            var heartbeat = testPlayer.Logic?.GetHeartbeat();
+            if (heartbeat is null)
+                return Results.Ok(new { tests = results, summary = "player has no heartbeat service" });
+
+            var boardState = heartbeat.BoardState;
+            var config = testPlayer.GameContext?.Configuration;
+            var inv = testPlayer.Inventory;
+
+            var testType = type ?? "auto_equip";
+            logger.LogInformation("[TestRunner] 测试类型={Type} 玩家={Name}", testType, testPlayer.SelectedCharacter?.Name ?? "?");
+
+            // 辅助方法：清理装备位的药水/消耗品
+            async ValueTask ClearEquipSlotsOfPotionsAsync(MUnique.OpenMU.DataModel.Entities.ItemStorage storage, MUnique.OpenMU.Persistence.IContext ctx)
+            {
+                var potions = storage.Items
+                    .Where(i => i.ItemSlot <= InventoryConstants.LastEquippableItemSlotIndex
+                                && i.Definition?.ItemSlot is null)
+                    .ToList();
+                foreach (var p in potions)
+                {
+                    storage.Items.Remove(p);
+                }
+                if (potions.Count > 0)
+                    await ctx.SaveChangesAsync().ConfigureAwait(false);
+            }
+
+            if (testType == "auto_equip")
+            {
+                try
+                {
+                    var swordDef = config?.Items.FirstOrDefault(i => i.Group == 0 && i.Number == 16);
+                    if (swordDef is null)
+                    {
+                        results.Add(new { name = "auto_equip", status = "skip", detail = "找不到物品定义 G0N16 (Sword of Destruction)" });
+                    }
+                    else
+                    {
+                        // 清理装备位的药水/消耗品，确保装备位干净
+                        if (inv?.ItemStorage is not null)
+                        {
+                            await ClearEquipSlotsOfPotionsAsync(inv.ItemStorage, testPlayer.PersistenceContext);
+                            logger.LogInformation("[TestRunner] 已清理装备位药水");
+                        }
+
+                        // 找背包空格
+                        var occupied = new HashSet<int>(inv?.ItemStorage.Items
+                            .Select(i => (int)i.ItemSlot) ?? Enumerable.Empty<int>());
+                        byte freeSlot = 28;
+                        for (byte s = 28; s < 76; s++) { if (!occupied.Contains(s)) { freeSlot = s; break; } }
+
+                        var ctx = testPlayer.PersistenceContext;
+                        var sword = ctx.CreateNew<MUnique.OpenMU.DataModel.Entities.Item>();
+                        sword.Definition = swordDef;
+                        sword.Durability = swordDef.Durability;
+                        sword.ItemSlot = freeSlot;
+                        inv?.ItemStorage.Items.Add(sword);
+                        await ctx.SaveChangesAsync().ConfigureAwait(false);
+                        logger.LogInformation("[TestRunner] 注入 Sword of Destruction (Slot={Slot})", freeSlot);
+
+                        boardState.PendingTest = new Dictionary<string, object>
+                        {
+                            { "type", "auto_equip" },
+                            { "injectedSlot", freeSlot },
+                        };
+                        results.Add(new { name = "auto_equip", status = "pending", detail = $"已注入剑到背包(Slot={freeSlot})，装备位已清理，等待心跳自动换装" });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new { name = "auto_equip", status = "error", detail = ex.Message });
+                }
+            }
+            else if (testType == "inventory_cleanup")
+            {
+                try
+                {
+                    // 使用普通白装（G0N0 Short Sword），不是被 DropTrashAsync 保护的物品
+                    var junkDef = config?.Items.FirstOrDefault(i => i.Group == 0 && i.Number == 0);
+                    if (junkDef is null)
+                    {
+                        results.Add(new { name = "inventory_cleanup", status = "skip", detail = "找不到物品定义 G0N0 (Short Sword)" });
+                    }
+                    else if (inv is null)
+                    {
+                        results.Add(new { name = "inventory_cleanup", status = "skip", detail = "玩家背包为空" });
+                    }
+                    else
+                    {
+                        var ctx = testPlayer.PersistenceContext;
+                        var occupied = new HashSet<int>(inv.ItemStorage.Items.Select(i => (int)i.ItemSlot));
+                        var existingCount = inv.ItemStorage.Items.Count;
+
+                        // 注入足够垃圾让背包几乎满（空格<4），这样 ForceCleanupAsync 才会执行 DropTrashAsync
+                        // 背包共 76 slot (0-75)，装备位 0-11 已占用，可用仓库格 12-75 = 64 格
+                        const int MaxSlots = 76;
+                        const int LastEquip = 11;
+                        int targetFree = 2; // 目标剩余空格数
+                        int maxFill = MaxSlots - LastEquip - 1 - targetFree; // 最多填到还剩 targetFree 格
+                        int filled = 0;
+
+                        // 先清理装备位的药水/消耗品（它们也会被算在 ItemStorage 中）
+                        var nonEquips = inv.ItemStorage.Items
+                            .Where(i => i.ItemSlot <= LastEquip && i.Definition?.ItemSlot is null)
+                            .ToList();
+                        foreach (var ne in nonEquips)
+                            inv.ItemStorage.Items.Remove(ne);
+
+                        // 用垃圾填满背包到只剩 targetFree 空格
+                        for (byte s = 12; s < MaxSlots && filled < maxFill; s++)
+                        {
+                            if (!occupied.Contains(s))
+                            {
+                                var junk = ctx.CreateNew<MUnique.OpenMU.DataModel.Entities.Item>();
+                                junk.Definition = junkDef;
+                                junk.Durability = 1;
+                                junk.ItemSlot = s;
+                                inv.ItemStorage.Items.Add(junk);
+                                filled++;
+                            }
+                        }
+                        await ctx.SaveChangesAsync().ConfigureAwait(false);
+                        logger.LogInformation("[TestRunner] 已清理装备位药水 {Removed} 件，注入 {Count} 件垃圾(G0N0)，背包原物品 {Existing} 件",
+                            nonEquips.Count, filled, existingCount);
+
+                        boardState.PendingTest = new Dictionary<string, object>
+                        {
+                            { "type", "inventory_cleanup" },
+                            { "filled", filled },
+                            { "removedPotions", nonEquips.Count },
+                        };
+                        results.Add(new { name = "inventory_cleanup", status = "pending",
+                            detail = $"已清理{nonEquips.Count}件药水+注入{filled}件白装，背包应近乎全满，等待心跳清理" });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new { name = "inventory_cleanup", status = "error", detail = ex.Message });
+                }
+            }
+            else if (testType == "learn_skill")
+            {
+                try
+                {
+                    // 找一本技能书（Group 15 且有 Skill 定义）
+                    var skillBookDef = config?.Items.FirstOrDefault(i =>
+                        i.Group == 15 && i.Skill is not null);
+                    if (skillBookDef is null)
+                    {
+                        results.Add(new { name = "learn_skill", status = "skip", detail = "找不到技能书定义(G15 with Skill)" });
+                    }
+                    else
+                    {
+                        // 检查技能是否已学
+                        var skillId = (ushort)skillBookDef.Skill!.Number;
+                        var alreadyLearned = testPlayer.SkillList?.ContainsSkill(skillId) == true;
+
+                        var ctx = testPlayer.PersistenceContext;
+                        var occupied = new HashSet<int>(inv?.ItemStorage.Items
+                            .Select(i => (int)i.ItemSlot) ?? Enumerable.Empty<int>());
+                        byte freeSlot = 28;
+                        for (byte s = 28; s < 76; s++) { if (!occupied.Contains(s)) { freeSlot = s; break; } }
+
+                        var book = ctx.CreateNew<MUnique.OpenMU.DataModel.Entities.Item>();
+                        book.Definition = skillBookDef;
+                        book.Durability = 1;
+                        book.ItemSlot = freeSlot;
+                        inv?.ItemStorage.Items.Add(book);
+                        await ctx.SaveChangesAsync().ConfigureAwait(false);
+                        logger.LogInformation("[TestRunner] 注入技能书 {Name} (G15N{Num}, Slot={Slot})",
+                            skillBookDef.Name.ToString() ?? "?", skillBookDef.Number, freeSlot);
+
+                        boardState.PendingTest = new Dictionary<string, object>
+                        {
+                            { "type", "learn_skill" },
+                            { "skillBookSlot", freeSlot },
+                            { "skillId", skillId },
+                            { "skillName", skillBookDef.Skill?.Name.ToString() ?? "?" },
+                            { "alreadyLearned", alreadyLearned },
+                        };
+                        results.Add(new { name = "learn_skill", status = "pending",
+                            detail = $"已注入技能书({skillBookDef.Name})(Slot={freeSlot})，等待心跳学习" });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new { name = "learn_skill", status = "error", detail = ex.Message });
+                }
+            }
+            else if (testType == "survival_hp")
+            {
+                try
+                {
+                    // 1) 先设置 HP 到低位（10%）
+                    var maxHp = testPlayer.Attributes?[Stats.MaximumHealth] ?? 100f;
+                    testPlayer.Attributes![Stats.CurrentHealth] = (int)(maxHp * 0.1f);
+                    logger.LogInformation("[TestRunner] 设置 HP={Target} (10% of {Max})",
+                        (int)(maxHp * 0.1f), (int)maxHp);
+
+                    // 2) 注入 HP 药水
+                    var potionDef = config?.Items.FirstOrDefault(i => i.Group == 14 && i.Number == 3);
+                    if (potionDef is null)
+                    {
+                        results.Add(new { name = "survival_hp", status = "skip", detail = "找不到药水定义 G14N3 (Large HP Potion)" });
+                    }
+                    else
+                    {
+                        var ctx = testPlayer.PersistenceContext;
+                        var occupied = new HashSet<int>(inv?.ItemStorage.Items
+                            .Select(i => (int)i.ItemSlot) ?? Enumerable.Empty<int>());
+                        byte freeSlot = 28;
+                        for (byte s = 28; s < 76; s++) { if (!occupied.Contains(s)) { freeSlot = s; break; } }
+
+                        var potion = ctx.CreateNew<MUnique.OpenMU.DataModel.Entities.Item>();
+                        potion.Definition = potionDef;
+                        potion.Durability = 1;
+                        potion.ItemSlot = freeSlot;
+                        inv?.ItemStorage.Items.Add(potion);
+                        await ctx.SaveChangesAsync().ConfigureAwait(false);
+                        logger.LogInformation("[TestRunner] 注入 HP药水 (Slot={Slot})", freeSlot);
+
+                        boardState.PendingTest = new Dictionary<string, object>
+                        {
+                            { "type", "survival_hp" },
+                            { "potionSlot", freeSlot },
+                            { "initialHp", (int)(maxHp * 0.1f) },
+                            { "maxHp", (int)maxHp },
+                        };
+                        results.Add(new { name = "survival_hp", status = "pending",
+                            detail = $"已设置HP=10%并注入HP药水(Slot={freeSlot})，等待心跳喝血" });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new { name = "survival_hp", status = "error", detail = ex.Message });
+                }
+            }
+            else if (testType == "rule_engine_chain")
+            {
+                try
+                {
+                    // 同时注入多类物品，看规则引擎按优先级依次执行
+                    var swordDef = config?.Items.FirstOrDefault(i => i.Group == 0 && i.Number == 16);
+                    var skillBookDef = config?.Items.FirstOrDefault(i => i.Group == 15 && i.Skill is not null);
+                    var junkDef = config?.Items.FirstOrDefault(i => i.Group == 0 && i.Number == 0);
+
+                    if (swordDef is null || skillBookDef is null || junkDef is null)
+                    {
+                        results.Add(new { name = "rule_engine_chain", status = "skip",
+                            detail = $"缺少物品定义: sword={(swordDef is null ? "missing" : "ok")}, skillBook={(skillBookDef is null ? "missing" : "ok")}, junk={(junkDef is null ? "missing" : "ok")}" });
+                    }
+                    else
+                    {
+                        var ctx = testPlayer.PersistenceContext;
+                        var occupied = new HashSet<int>(inv?.ItemStorage.Items
+                            .Select(i => (int)i.ItemSlot) ?? Enumerable.Empty<int>());
+                        var injected = new List<string>();
+
+                        // 如果装备位有药水，先清理
+                        if (inv?.ItemStorage is not null)
+                        {
+                            await ClearEquipSlotsOfPotionsAsync(inv.ItemStorage, ctx);
+                        }
+
+                        byte nextSlot = 28;
+                        for (byte s = 28; s < 76; s++)
+                        {
+                            if (!occupied.Contains(s)) { nextSlot = s; break; }
+                        }
+
+                        // 1) 注入剑（触发 auto_equip，priority=20）
+                        var sword = ctx.CreateNew<MUnique.OpenMU.DataModel.Entities.Item>();
+                        sword.Definition = swordDef;
+                        sword.Durability = swordDef.Durability;
+                        sword.ItemSlot = nextSlot;
+                        inv?.ItemStorage.Items.Add(sword);
+                        injected.Add($"剑(G0N16)@Slot{nextSlot}");
+                        nextSlot++;
+
+                        // 跳过被占用的 slot
+                        while (occupied.Contains(nextSlot) && nextSlot < 76) nextSlot++;
+
+                        // 2) 注入技能书（触发 learn_skill，priority=25）
+                        var book = ctx.CreateNew<MUnique.OpenMU.DataModel.Entities.Item>();
+                        book.Definition = skillBookDef;
+                        book.Durability = 1;
+                        book.ItemSlot = nextSlot;
+                        inv?.ItemStorage.Items.Add(book);
+                        injected.Add($"技能书(G15N{skillBookDef.Number})@Slot{nextSlot}");
+                        nextSlot++;
+
+                        while (occupied.Contains(nextSlot) && nextSlot < 76) nextSlot++;
+
+                        // 3) 注入垃圾（触发 inventory_cleanup，priority=10）
+                        for (int i = 0; i < 5 && nextSlot < 76; i++)
+                        {
+                            while (occupied.Contains(nextSlot) && nextSlot < 76) nextSlot++;
+                            if (nextSlot >= 76) break;
+                            var junk = ctx.CreateNew<MUnique.OpenMU.DataModel.Entities.Item>();
+                            junk.Definition = junkDef;
+                            junk.Durability = 1;
+                            junk.ItemSlot = nextSlot;
+                            inv?.ItemStorage.Items.Add(junk);
+                            injected.Add($"垃圾#{(i + 1)}@Slot{nextSlot}");
+                            nextSlot++;
+                        }
+
+                        await ctx.SaveChangesAsync().ConfigureAwait(false);
+                        logger.LogInformation("[TestRunner] 规则链测试注入: {Items}", string.Join(", ", injected));
+
+                        boardState.PendingTest = new Dictionary<string, object>
+                        {
+                            { "type", "rule_engine_chain" },
+                            { "injected", string.Join("; ", injected) },
+                        };
+                        results.Add(new { name = "rule_engine_chain", status = "pending",
+                            detail = $"已注入{injected.Count}件物品(剑+技能书+垃圾)，等待心跳按优先级执行规则链" });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new { name = "rule_engine_chain", status = "error", detail = ex.Message });
+                }
+            }
+            else
+            {
+                results.Add(new { name = testType, status = "skip", detail = $"未知测试类型 '{testType}'(支持: auto_equip, inventory_cleanup, learn_skill, survival_hp, rule_engine_chain)" });
+            }
+
+            return Results.Ok(new { tests = results, message = "tests queued — check /api/ai/test-result after next heartbeat" });
+        });
+
+        // AI test-result endpoint: reads PendingTest results from all players.
+        _ = host.MapGet("/api/ai/test-result", async () =>
+        {
+            var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
+            var manager = (MUnique.OpenMU.AIPlayer.AiPlayerManager)aiService;
+            var allResults = new List<object>();
+
+            foreach (var player in manager.GetActivePlayers())
+            {
+                var heartbeat = player.Logic?.GetHeartbeat();
+                if (heartbeat is null) continue;
+                var board = heartbeat.BoardState;
+                if (board.PendingTest?.ContainsKey("completed") == true)
+                {
+                    allResults.Add(new
+                    {
+                        playerName = player.SelectedCharacter?.Name,
+                        testType = board.PendingTest.GetValueOrDefault("type"),
+                        result = board.PendingTest.ToDictionary(k => k.Key, k => k.Value),
+                    });
+
+                    // 读取后清除标记
+                    board.PendingTest = null;
+                }
+            }
+
+            return Results.Ok(new { tests = allResults, count = allResults.Count });
+        });
+
+        // AI rules-reload endpoint: hot-reloads scripts-rules.json for all players.
+        _ = host.MapGet("/api/ai/rules-reload", () =>
+        {
+            var aiService = host.Services.GetRequiredService<MUnique.OpenMU.AIPlayer.IAiService>();
+            var manager = (MUnique.OpenMU.AIPlayer.AiPlayerManager)aiService;
+            var reloaded = 0;
+
+            foreach (var player in manager.GetActivePlayers())
+            {
+                var heartbeat = player.Logic?.GetHeartbeat();
+                if (heartbeat is null) continue;
+                heartbeat.ReloadRules();
+                reloaded++;
+            }
+
+            return Results.Ok(new { success = true, reloadedPlayers = reloaded, message = $"{reloaded} players' rules reloaded" });
+        });
+
+        // KG API endpoints
+        _ = host.MapGet("/api/kg/info", () =>
+        {
+            var query = host.Services.GetRequiredService<IKnowledgeGraphQuery>();
+            var graph = host.Services.GetRequiredService<KnowledgeGraph>();
+            var allNodes = graph.GetAllNodes();
+            var nodeTypeCounts = allNodes.GroupBy(n => n.Type).ToDictionary(g => g.Key.ToString(), g => g.Count());
+            return Results.Ok(new
+            {
+                nodeCount = graph.NodeCount,
+                edgeCount = graph.EdgeCount,
+                nodeTypes = nodeTypeCounts,
+            });
+        });
+
+        _ = host.MapGet("/api/kg/query", (string? nodeId, string? q) =>
+        {
+            var query = host.Services.GetRequiredService<IKnowledgeGraphQuery>();
+            var graph = host.Services.GetRequiredService<KnowledgeGraph>();
+
+            if (!string.IsNullOrEmpty(nodeId) && NodeId.TryParse(nodeId, out var parsed))
+            {
+                if (!graph.TryGetNode(parsed, out var node) || node is null)
+                {
+                    return Results.Ok(new { error = $"Node '{nodeId}' not found" });
+                }
+
+                var outgoing = graph.GetOutgoingEdges(parsed).Select(e => new
+                {
+                    type = e.Type.ToString(),
+                    targetId = e.Target.ToString(),
+                    targetLabel = graph.TryGetNode(e.Target, out var tn) ? tn?.Label : null,
+                    weight = e.Weight,
+                }).ToList();
+
+                var incoming = graph.GetIncomingEdges(parsed).Select(e => new
+                {
+                    type = e.Type.ToString(),
+                    sourceId = e.Source.ToString(),
+                    sourceLabel = graph.TryGetNode(e.Source, out var sn) ? sn?.Label : null,
+                    weight = e.Weight,
+                }).ToList();
+
+                return Results.Ok(new
+                {
+                    nodeId = parsed.ToString(),
+                    label = node.Label,
+                    type = node.Type.ToString(),
+                    outgoingCount = outgoing.Count,
+                    outgoing,
+                    incomingCount = incoming.Count,
+                    incoming,
+                });
+            }
+
+            if (!string.IsNullOrEmpty(q))
+            {
+                var allNodes = graph.GetAllNodes();
+                var matches = allNodes
+                    .Where(n => n.Label is not null && n.Label.Contains(q, StringComparison.OrdinalIgnoreCase))
+                    .Take(20)
+                    .Select(n => new
+                    {
+                        nodeId = n.Id.ToString(),
+                        label = n.Label,
+                        type = n.Type.ToString(),
+                    }).ToList();
+
+                return Results.Ok(new { query = q, matchCount = matches.Count, matches });
+            }
+
+            return Results.Ok(new { error = "Provide nodeId or q parameter" });
+        });
+
+        _ = host.MapGet("/api/kg/crafting-chain", (string? targetId, int maxDepth) =>
+        {
+            if (string.IsNullOrEmpty(targetId) || !NodeId.TryParse(targetId, out var parsed))
+            {
+                return Results.Ok(new { error = "Provide a valid targetId parameter (e.g. Item(12,15))" });
+            }
+
+            var query = host.Services.GetRequiredService<IKnowledgeGraphQuery>();
+            var graph = host.Services.GetRequiredService<KnowledgeGraph>();
+
+            if (!graph.TryGetNode(parsed, out var targetNode) || targetNode is null)
+            {
+                return Results.Ok(new { error = $"Target node '{targetId}' not found" });
+            }
+
+            if (maxDepth <= 0) maxDepth = 10;
+
+            // Craft-relevant edge types for backward traversal
+            var craftEdgeTypes = new HashSet<EdgeType>
+            {
+                EdgeType.HasRecipe,        // Item → CraftingRecipe
+                EdgeType.RequiresMaterial, // CraftingRecipe → Item
+                EdgeType.RequiresLevel,    // * → level constraint
+                EdgeType.RequiresClass,    // * → PlayerClass
+            };
+
+            var chain = query.ResolveDependencies(parsed, DependencyDirection.Backward, craftEdgeTypes, maxDepth);
+
+            // Build hierarchical tree from the flat dependency list
+            var result = BuildCraftingTree(parsed, targetNode.Label, chain, graph);
+
+            return Results.Ok(new
+            {
+                targetId = parsed.ToString(),
+                targetLabel = targetNode.Label,
+                targetType = targetNode.Type.ToString(),
+                stepCount = chain.Steps.Count,
+                isComplete = chain.IsComplete,
+                tree = result,
+            });
+        });
+
+        // Helper: builds a hierarchical tree from a flat dependency chain
+        static object? BuildCraftingTree(NodeId nodeId, string? label, DependencyChain chain, KnowledgeGraph graph)
+        {
+            // Find all steps directly depending on this node (depth = parent depth + 1)
+            var parentDepth = chain.Steps
+                .FirstOrDefault(s => s.NodeId.Equals(nodeId))?.Depth ?? 0;
+
+            var children = chain.Steps
+                .Where(s => s.Depth == parentDepth + 1)
+                .Select(s =>
+                {
+                    var grandchildChain = new DependencyChain
+                    {
+                        Target = s.NodeId,
+                        Direction = chain.Direction,
+                        Steps = chain.Steps.Where(x => x.Depth > s.Depth).ToList(),
+                    };
+                    return new
+                    {
+                        nodeId = s.NodeId.ToString(),
+                        label = s.Label,
+                        type = graph.TryGetNode(s.NodeId, out var gn) ? gn?.Type.ToString() : null,
+                        edgeType = s.Edge.Type.ToString(),
+                        weight = s.Edge.Weight,
+                        children = BuildCraftingTree(s.NodeId, s.Label, grandchildChain, graph),
+                    };
+                }).ToList();
+
+            if (children.Count == 0) return null;
+
+            return children;
+        }
+
         if (addAdminPanel)
         {
             host.ConfigureAdminPanel();
@@ -634,13 +1390,10 @@ internal sealed class Program : IDisposable
 
     private IIpAddressResolver CreateIpResolver(IServiceProvider serviceProvider, string[] args)
     {
-        (IpResolverType IpResolver, string? IpResolverParameter)? settings = default;
-        if (_systemConfiguration is not null)
-        {
-            settings = (_systemConfiguration.IpResolver, _systemConfiguration.IpResolverParameter);
-        }
-
-        return IpAddressResolverFactory.CreateIpResolver(args, settings, serviceProvider.GetService<ILoggerFactory>()!);
+        // Ignore system configuration for IP resolver - command line args or environment
+        // detection should always take precedence. The InMemory DB's SystemConfiguration
+        // has IpResolverType.Custom with no parameter, which crashes at startup.
+        return IpAddressResolverFactory.CreateIpResolver(args, null, serviceProvider.GetService<ILoggerFactory>()!);
     }
 
     private ICollection<PlugInConfiguration> PlugInConfigurationsFactory(IServiceProvider serviceProvider)

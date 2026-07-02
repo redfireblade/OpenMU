@@ -9,6 +9,7 @@ using System.Linq;
 using Microsoft.Extensions.Logging;
 using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.Pathfinding;
+using MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph;
 
 /// <summary>
 /// 跨地图传送路由引擎。构建门图 + 传送菜单图，BFS 计算最佳多跳路线。
@@ -28,6 +29,12 @@ public sealed class WarpPlanner
         this._logger = logger;
         this.BuildGraph();
     }
+
+    /// <summary>
+    /// Gets or sets the knowledge graph query service for fallback routing.
+    /// When set, <see cref="ComputeRouteWithKgAsync"/> uses KG for multi-constraint routing.
+    /// </summary>
+    public IKnowledgeGraphQuery? KnowledgeGraphQuery { get; set; }
 
     /// <summary>
     /// 计算从 <paramref name="fromMap"/> 到 <paramref name="toMap"/> 的最佳路线。
@@ -56,6 +63,63 @@ public sealed class WarpPlanner
 
         // Phase 2: no feasible route — find one with minimal blocker
         return this.FindBestRoute(fromMap, toMap, playerLevel, playerMoney, requireFeasible: false);
+    }
+
+    /// <summary>
+    /// Computes a route using Knowledge Graph as fallback when BFS cannot find a feasible path.
+    /// Phase 1: tries normal <see cref="ComputeRoute"/>.
+    /// Phase 2: if null or infeasible, queries KG with <see cref="EdgeType.ConnectsTo"/> and <see cref="EdgeType.WarpMenuTo"/> edges.
+    /// Phase 3: on success, converts the <see cref="PathResult"/> to a <see cref="WarpRoute"/>.
+    /// </summary>
+    public async ValueTask<WarpRoute?> ComputeRouteWithKgAsync(short fromMap, short toMap, int playerLevel, int playerMoney)
+    {
+        // Phase 1: normal BFS route
+        var normalRoute = this.ComputeRoute(fromMap, toMap, playerLevel, playerMoney);
+        if (normalRoute is not null && normalRoute.IsFeasible)
+        {
+            return normalRoute;
+        }
+
+        // Phase 2: KG fallback using gold-aware weight function
+        if (KnowledgeGraphHolder.Graph is not { } kg)
+        {
+            return normalRoute;
+        }
+
+        var fromNode = NodeId.ForMap(fromMap);
+        var toNode = NodeId.ForMap(toMap);
+
+        // Weight function: ConnectsTo = 0 (walking), WarpMenuTo = gold cost / 100 + 1
+        // This finds the cheapest route considering both gold and hop count.
+        double WeightFunc(GraphEdge edge) => edge.Type switch
+        {
+            EdgeType.ConnectsTo => 0.1, // small cost to prefer direct warps over walking
+            EdgeType.WarpMenuTo => 1.0 + (ExtractWarpCost(edge) / 100.0),
+            _ => 1.0,
+        };
+
+        // Edge filter: prune by level requirement and affordability
+        var pathFinder = new KnowledgeGraphPathFinder(kg);
+        var constraints = new QueryConstraints
+        {
+            PlayerLevel = playerLevel,
+            MaxDepth = MaxHops,
+            EdgeFilter = edge => edge.Type switch
+            {
+                EdgeType.ConnectsTo => true,
+                EdgeType.WarpMenuTo => playerMoney >= ExtractWarpCost(edge),
+                _ => false,
+            },
+        };
+
+        var path = pathFinder.Dijkstra(fromNode, toNode, WeightFunc, constraints);
+        if (path is null || !path.IsFound)
+        {
+            return normalRoute;
+        }
+
+        // Phase 3: convert KG PathResult to WarpRoute
+        return ConvertKgPathToWarpRoute(fromMap, toMap, path, playerLevel, playerMoney);
     }
 
     /// <summary>
@@ -252,5 +316,71 @@ public sealed class WarpPlanner
         }
 
         return bestRoute;
+    }
+
+    /// <summary>
+    /// Converts a KG <see cref="PathResult"/> to a <see cref="WarpRoute"/>.
+    /// <see cref="EdgeType.ConnectsTo"/> maps to <see cref="WarpEdgeType.Gate"/>;
+    /// <see cref="EdgeType.WarpMenuTo"/> maps to <see cref="WarpEdgeType.WarpMenu"/>.
+    /// </summary>
+    private static WarpRoute? ConvertKgPathToWarpRoute(short fromMap, short toMap, PathResult path, int playerLevel, int playerMoney)
+    {
+        if (path.Edges.Count == 0)
+        {
+            return null;
+        }
+
+        var steps = new List<WarpStep>(path.Edges.Count);
+        var totalGold = 0;
+        var maxLevel = 0;
+        var feasible = true;
+
+        foreach (var edge in path.Edges)
+        {
+            var from = (short)edge.Source.DomainId;
+            var to = (short)edge.Target.DomainId;
+            var method = edge.Type == EdgeType.WarpMenuTo ? WarpEdgeType.WarpMenu : WarpEdgeType.Gate;
+            var goldCost = ExtractWarpCost(edge);
+            totalGold += goldCost;
+
+            if (goldCost > 0 && totalGold > playerMoney)
+            {
+                feasible = false;
+            }
+
+            steps.Add(new WarpStep
+            {
+                FromMap = from,
+                ToMap = to,
+                Method = method,
+                LevelRequirement = 0,
+                GoldCost = goldCost,
+            });
+        }
+
+        return new WarpRoute
+        {
+            SourceMap = fromMap,
+            DestinationMap = toMap,
+            Steps = steps.AsReadOnly(),
+            IsFeasible = feasible,
+            TotalGoldCost = totalGold,
+            HighestLevelRequirement = maxLevel,
+        };
+    }
+
+    /// <summary>
+    /// Extracts the gold cost from a KG edge if available via properties or weight.
+    /// </summary>
+    private static int ExtractWarpCost(GraphEdge edge)
+    {
+        if (edge.Properties is not null &&
+            edge.Properties.TryGetValue("GoldCost", out var costObj) &&
+            costObj is int cost)
+        {
+            return cost;
+        }
+
+        return (int)edge.Weight;
     }
 }

@@ -359,6 +359,7 @@ public class DefaultDropGenerator : IDropGenerator
         {
             SpecialItemType.Ancient => this.GenerateRandomAncient(),
             SpecialItemType.Excellent => this.GenerateRandomExcellentItem(possibleItems: possibleItems),
+            SpecialItemType.Jewel => this.GenerateRandomItem(possibleItems),
             _ => this.GenerateRandomItem(possibleItems),
         };
 

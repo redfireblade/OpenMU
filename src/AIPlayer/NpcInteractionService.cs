@@ -5,6 +5,8 @@
 namespace MUnique.OpenMU.AIPlayer;
 
 using Microsoft.Extensions.Logging;
+using MUnique.OpenMU.DataModel;
+using MUnique.OpenMU.DataModel.Configuration.Items;
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.Pathfinding;
@@ -82,7 +84,95 @@ public sealed class NpcInteractionService
         return player.OpenedNpc == npc;
     }
 
-    public ValueTask<int> SellItemsAsync(AiPlayer player) => ValueTask.FromResult(0);
+    /// <summary>
+    /// Sells junk items from the player's inventory (non-equipped slots 12+).
+    /// Skips excellent items, jewels (group 12), bound items, and items with luck.
+    /// Uses the game engine's SellItemToNpcAction to safely remove items and add money.
+    /// </summary>
+    public async ValueTask<int> SellItemsAsync(AiPlayer player)
+    {
+        var inv = player.Inventory;
+        if (inv is null)
+        {
+            this._logger.LogDebug("[NpcService] SellItems: no inventory");
+            return 0;
+        }
+
+        var sellAction = new MUnique.OpenMU.GameLogic.PlayerActions.Items.SellItemToNpcAction();
+        var sold = 0;
+        var errors = 0;
+        const int maxErrors = 2;
+
+        // Get the Excellent and Luck option types from the game configuration
+        var excellentOptionType = player.GameContext?.Configuration?.ItemOptionTypes?
+            .FirstOrDefault(o => o.Name == "Excellent");
+        var luckOptionType = player.GameContext?.Configuration?.ItemOptionTypes?
+            .FirstOrDefault(o => o.Name == "Luck");
+
+        foreach (var item in inv.Items.ToList())
+        {
+            if (errors >= maxErrors)
+            {
+                this._logger.LogWarning("[NpcService] SellItems: too many errors ({Errors}), stopping", errors);
+                break;
+            }
+
+            // Skip equipped items (slots 0-11)
+            if (item.ItemSlot <= InventoryConstants.LastEquippableItemSlotIndex)
+            {
+                continue;
+            }
+
+            if (item.Definition is null)
+            {
+                continue;
+            }
+
+            // Skip bound items
+            if (item.Definition.IsBoundToCharacter)
+            {
+                continue;
+            }
+
+            // Skip jewels (group 12: Bless, Soul, Chaos, Creation, etc.)
+            if (item.Definition.Group == 12)
+            {
+                continue;
+            }
+
+            // Skip excellent items
+            if (excellentOptionType is not null && item.ItemOptions.Any(o => o.ItemOption?.OptionType == excellentOptionType))
+            {
+                continue;
+            }
+
+            // Skip items with Luck option
+            if (luckOptionType is not null && item.ItemOptions.Any(o => o.ItemOption?.OptionType == luckOptionType))
+            {
+                continue;
+            }
+
+            try
+            {
+                await sellAction.SellItemAsync(player, (byte)item.ItemSlot).ConfigureAwait(false);
+                sold++;
+                this._logger.LogDebug("[NpcService] Sold item: {Item} (slot {Slot}) for zen",
+                    item.Definition.Name, item.ItemSlot);
+            }
+            catch (Exception ex)
+            {
+                this._logger.LogWarning(ex, "[NpcService] Failed to sell item at slot {Slot}", item.ItemSlot);
+                errors++;
+            }
+        }
+
+        if (sold > 0)
+        {
+            this._logger.LogInformation("[NpcService] ✅ Sold {Sold} items to merchant", sold);
+        }
+
+        return sold;
+    }
 
     /// <summary>
     /// 修理所有装备。需要先打开 NPC 对话（Potion Girl 或任何修理 NPC）。

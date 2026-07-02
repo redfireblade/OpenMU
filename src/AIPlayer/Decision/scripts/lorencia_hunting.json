@@ -1,0 +1,113 @@
+{
+  "id": "lorencia_hunting",
+  "name": "勇者大陆狩猎脚本",
+  "version": "1.0.0",
+  "status": "verified",
+  "dslSource": "新手狩猎脚本：适用于1-30级，在勇者大陆区域自动打怪升级。优先拾取祝福宝石、灵魂宝石、玛雅宝石等高价值物品。血量低于40%时自动喝药。巡逻范围15格。段落模式：start→combat→loot",
+  "parameters": {
+    "searchRange": 15,
+    "healThreshold": 0.4,
+    "potionThreshold": 0.3,
+    "huntingRange": 12,
+    "pickupRange": 8
+  },
+  "priorityChain": [],
+  "paragraphs": [
+    {
+      "label": "start",
+      "nodes": [
+        {
+          "condition": "just_revived",
+          "action": "relocate_to_hotspot",
+          "description": "复活后返回狩猎热点区域",
+          "goto": "start"
+        },
+        {
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "parameters": {
+            "healThreshold": 0.4
+          },
+          "description": "HP低于40%自动喝药补给",
+          "goto": "start"
+        },
+        {
+          "condition": "no_monsters_recently",
+          "action": "relocate_to_hotspot",
+          "description": "附近长时间无怪物，切换到热点区域",
+          "goto": "start"
+        },
+        {
+          "condition": "has_target",
+          "action": "attack_target",
+          "description": "发现攻击目标，进入战斗段落",
+          "goto": "combat"
+        },
+        {
+          "condition": "always",
+          "action": "random_patrol",
+          "description": "无目标时随机巡逻搜索怪物",
+          "goto": "combat"
+        }
+      ]
+    },
+    {
+      "label": "combat",
+      "nodes": [
+        {
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "description": "战斗中血量低于40%立即喝药",
+          "goto": "combat"
+        },
+        {
+          "condition": "has_target_in_range",
+          "action": "attack_target",
+          "description": "目标在攻击范围内，持续攻击"
+        },
+        {
+          "condition": "has_target_not_in_range",
+          "action": "random_patrol",
+          "description": "目标超出攻击范围，移动追击"
+        },
+        {
+          "condition": "no_target",
+          "action": "pickup_nearby",
+          "description": "目标已击杀，进入拾取段落",
+          "goto": "loot"
+        },
+        {
+          "condition": "always",
+          "action": "pickup_nearby",
+          "description": "兜底逻辑：拾取附近战利品",
+          "goto": "loot"
+        }
+      ]
+    },
+    {
+      "label": "loot",
+      "nodes": [
+        {
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "description": "拾取过程中血量低紧急喝药",
+          "goto": "loot"
+        },
+        {
+          "condition": "has_target",
+          "action": "attack_target",
+          "description": "拾取时发现新目标，进入战斗",
+          "goto": "combat"
+        },
+        {
+          "condition": "always",
+          "action": "pickup_nearby",
+          "description": "拾取附近掉落物品后返回起始段落",
+          "goto": "start"
+        }
+      ]
+    }
+  ],
+  "branchHitCounts": {},
+  "orchestrator": null
+}

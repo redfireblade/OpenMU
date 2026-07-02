@@ -91,29 +91,56 @@ public sealed class ItemPickupManager : IBehaviorSubModule
             return StepResult.Completed;
         }
 
-        // Step 1: 获取当前掉落物
-        var drops = this._context.WorldState.DropsInRange;
-        if (drops is null || drops.Count == 0)
+        // Step 1: 获取当前掉落物（包括物品和金钱）
+        var dropLocateables = this._context.WorldState.DropsInRange;
+        if (dropLocateables is null || dropLocateables.Count == 0)
         {
-            // 无掉落物 → 尝试从地图直接搜索（兼容 WorldState 为空的情况）
-            var directDrops = await this.ScanMapForDropsAsync().ConfigureAwait(false);
-            if (directDrops is null || directDrops.Count == 0)
-            {
-                this._logger.LogDebug("[ItemPickup] 附近无掉落物");
-                return StepResult.Completed;
-            }
-
-            drops = directDrops;
+            this._logger.LogDebug("[ItemPickup] 附近无掉落物");
+            return StepResult.Completed;
         }
 
-        // Step 2: 按价值过滤 + 排序（优先级降序→距离升序）
-        var valuableDrops = drops
+        // 分离物品和金钱，分别处理
+        var moneyDrops = dropLocateables.OfType<DroppedMoney>().ToList();
+        var itemDrops = dropLocateables.OfType<DroppedItem>().ToList();
+
+        // 金钱：直接走过去捡（金钱不占背包空间，永远值得捡）
+        if (moneyDrops.Count > 0)
+        {
+            var nearestMoney = moneyDrops
+                .OrderBy(m => this._player.Position.EuclideanDistanceTo(m.Position))
+                .First();
+            var moneyDist = this._player.Position.EuclideanDistanceTo(nearestMoney.Position);
+
+            if (moneyDist <= 2.0f)
+            {
+                await this._adapter.PickupItemAsync(nearestMoney.Id).ConfigureAwait(false);
+                this._logger.LogInformation("[ItemPickup] 拾取金钱: {Amount} at ({X},{Y})",
+                    nearestMoney.Amount, nearestMoney.Position.X, nearestMoney.Position.Y);
+                return StepResult.InProgress;
+            }
+
+            // 金钱在可走范围内 → 走过去
+            if (moneyDist <= MaxPickupDistance)
+            {
+                var map = this._adapter.GetCurrentMap();
+                if (map is not null)
+                {
+                    await this._adapter.WalkToAsync(
+                        new Point((byte)nearestMoney.Position.X, (byte)nearestMoney.Position.Y), map)
+                        .ConfigureAwait(false);
+                    return StepResult.InProgress;
+                }
+            }
+        }
+
+        // 物品：按价值过滤
+        var itemDropList = itemDrops;
+        var valuableDrops = itemDropList
             .Where(d => this.IsWorthPickingUp(d))
             .ToList();
 
         if (this._valueAssessment is not null)
         {
-            // 按价值层级排序，同优先级按距离升序
             valuableDrops = valuableDrops
                 .OrderByDescending(d => this._valueAssessment.GetPickupPriority(
                     this._valueAssessment.Evaluate(d.Item)))
@@ -130,7 +157,8 @@ public sealed class ItemPickupManager : IBehaviorSubModule
 
         if (valuableDrops.Count == 0)
         {
-            this._logger.LogDebug("[ItemPickup] 范围掉落物 {Total} 个，无值得拾取的物品", drops.Count);
+            this._logger.LogDebug("[ItemPickup] 范围掉落物 {Total} 个(物品 {ItemCount}+金钱 {MoneyCount}) 无值得拾取的",
+                itemDrops.Count, moneyDrops.Count);
             return StepResult.Completed;
         }
 
@@ -305,32 +333,6 @@ public sealed class ItemPickupManager : IBehaviorSubModule
         }
 
         return false;
-    }
-
-    /// <summary>
-    /// 作为 WorldState.DropsInRange 的 fallback：直接从地图扫描掉落物。
-    /// 当 WorldState 未刷新或为空时使用。
-    /// </summary>
-    private async ValueTask<IList<DroppedItem>?> ScanMapForDropsAsync()
-    {
-        var map = this._adapter.GetCurrentMap();
-        if (map is null) return null;
-
-        var pos = this._adapter.GetPlayerPosition();
-
-        // GameMap 上有 GetDropsInRange 方法吗？从现有代码看可能没有直接暴露。
-        // 尝试通过 WorldState 或地图方式获取
-        try
-        {
-            // 使用反射式探索：地图可能通过某种方式暴露掉落物
-            // 最佳路径：期待 BehaviorContext.WorldState 已被刷新
-            // 如果 WorldState 为空，此方法返回 null，由上层处理
-            return null;
-        }
-        catch
-        {
-            return null;
-        }
     }
 
     /// <summary>

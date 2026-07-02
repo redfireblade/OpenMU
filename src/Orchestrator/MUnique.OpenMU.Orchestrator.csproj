@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <WarningsAsErrors>nullable;CS4014;VSTHRD110;VSTHRD100</WarningsAsErrors>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <RootNamespace>MUnique.OpenMU.Orchestrator</RootNamespace>
+    <AssemblyName>MUnique.OpenMU.Orchestrator</AssemblyName>
+    <PackageId>MUnique.OpenMU.Orchestrator</PackageId>
+    <PackageVersion>1.0.0</PackageVersion>
+    <Version>1.0.0</Version>
+    <Authors>MUnique</Authors>
+    <Copyright>Copyright (c) MUnique</Copyright>
+    <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://munique.net</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/MUnique/OpenMU/tree/master/src/Orchestrator</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReleaseNotes>https://github.com/MUnique/OpenMU/releases</PackageReleaseNotes>
+    <PackageTags>MUnique;OpenMU;Orchestrator;DAG;dependency-graph;execution-engine;topological-sort;kahn</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Description>
+      MUnique.OpenMU.Orchestrator is a generic DAG-based execution engine extracted from the OpenMU AI Player. It models workflows as directed acyclic graphs using Kahn's algorithm for topological sorting, with typed context, event bus, telemetry, step-mode testing, and per-node error isolation.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <OutputPath>..\..\bin\Debug\</OutputPath>
+    <DocumentationFile>..\..\bin\Debug\MUnique.OpenMU.Orchestrator.xml</DocumentationFile>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <OutputPath>..\..\bin\Release\</OutputPath>
+    <DocumentationFile>..\..\bin\Release\MUnique.OpenMU.Orchestrator.xml</DocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+</Project>

@@ -29,6 +29,11 @@ public enum DatabaseEngine
     /// The in memory engine (could be used for testing).
     /// </summary>
     InMemory,
+
+    /// <summary>
+    /// The SQLite engine (file-based).
+    /// </summary>
+    Sqlite,
 }
 
 /// <summary>

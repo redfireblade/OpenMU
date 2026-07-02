@@ -65,9 +65,12 @@ public class ConfigurableIpResolver : IIpAddressResolver
 
     private void ApplyConfiguration(IpResolverType resolverType, string? parameter, bool raiseEvent)
     {
+        // Fallback: if Custom type is requested without a parameter, use loopback
+        // instead of crashing. This can happen when InMemory demo data creates
+        // a SystemConfiguration with IpResolverType.Custom and no parameter.
         if (resolverType == IpResolverType.Custom && string.IsNullOrWhiteSpace(parameter))
         {
-            throw new ArgumentException("When using a custom resolver type, a parameter with an IP or host name is required.", nameof(parameter));
+            resolverType = IpResolverType.Loopback;
         }
 
         this._effectiveResolver = null;

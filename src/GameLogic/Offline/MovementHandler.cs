@@ -14,7 +14,7 @@ public sealed class MovementHandler
 {
     private const byte RegroupDistanceThreshold = 1;
 
-    private readonly OfflinePlayer _player;
+    private readonly Player _player;
     private readonly IMuHelperSettings? _config;
     private readonly Point _originPosition;
 
@@ -26,7 +26,7 @@ public sealed class MovementHandler
     /// <param name="player">The offline player.</param>
     /// <param name="config">The MU Helper configuration.</param>
     /// <param name="originPosition">The original spawn position.</param>
-    public MovementHandler(OfflinePlayer player, IMuHelperSettings? config, Point originPosition)
+    public MovementHandler(Player player, IMuHelperSettings? config, Point originPosition)
     {
         this._player = player;
         this._config = config;

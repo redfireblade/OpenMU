@@ -24,6 +24,16 @@ public sealed class BoardState
 
     /// <summary>角色当前状态快照 (每 tick 同步)。</summary>
     public PlayerStateSnapshot PlayerState { get; set; } = new();
+
+    /// <summary>材料需求知识 — 登录时扫描生成。只读，不参与决策循环。</summary>
+    public List<MaterialKnowledgeEntry> MaterialNeeds { get; set; } = new();
+
+    /// <summary>待执行的测试任务（由 test-run API 设置，下一心跳消费）。
+    /// 键值对包含 type（如"auto_equip"、"inventory_cleanup"），
+    /// 执行完成后会写入 result/completed 等字段，
+    /// 由 test-result API 读取后自行清除。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public Dictionary<string, object>? PendingTest { get; set; }
 }
 
 /// <summary>
@@ -103,4 +113,78 @@ public sealed class PlayerStateSnapshot
 
     /// <summary>角色等级。</summary>
     public int Level { get; set; }
+}
+
+/// <summary>材料需求知识条目 — 登录时填充，供看板展示和决策参考。</summary>
+public sealed class MaterialKnowledgeEntry
+{
+    /// <summary>需要合成的目标物品描述（如"恶魔广场Lv.2门票"、"翅膀"）</summary>
+    public string TargetDescription { get; set; } = "";
+
+    /// <summary>目标物品 Group</summary>
+    public int TargetGroup { get; set; }
+
+    /// <summary>目标物品 Number</summary>
+    public int TargetNumber { get; set; }
+
+    /// <summary>目标材料等级（0=不区分等级）</summary>
+    public byte TargetLevel { get; set; }
+
+    /// <summary>材料列表</summary>
+    public List<MaterialItemState> Materials { get; set; } = new();
+
+    /// <summary>是否已满足(目标物品已合成或在背包)。</summary>
+    public bool IsSatisfied { get; set; }
+}
+
+/// <summary>单个材料的状态</summary>
+public sealed class MaterialItemState
+{
+    public int Group { get; set; }
+    public int Number { get; set; }
+    public string Name { get; set; } = "";
+    public byte RequiredLevel { get; set; }
+    public int RequiredCount { get; set; }
+
+    /// <summary>背包中有多少</summary>
+    public int InInventory { get; set; }
+    /// <summary>仓库中有多少（同等级匹配）</summary>
+    public int InVault { get; set; }
+    /// <summary>背包+仓库总计</summary>
+    public int Total => this.InInventory + this.InVault;
+
+    /// <summary>是否充足</summary>
+    public bool IsSufficient => this.Total >= this.RequiredCount;
+
+    /// <summary>状态枚举</summary>
+    public MaterialStatus Status { get; set; }
+
+    // 如果 Status == NeedFarm，以下字段可用
+    public short? FarmMonsterNumber { get; set; }
+    public string? FarmMonsterName { get; set; }
+    public ushort? FarmMapNumber { get; set; }
+    public string? FarmMapName { get; set; }
+    public byte? FarmItemLevel { get; set; }
+}
+
+/// <summary>材料状态</summary>
+public enum MaterialStatus
+{
+    /// <summary>充足</summary>
+    Sufficient,
+
+    /// <summary>仓库有（需取）</summary>
+    NeedVault,
+
+    /// <summary>需要打</summary>
+    NeedFarm,
+
+    /// <summary>需要先合成中间产物</summary>
+    NeedCraftFirst,
+
+    /// <summary>等级不够</summary>
+    LevelTooLow,
+
+    /// <summary>未知（无掉落/合成信息）</summary>
+    Unknown,
 }

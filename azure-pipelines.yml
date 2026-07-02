@@ -15,19 +15,56 @@ variables:
 
 steps:
 - task: UseDotNet@2
-  displayName: 'Install .NET SDK'
+  displayName: 'Install .NET 10 SDK'
   inputs:
     version: 10.0.x
     performMultiLevelLookup: true
     includePreviewVersions: true
 
-- script: dotnet build src/MUnique.OpenMU.sln --configuration $(buildConfiguration) -p:ci=true
+# Build with normal verbosity and capture warning count for quality visibility
+- powershell: |
+    $output = dotnet build src/MUnique.OpenMU.sln --configuration $(buildConfiguration) -p:ci=true --verbosity normal 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+    Write-Host $output
+    if ($output -match '(\d+)\s*warning') {
+        $wc = $Matches[1]
+    } else {
+        $wc = 0
+    }
+    Write-Host "##vso[task.setvariable variable=buildWarningCount]$wc"
+    Write-Host "Build completed with $wc warning(s)"
+    if ($exitCode -ne 0) { exit $exitCode }
   displayName: 'Build + SpecAnalyzer validation'
 
+# Run core unit tests
 - script: dotnet test tests/MUnique.OpenMU.Tests --configuration $(buildConfiguration) --no-build --logger trx
   displayName: 'Run core tests'
   continueOnError: true
 
-- script: dotnet test tests/MUnique.OpenMU.AIPlayer.IntegrationTests --configuration $(buildConfiguration) --no-build --logger trx
-  displayName: 'Run AIPlayer integration tests'
+# Run AI Player unit tests
+- script: dotnet test tests/MUnique.OpenMU.AIPlayer.Tests --configuration $(buildConfiguration) --no-build --logger trx
+  displayName: 'Run AI Player unit tests'
   continueOnError: true
+
+# Run AI Player integration tests
+- script: dotnet test tests/MUnique.OpenMU.AIPlayer.IntegrationTests --configuration $(buildConfiguration) --no-build --logger trx
+  displayName: 'Run AI Player integration tests'
+  continueOnError: true
+
+# Publish all test results in TRX format
+- task: PublishTestResults@2
+  displayName: 'Publish test results'
+  inputs:
+    testResultsFormat: 'VSTest'
+    testResultsFiles: '**/TestResults/*.trx'
+    searchFolder: '$(System.DefaultWorkingDirectory)'
+    mergeTestResults: true
+    failTaskOnFailedTests: false
+    testRunTitle: 'OpenMU CI'
+  condition: succeededOrFailed()
+
+# StyleCop warning check (optional — uncomment to enable on a full source tree)
+# - script: ./tools/stylecop-analyze.sh
+#   displayName: 'StyleCop analysis (optional)'
+#   continueOnError: true
+#   condition: succeededOrFailed()

@@ -379,10 +379,36 @@ public sealed class EventExecutorModule : IBehaviorSubModule
         var craftMissionId = $"craft_ticket_{miniGameDef.Type}_{miniGameDef.GameLevel}";
         var existingCraftMission = this._boardState.Missions.FirstOrDefault(m => m.Id == craftMissionId);
 
-        // 已有合成任务且已完成 → 但背包仍无门票 → 合成失败/材料被消耗但没出票
+        // 已有合成任务且已完成 → 检查是否可以重置重试
         if (existingCraftMission is not null && existingCraftMission.Status == MissionStatus.Completed)
         {
-            return StepResult.Failed;
+            if (existingCraftMission.IsDailyLimitReached)
+            {
+                this._logger.LogInformation(
+                    "[EventExec] 合成任务 {Id} 当日已完成 {Count}/{Max} 次，已达上限",
+                    craftMissionId, existingCraftMission.DailyCount, existingCraftMission.DailyMaxCount);
+                return StepResult.Failed;
+            }
+
+            // 未达日限 → 门票用完了，重置 craft 任务重新合成
+            this._logger.LogInformation(
+                "[EventExec] 门票已用完，重置合成任务 {Id} (当日 {Count}/{Max})",
+                craftMissionId, existingCraftMission.DailyCount, existingCraftMission.DailyMaxCount);
+
+            existingCraftMission.Status = MissionStatus.Pending;
+            existingCraftMission.IsDeadTask = false;
+            existingCraftMission.FailureReason = null;
+
+            // 检查背包材料是否还够
+            if (!this.CheckTicketCraftingMaterials(miniGameDef))
+            {
+                // 材料不够 → 注入 farm_ticket_* 打材料任务
+                this.EnsureTicketMaterialFarmingMissionExists(miniGameDef, eventItem);
+            }
+
+            // 降级事件任务为 Pending，让 craft 优先被选
+            eventItem.Status = MissionStatus.Pending;
+            return StepResult.InProgress;
         }
 
         // 已有合成任务正在执行中 → 等待

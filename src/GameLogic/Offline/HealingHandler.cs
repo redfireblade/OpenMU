@@ -28,7 +28,7 @@ public sealed class HealingHandler
         ItemConstants.Apple,
     ];
 
-    private readonly OfflinePlayer _player;
+    private readonly Player _player;
     private readonly IMuHelperSettings? _config;
 
     /// <summary>
@@ -36,7 +36,7 @@ public sealed class HealingHandler
     /// </summary>
     /// <param name="player">The offline player.</param>
     /// <param name="config">The MU helper settings.</param>
-    public HealingHandler(OfflinePlayer player, IMuHelperSettings? config)
+    public HealingHandler(Player player, IMuHelperSettings? config)
     {
         this._player = player;
         this._config = config;

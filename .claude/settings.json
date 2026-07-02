@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash",
+      "Glob",
+      "Grep",
+      "Skill",
+      "Agent"
+    ],
+    "auto": true
+  },
+  "hooks": {
+    "SessionStart": {
+      "command": "cat .claude/hooks/SessionStart"
+    },
+    "Stop": {
+      "command": "cat .claude/hooks/Stop"
+    }
+  },
+  "mcpServers": {
+    "shell-command": {
+      "command": "npx",
+      "args": ["-y", "@egoist/shell-command-mcp"]
+    }
+  }
+}

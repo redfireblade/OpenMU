@@ -4,11 +4,13 @@
 
 namespace MUnique.OpenMU.AIPlayer;
 
+using Microsoft.Extensions.Logging;
+using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.GameLogic.NPC;
 using MUnique.OpenMU.GameLogic.PlayerActions.Quests;
-using Microsoft.Extensions.Logging;
+using MUnique.OpenMU.GameLogic.Views.World;
 
 /// <summary>
 /// L3 atomic execution service — calls game public APIs directly, like NPC AI does.
@@ -30,10 +32,16 @@ public sealed class NativeExecutionService
     /// Melee physical attack — like Monster.AttackAsync => target.AttackByAsync(this, null, false).
     /// This properly triggers QuestMonsterKillCountPlugIn, unlike packet injection.
     /// </summary>
-    public async ValueTask MeleeAttackAsync(IAttackable target)
+    /// <returns>Hit info with damage dealt, or null if the target was already dead.</returns>
+    public async ValueTask<HitInfo?> MeleeAttackAsync(IAttackable target)
     {
-        if (!target.IsAlive || target is Monster { IsAlive: false }) return;
+        if (!target.IsAlive || target is Monster { IsAlive: false }) return null;
         this._player.Rotation = this._player.Position.GetDirectionTo(target.Position);
+
+        // Broadcast basic attack animation to observers (real players)
+        await this._player.ForEachWorldObserverAsync<IShowAnimationPlugIn>(
+            p => p.ShowAnimationAsync(this._player, 0, target, this._player.Rotation), false).ConfigureAwait(false);
+
         var hitInfo = await target.AttackByAsync(this._player, null, false).ConfigureAwait(false);
         this._player.Logger.LogInformation("[P0D] MeleeAttackAsync: target #{Target}({Name}) at ({X},{Y}), hpDmg={HpDmg}, shieldDmg={ShieldDmg}, targetAlive={Alive}",
             target is Monster m ? m.Definition?.Number : 0,
@@ -42,6 +50,7 @@ public sealed class NativeExecutionService
             hitInfo?.HealthDamage ?? 0, hitInfo?.ShieldDamage ?? 0,
             target.IsAlive);
         await this.EnsureMinimumDamageAsync(target, hitInfo).ConfigureAwait(false);
+        return hitInfo;
     }
 
     /// <summary>
@@ -94,6 +103,14 @@ public sealed class NativeExecutionService
         }
 
         this._player.Rotation = this._player.Position.GetDirectionTo(target.Position);
+
+        // Broadcast skill animation to observers
+        if (skillEntry.Skill.SkillType != SkillType.Buff && skillEntry.Skill.SkillType != SkillType.PassiveBoost)
+        {
+            await this._player.ForEachWorldObserverAsync<IShowSkillAnimationPlugIn>(
+                p => p.ShowSkillAnimationAsync(this._player, target, skillEntry.Skill, true), false).ConfigureAwait(false);
+        }
+
         await target.AttackByAsync(this._player, skillEntry, false).ConfigureAwait(false);
     }
 

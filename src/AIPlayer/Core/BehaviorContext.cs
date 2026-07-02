@@ -60,6 +60,9 @@ public sealed class BehaviorContext
     /// <summary>最后经验合并时间戳。</summary>
     public DateTime LastConsolidationTick { get; set; } = DateTime.UtcNow;
 
+    /// <summary>群体经验服务引用（由 AiPlayerManager 初始化时设置）。</summary>
+    public Decision.Experience.ExperienceService? ExpService { get; set; }
+
     /// <summary>游戏操作适配器（模块通过此接口操作游戏，不直接依赖 Player/GameContext）。</summary>
     public IGameAdapter GameAdapter { get; set; } = null!;
 
@@ -134,6 +137,7 @@ public sealed class BehaviorContext
 public struct TickTiming
 {
     public long WorldRefreshUs;
+    public long OfflineHelperUs;
     public long ScriptExecutionUs;
     public long TotalUs;
 }
@@ -144,8 +148,8 @@ public sealed class WorldState
     /// <summary>范围内的可攻击对象（怪物 + 可 PVP 玩家）。</summary>
     public IList<IAttackable> AttackablesInRange { get; init; } = new List<IAttackable>();
 
-    /// <summary>范围内的掉落物品。</summary>
-    public IList<DroppedItem> DropsInRange { get; init; } = new List<DroppedItem>();
+    /// <summary>范围内的掉落物品和金钱。</summary>
+    public IList<ILocateable> DropsInRange { get; init; } = new List<ILocateable>();
 
     /// <summary>范围内的 NPC。</summary>
     public IList<NonPlayerCharacter> NpcsInRange { get; init; } = new List<NonPlayerCharacter>();

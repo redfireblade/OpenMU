@@ -6,6 +6,8 @@ namespace MUnique.OpenMU.AIPlayer;
 
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.Attributes;
+using MUnique.OpenMU.GameLogic.Views.World;
+using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.DataModel.Entities;
 using MUnique.OpenMU.DataModel.Configuration.Quests;
 using MUnique.OpenMU.GameLogic.NPC;
@@ -94,6 +96,27 @@ public sealed class GameAdapter : IGameAdapter
             ? this._player.Position.GetDirectionTo(target.Position)
             : direction;
         this._player.Rotation = attackDir;
+
+        // Broadcast attack animation to all nearby observers (including real players)
+        // This is what the real AttackAction does — without this, clients see AI standing still.
+        if (skillNumber > 0)
+        {
+            var skill = this._player.SkillList?.GetSkill(skillNumber)?.Skill;
+            if (skill is not null && skill.SkillType != SkillType.Buff && skill.SkillType != SkillType.PassiveBoost)
+            {
+                await this._player.ForEachWorldObserverAsync<IShowSkillAnimationPlugIn>(
+                    p => p.ShowSkillAnimationAsync(this._player, target, skill, true), false).ConfigureAwait(false);
+            }
+        }
+        else
+        {
+            // Basic attack (no skill): broadcast animation to observers.
+            // Animation 0 = default weapon swing. Without this broadcast,
+            // real players never see the AI attack.
+            await this._player.ForEachWorldObserverAsync<IShowAnimationPlugIn>(
+                p => p.ShowAnimationAsync(this._player, 0, target, attackDir), false).ConfigureAwait(false);
+        }
+
         var hitInfo = await target.AttackByAsync(this._player, null, false).ConfigureAwait(false);
         this._player.Logger.LogInformation("[P0D] HitAsync: target #{Target}({Name}) at ({X},{Y}), hpDmg={HpDmg}, shieldDmg={ShieldDmg}, targetAlive={Alive}",
             target is Monster m ? m.Definition?.Number : 0,
@@ -127,6 +150,14 @@ public sealed class GameAdapter : IGameAdapter
         }
 
         this._player.Rotation = this._player.Position.GetDirectionTo(target.Position);
+
+        // Broadcast skill animation to observers
+        if (skill.SkillType != SkillType.Buff && skill.SkillType != SkillType.PassiveBoost)
+        {
+            await this._player.ForEachWorldObserverAsync<IShowSkillAnimationPlugIn>(
+                p => p.ShowSkillAnimationAsync(this._player, target, skill, true), true).ConfigureAwait(false);
+        }
+
         var hitInfo = await target.AttackByAsync(this._player, skillEntry, false).ConfigureAwait(false);
         this._player.Logger.LogInformation("[P0D] HitWithSkillAsync: target #{Target}({Name}) at ({X},{Y}), skill={Skill}, hpDmg={HpDmg}, shieldDmg={ShieldDmg}, targetAlive={Alive}",
             target is Monster m ? m.Definition?.Number : 0,
@@ -199,9 +230,20 @@ public sealed class GameAdapter : IGameAdapter
         var currentMap = this._player.CurrentMap;
         if (currentMap is null)
         {
-            var reason = "CurrentMap is null, cannot warp";
-            this._player.Logger.LogWarning("[WarpToMapAsync] {Reason} to map {MapNumber}.", reason, mapNumber);
-            return new WarpResult(WarpStatusCode.PlayerNullContext, mapNumber, null, reason, this._player.Position);
+            // 死亡/复活过渡期 CurrentMap 可能为 null。等最多 500ms 让地图就绪。
+            for (var i = 0; i < 5; i++)
+            {
+                await Task.Delay(100).ConfigureAwait(false);
+                currentMap = this._player.CurrentMap;
+                if (currentMap is not null) break;
+            }
+
+            if (currentMap is null)
+            {
+                var reason = "CurrentMap is null, cannot warp";
+                this._player.Logger.LogWarning("[WarpToMapAsync] {Reason} to map {MapNumber}.", reason, mapNumber);
+                return new WarpResult(WarpStatusCode.PlayerNullContext, mapNumber, null, reason, this._player.Position);
+            }
         }
 
         if (currentMap.Definition.Number == mapNumber)

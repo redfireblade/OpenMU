@@ -52,4 +52,7 @@ public interface IAiService
     /// <param name="playerId">The ID of the AI player.</param>
     /// <returns>The AI player state, or <c>null</c> if not found.</returns>
     ValueTask<AiPlayerState?> GetAiPlayerStateAsync(Guid playerId);
+
+    /// <summary>Gets the game configuration, once available.</summary>
+    MUnique.OpenMU.DataModel.Configuration.GameConfiguration? GameConfiguration { get; }
 }

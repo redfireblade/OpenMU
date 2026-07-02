@@ -4,6 +4,8 @@
 
 namespace MUnique.OpenMU.AIPlayer;
 
+using MUnique.OpenMU.AIPlayer.Knowledge;
+
 /// <summary>
 /// Configuration for creating a new AI player.
 /// </summary>
@@ -11,8 +13,11 @@ namespace MUnique.OpenMU.AIPlayer;
 /// <param name="CharacterClassNumber">The character class number (0=Dark Wizard, 4=Dark Knight, etc.).</param>
 /// <param name="MapId">The map number to spawn on (0=Lorencia, etc.).</param>
 /// <param name="ScriptPath">Optional path to a behavior script JSON file for 1D script-driven mode.</param>
+/// <param name="Direction">Optional build direction for stat allocation and equipment scoring. When null, uses <see cref="StatAllocationStrategy.GetDefaultDirection"/> based on class number.</param>
 public sealed record AiPlayerCreateConfig(
     string CharacterName,
     int CharacterClassNumber,
     ushort MapId,
-    string? ScriptPath = null);
+    string? ScriptPath = null,
+    BuildDirection? Direction = null,
+    int Level = 1);

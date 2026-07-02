@@ -47,7 +47,7 @@ public abstract class GameConfigurationInitializerBase : InitializerBase
         this.GameConfiguration.MaximumVaultMoney = int.MaxValue;
         this.GameConfiguration.PreventExperienceOverflow = false;
         this.GameConfiguration.ClampMoneyOnPickup = false;
-        this.GameConfiguration.ExcellentItemDropLevelDelta = 25;
+        this.GameConfiguration.ExcellentItemDropLevelDelta = 5;
         this.GameConfiguration.RecoveryInterval = 3000;
         this.GameConfiguration.MaximumLetters = 50;
         this.GameConfiguration.LetterSendPrice = 1000;
@@ -157,21 +157,22 @@ public abstract class GameConfigurationInitializerBase : InitializerBase
         {
             var excellentItemDropItemGroup = this.Context.CreateNew<DropItemGroup>();
             excellentItemDropItemGroup.SetGuid(3);
-            excellentItemDropItemGroup.Chance = 0.0001;
+            excellentItemDropItemGroup.Chance = 0.20;
             excellentItemDropItemGroup.ItemType = SpecialItemType.Excellent;
             excellentItemDropItemGroup.ItemLevel = 0;
             excellentItemDropItemGroup.Description =
-                "The common drop item group for random excellent items (0.01 % drop chance)";
+                "The common drop item group for random excellent items (0.05 % drop chance)";
             this.GameConfiguration.DropItemGroups.Add(excellentItemDropItemGroup);
             BaseMapInitializer.RegisterDefaultDropItemGroup(excellentItemDropItemGroup);
         }
 
         var jewelsDropItemGroup = this.Context.CreateNew<DropItemGroup>();
         jewelsDropItemGroup.SetGuid(4);
-        jewelsDropItemGroup.Chance = 0.001;
+        jewelsDropItemGroup.Chance = 1.5;
         jewelsDropItemGroup.ItemType = SpecialItemType.Jewel;
         jewelsDropItemGroup.Description = "The jewels drop item group (0.1 % drop chance)";
         this.GameConfiguration.DropItemGroups.Add(jewelsDropItemGroup);
+
         BaseMapInitializer.RegisterDefaultDropItemGroup(jewelsDropItemGroup);
     }
 

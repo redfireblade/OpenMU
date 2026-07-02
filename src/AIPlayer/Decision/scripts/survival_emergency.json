@@ -1,0 +1,115 @@
+{
+  "id": "survival_emergency",
+  "name": "庄园守护/生存应急脚本",
+  "version": "1.0.0",
+  "status": "candidate",
+  "dslSource": "兜底生存应急脚本：作为所有脚本的最后一道防线，专注于角色生存保障。自动管理HP和MP状态，当血量低于60%时立即喝药。整理背包中的冗余物品腾出空间。检查装备耐久度，低于20%阈值时自动回城修理。无其他脚本匹配时以此为兜底行为模式。",
+  "parameters": {
+    "searchRange": 5,
+    "healThreshold": 0.6,
+    "mpHealThreshold": 0.3,
+    "potionThreshold": 0.5,
+    "durableLowThreshold": 0.2,
+    "inventoryFullThreshold": 80
+  },
+  "priorityChain": [
+    {
+      "name": "revive_recover",
+      "condition": "just_revived",
+      "action": "use_hp_potion",
+      "description": "复活后立即补满血量确保安全"
+    },
+    {
+      "name": "hp_emergency_heal",
+      "condition": "hp_below_threshold",
+      "action": "use_hp_potion",
+      "parameters": {
+        "healThreshold": 0.6
+      },
+      "description": "HP低于60%紧急喝血瓶回血"
+    },
+    {
+      "name": "mp_emergency_heal",
+      "condition": "mp_below_threshold",
+      "action": "use_mp_potion",
+      "description": "MP低于30%喝蓝瓶恢复法力"
+    },
+    {
+      "name": "inventory_cleanup",
+      "condition": "inventory_full",
+      "action": "travel_to_map",
+      "parameters": {
+        "mapId": 0
+      },
+      "description": "背包空间已满，回城整理丢弃冗余物品"
+    },
+    {
+      "name": "equipment_repair",
+      "condition": "equip_durable_low",
+      "action": "travel_to_map",
+      "parameters": {
+        "mapId": 0
+      },
+      "description": "装备耐久度低于20%，回城修理装备"
+    },
+    {
+      "name": "potion_refill",
+      "condition": "potion_count_below_threshold",
+      "action": "travel_to_map",
+      "parameters": {
+        "mapId": 0
+      },
+      "description": "药水数量低于阈值，回城补给药水"
+    },
+    {
+      "name": "safe_patrol",
+      "condition": "always",
+      "action": "random_patrol",
+      "description": "无紧急情况时小范围安全巡逻"
+    }
+  ],
+  "paragraphs": [
+    {
+      "label": "survival",
+      "nodes": [
+        {
+          "condition": "just_revived",
+          "action": "use_hp_potion",
+          "description": "复活后第一时间补血"
+        },
+        {
+          "condition": "hp_below_threshold",
+          "action": "use_hp_potion",
+          "description": "血量低于60%紧急喝药"
+        },
+        {
+          "condition": "mp_below_threshold",
+          "action": "use_mp_potion",
+          "description": "蓝量低于30%喝蓝"
+        },
+        {
+          "condition": "inventory_full",
+          "action": "travel_to_map",
+          "description": "背包满回城整理"
+        },
+        {
+          "condition": "equip_durable_low",
+          "action": "travel_to_map",
+          "description": "耐久低回城修理"
+        },
+        {
+          "condition": "potion_count_below_threshold",
+          "action": "travel_to_map",
+          "description": "药水不足回城补给"
+        },
+        {
+          "condition": "always",
+          "action": "random_patrol",
+          "description": "安全状态下小范围巡逻待命"
+        }
+      ]
+    }
+  ],
+  "branchHitCounts": {},
+  "orchestrator": null
+}

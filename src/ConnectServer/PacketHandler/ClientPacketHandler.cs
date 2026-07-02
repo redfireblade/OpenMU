@@ -32,7 +32,7 @@ internal class ClientPacketHandler : IPacketHandler<Client>
         this._connectServerSettings = connectServer.Settings;
 
         // TODO: Is 0x05 correct? PatchCheckRequest has Code 0x02
-        this._packetHandlers.Add(0x05, new FtpRequestHandler(connectServer.Settings, loggerFactory.CreateLogger<FtpRequestHandler>()));
+        this._packetHandlers.Add(0x02, new FtpRequestHandler(connectServer.Settings, loggerFactory.CreateLogger<FtpRequestHandler>()));
         this._packetHandlers.Add(0xF4, new ServerListHandler(connectServer, loggerFactory));
     }
 

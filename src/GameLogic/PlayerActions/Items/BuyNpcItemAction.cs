@@ -51,7 +51,12 @@ public class BuyNpcItemAction
         }
 
         // Inventory Update:
-        if (storeItem.IsStackable() && player.Inventory!.Items.FirstOrDefault(item => storeItem.CanCompletelyStackOn(item)) is { } targetItem)
+        // 修正堆叠检查：不能用 Definition.Durability 当上限（药水 Definition.Durability=3 是充能数），
+        // 实际堆叠上限是 byte.MaxValue(255)。使用独立的 CanStackItem 方法。
+        var stackTarget = storeItem.IsStackable()
+            ? player.Inventory!.Items.FirstOrDefault(invItem => BuyNpcItemAction.CanStackItem(storeItem, invItem))
+            : null;
+        if (stackTarget is { } targetItem)
         {
             if (!this.CheckMoney(player, storeItem))
             {
@@ -60,7 +65,8 @@ public class BuyNpcItemAction
 
             targetItem.Durability += storeItem.Durability;
             await player.InvokeViewPlugInAsync<IItemDurabilityChangedPlugIn>(p => p.ItemDurabilityChangedAsync(targetItem, false)).ConfigureAwait(false);
-            await player.InvokeViewPlugInAsync<IBuyNpcItemFailedPlugIn>(p => p.BuyNpcItemFailedAsync()).ConfigureAwait(false);
+            await player.InvokeViewPlugInAsync<IUpdateMoneyPlugIn>(p => p.UpdateMoneyAsync()).ConfigureAwait(false);
+            return;
         }
         else
         {
@@ -88,6 +94,21 @@ public class BuyNpcItemAction
         }
 
         await player.InvokeViewPlugInAsync<IUpdateMoneyPlugIn>(p => p.UpdateMoneyAsync()).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 检查 NPC 商店物品能否堆叠到玩家背包的已有物品上。
+    /// 与 CanCompletelyStackOn 不同：不使用 Definition.Durability 作为堆叠上限，
+    /// 因为药水的 Definition.Durability=3（充能数），但实际上堆叠可以到 255。
+    /// </summary>
+    private static bool CanStackItem(Item storeItem, Item inventoryItem)
+    {
+        if (!storeItem.IsStackable()) return false;
+        if (!storeItem.IsSameItemAs(inventoryItem)) return false;
+        var maxStack = inventoryItem.Definition?.Durability ?? byte.MaxValue;
+        if (maxStack < 10) maxStack = byte.MaxValue; // Durability<10 表示是充能数而非堆叠上限，用255
+        var newTotal = storeItem.Durability + inventoryItem.Durability;
+        return newTotal <= maxStack && newTotal <= byte.MaxValue;
     }
 
     private bool CheckMoney(Player player, Item item)

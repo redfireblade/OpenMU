@@ -118,6 +118,14 @@ public sealed class MissionBoardService
                 FailureRetryable = true,
                 MaxRepeatCount = q.Repeatable ? -1 : 0,
             });
+
+            // G18 蜘蛛任务是日常可重复，一天最多打5轮
+            if (q.Group == 18)
+            {
+                var lastAdded = this._boardState.Missions[^1];
+                lastAdded.DailyMaxCount = 5;
+                this._logger.LogDebug("[MissionBoard] 📅 G18 任务 {Id} 每日上限5次", lastAdded.Id);
+            }
         }
 
         // ===== Phase 2: MiniGame 事件注入（由 DynamicMissionGenerator 和 EventWatcherService 动态管理） =====
@@ -134,6 +142,164 @@ public sealed class MissionBoardService
 
         // ===== Phase 5: 兜底生存刷怪 -- 已移到 DynamicMissionGenerator Layer 6 =====
 
+        // ===== Phase 6: 材料需求知识初始化 =====
+        try
+        {
+            var materialService = new MaterialRequirementService(
+                config, this._player, this._adapter, this._logger);
+            var needs = materialService.AnalyzeAll();
+            this._boardState.MaterialNeeds = needs;
+
+            // 对于材料不满足的，注入 farm_* 任务（每个材料缺口的第一个材料前驱）
+            foreach (var need in needs)
+            {
+                if (need.Materials.All(m => m.IsSufficient))
+                {
+                    continue; // 材料充足，无需任务
+                }
+
+                // 找第一个不充足的材料
+                var missing = need.Materials.FirstOrDefault(m => !m.IsSufficient);
+                if (missing is null)
+                {
+                    continue;
+                }
+
+                if (missing.Status != MaterialStatus.NeedFarm &&
+                    missing.Status != MaterialStatus.NeedVault)
+                {
+                    continue;
+                }
+
+                var missionId = $"farm_mat_{missing.Group}_{missing.Number}";
+                if (this._boardState.Missions.Any(m => m.Id == missionId))
+                {
+                    continue;
+                }
+
+                // 门票材料额外多打: 按玩家等级决定要打多少份
+                var baseNeed = missing.RequiredCount - missing.Total;
+                var extraCount = baseNeed;
+                if (missing.RequiredLevel > 0 && level >= 200)
+                    extraCount = Math.Max(baseNeed, 3);  // 高等级玩家多囤
+                else if (missing.RequiredLevel > 0 && level >= 100)
+                    extraCount = Math.Max(baseNeed, 2);  // 中等等级适量囤
+
+                // 只注入有具体掉落来源的任务（跳过全局掉落物，如宝石类）
+                if (!missing.FarmMonsterNumber.HasValue)
+                {
+                    this._logger.LogDebug(
+                        "[MissionBoard] 跳过材料任务 {Group}_{Number}: 无具体怪物掉落来源",
+                        missing.Group, missing.Number);
+                    continue;
+                }
+
+                var farmMission = new MissionItem
+                {
+                    Id = missionId,
+                    Title = $"刷{missing.Name}",
+                    Priority = 20, // 中等优先级
+                    Type = MissionType.ItemFarm,
+                    Category = QuestCategory.AiCustom,
+                    Module = "material_farm",
+                    FailureRetryable = true,
+                    MaxRepeatCount = -1,
+                    TargetLevel = missing.RequiredLevel,
+                    Context = new Dictionary<string, object>
+                    {
+                        { "ItemGroup", missing.Group },
+                        { "ItemNumber", missing.Number },
+                        { "TargetLevel", missing.RequiredLevel },
+                        { "RequiredCount", extraCount },
+                    },
+                };
+
+                if (missing.FarmMonsterNumber.HasValue)
+                {
+                    farmMission.Context["MonsterNumber"] = missing.FarmMonsterNumber.Value;
+                    farmMission.Context["MapNumber"] = missing.FarmMapNumber ?? 0;
+                }
+
+                this._boardState.Missions.Add(farmMission);
+                var extraLog = extraCount > baseNeed ? $", 多囤{extraCount - baseNeed}张" : "";
+                this._logger.LogInformation(
+                    "[MissionBoard] 📋 材料任务: {Id} -> {Title} (等级{Lv}, 缺{Need}个{Extra})",
+                    missionId,
+                    farmMission.Title,
+                    missing.RequiredLevel,
+                    extraCount,
+                    extraLog);
+            }
+
+            // 对于门票类合成需求，同时注入 craft_ticket_* 任务
+            foreach (var need in needs)
+            {
+                if (need.Materials.All(m => m.IsSufficient) || need.IsSatisfied)
+                    continue;
+
+                // 从 need 查 MiniGameDefinition
+                var miniGameDef = config.MiniGameDefinitions
+                    .FirstOrDefault(d => d.TicketItem?.Group == need.TargetGroup
+                                      && d.TicketItem?.Number == need.TargetNumber);
+                if (miniGameDef is null)
+                    continue;
+
+                var craftId = $"craft_ticket_{miniGameDef.Type}_{miniGameDef.GameLevel}";
+                if (this._boardState.Missions.Any(m => m.Id == craftId))
+                    continue;
+
+                // 找到对应的 farm 任务 ID
+                var farmIds = need.Materials
+                    .Where(m => !m.IsSufficient && (m.Status == MaterialStatus.NeedFarm || m.Status == MaterialStatus.NeedVault))
+                    .Select(m => $"farm_mat_{m.Group}_{m.Number}")
+                    .ToArray();
+
+                var craftMission = new MissionItem
+                {
+                    Id = craftId,
+                    Title = $"合成{miniGameDef.Name}门票(Lv.{miniGameDef.GameLevel})",
+                    Priority = 18, // 比 farm 高比事件低
+                    Type = MissionType.ItemFarm,
+                    Category = QuestCategory.InstanceEvent,
+                    Module = "crafting_executor",
+                    FailureRetryable = true,
+                    MaxRepeatCount = 5,
+                    TargetType = miniGameDef.Type,
+                    TargetLevel = miniGameDef.TicketItemLevel,
+                    Dependencies = farmIds, // 所有 farm 任务完成后才能合成
+                    Context = new Dictionary<string, object>
+                    {
+                        { "MiniGameType", (int)miniGameDef.Type },
+                        { "MiniGameLevel", miniGameDef.GameLevel },
+                        { "TicketItemGroup", miniGameDef.TicketItem?.Group ?? 0 },
+                        { "TicketItemNumber", miniGameDef.TicketItem?.Number ?? 0 },
+                    },
+                };
+
+                // 副本门票合成任务的每日可用次数限制
+                craftMission.DailyMaxCount = miniGameDef.Type switch
+                {
+                    MiniGameType.DevilSquare => 3,
+                    MiniGameType.BloodCastle => 3,
+                    MiniGameType.ChaosCastle => 3,
+                    _ => 0,
+                };
+
+                this._boardState.Missions.Add(craftMission);
+                this._logger.LogInformation("[MissionBoard] 📋 craft任务: {Id} -> {Title} (依赖:{Deps})",
+                    craftId, craftMission.Title, string.Join(",", farmIds));
+            }
+
+            this._logger.LogInformation(
+                "[MissionBoard] 📋 材料需求分析完成: {Count} 项目标",
+                needs.Count);
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning(
+                "[MissionBoard] 材料需求分析跳过: {Msg}", ex.Message);
+        }
+
         this._boardState.Missions.Sort((a, b) => a.Priority.CompareTo(b.Priority));
 
         // 同步角色状态
@@ -149,13 +315,11 @@ public sealed class MissionBoardService
             this._boardState.Missions.Count, level);
     }
 
-    /// <summary>Group → QuestCategory 映射。</summary>
+    /// <summary>Group → QuestCategory 映射。Season 6 实际配置中仅有 Group 0(主线) 和 Group 18(日常)。</summary>
     private static QuestCategory MapQuestCategory(short group) => group switch
     {
         0 => QuestCategory.MainStory,
-        15 => QuestCategory.SideQuest,
         18 => QuestCategory.Daily,
-        19 => QuestCategory.Random,
         _ => QuestCategory.SideQuest,
     };
 
@@ -353,6 +517,19 @@ public sealed class MissionBoardService
         }
 
         return (float)occupied / RegularInventorySlots;
+    }
+
+    /// <summary>
+    /// Clears all missions from the board state.
+    /// Called when the AI needs to reset its mission plan (e.g., during
+    /// death-loop escalation) so it re-evaluates from scratch rather than
+    /// running back to a dangerous hotspot.
+    /// </summary>
+    public void ClearAllMissions()
+    {
+        this._boardState.Missions.Clear();
+        this._boardState.WorldEvents.Clear();
+        this._logger.LogInformation("[MissionBoard] 已清空看板任务 — 死亡循环退避");
     }
 
     private bool IsQuestCompletelyFinished(QuestDefinition quest, ICollection<CharacterQuestState>? questStates)

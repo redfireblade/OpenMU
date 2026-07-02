@@ -9,4 +9,5 @@ public static class ContentVersionCatalog
     public static GameVersion? ServerVersion { get; set; }
     public static bool IsSkillAvailable(ushort skillNumber) => true;
     public static bool IsMapAvailable(ushort mapNumber) => true;
+    public static bool IsItemAvailable(MUnique.OpenMU.DataModel.Configuration.Items.ItemDefinition itemDef) => true;
 }

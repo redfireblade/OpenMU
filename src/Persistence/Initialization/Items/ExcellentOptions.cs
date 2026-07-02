@@ -63,7 +63,7 @@ public class ExcellentOptions : InitializerBase
         definition.SetGuid(ItemOptionDefinitionNumbers.ExcellentCurse);
         this.GameConfiguration.ItemOptions.Add(definition);
         definition.Name = CurseAttackOptionsName;
-        definition.AddChance = 0.001f;
+        definition.AddChance = 0.3f;
         definition.AddsRandomly = true;
         definition.MaximumOptionsPerItem = 2;
 
@@ -81,7 +81,7 @@ public class ExcellentOptions : InitializerBase
         definition.SetGuid(ItemOptionDefinitionNumbers.ExcellentWizardry);
         this.GameConfiguration.ItemOptions.Add(definition);
         definition.Name = WizardryAttackOptionsName;
-        definition.AddChance = 0.001f;
+        definition.AddChance = 0.3f;
         definition.AddsRandomly = true;
         definition.MaximumOptionsPerItem = 2;
 
@@ -99,7 +99,7 @@ public class ExcellentOptions : InitializerBase
         definition.SetGuid(ItemOptionDefinitionNumbers.ExcellentPhysical);
         this.GameConfiguration.ItemOptions.Add(definition);
         definition.Name = PhysicalAttackOptionsName;
-        definition.AddChance = 0.001f;
+        definition.AddChance = 0.3f;
         definition.AddsRandomly = true;
         definition.MaximumOptionsPerItem = 2;
 
@@ -117,7 +117,7 @@ public class ExcellentOptions : InitializerBase
         definition.SetGuid(ItemOptionDefinitionNumbers.ExcellentDefense);
         this.GameConfiguration.ItemOptions.Add(definition);
         definition.Name = DefenseOptionsName;
-        definition.AddChance = 0.001f;
+        definition.AddChance = 0.3f;
         definition.AddsRandomly = true;
         definition.MaximumOptionsPerItem = 2;
 
