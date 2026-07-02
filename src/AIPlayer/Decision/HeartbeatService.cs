@@ -5,6 +5,7 @@
 namespace MUnique.OpenMU.AIPlayer.Decision;
 
 using MUnique.OpenMU.DataModel.Configuration;
+using MUnique.OpenMU.DataModel;
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameLogic.MiniGames;
 using MUnique.OpenMU.GameLogic.NPC;
@@ -12,10 +13,13 @@ using MUnique.OpenMU.GameLogic.Attributes;
 using MUnique.OpenMU.GameLogic.PlugIns.PeriodicTasks;
 using MUnique.OpenMU.Pathfinding;
 using MUnique.OpenMU.AIPlayer.Scripting;
+using MUnique.OpenMU.AIPlayer.AIStateMachine;
+using MUnique.OpenMU.AIPlayer.Knowledge.KnowledgeGraph;
 using System.Diagnostics;
+using System.IO;
 using MUnique.OpenMU.DataModel.Configuration.Quests;
-using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.GameLogic.Views;
+using MUnique.OpenMU.AIPlayer.Decision.Skills;
 
 /// <summary>
 /// 心跳服务 — AI 角色的决策引擎。
@@ -38,7 +42,7 @@ public sealed class HeartbeatService : IEventBroadcaster
     private readonly BehaviorContext _context;
 
     private readonly SurvivalMode _survival;
-    private readonly ItemFarmModule _itemFarm;
+    private readonly PetHandlerModule _petHandler;
     private readonly InventoryManagerService _inventoryManager;
     private readonly ValueAssessmentService _valueAssessment;
     private readonly MarketPriceService _marketPrice;
@@ -46,11 +50,16 @@ public sealed class HeartbeatService : IEventBroadcaster
     private readonly Dictionary<string, IBehaviorSubModule> _modules = new();
     private DynamicMissionGenerator _missionGenerator;
     private GoalScheduler _goalScheduler;
-    private CraftingModule _crafting;
-    private EventExecutorModule _eventExecutor;
-    private ItemPickupManager _itemPickupManager;
     private MaterialKnowledgeService _materialKnowledge;
-    private MaterialFarmModule _materialFarm;
+
+    /// <summary>脚本注册表 — 统一管理所有 IBehaviorSubModule 实例。</summary>
+    private readonly ScriptLibrary _scriptLib;
+
+    /// <summary>规则引擎 — 条件评估 + 脚本选择。</summary>
+    private readonly RuleEngine _ruleEngine;
+
+    /// <summary>行为日志服务 — 记录每次任务执行的全过程。</summary>
+    private readonly Experience.ExperienceService _expService;
 
     /// <summary>事件中断决策服务 — 判断是否中断当前任务去参加事件。</summary>
     private readonly EventInterruptService _eventInterrupt;
@@ -58,20 +67,63 @@ public sealed class HeartbeatService : IEventBroadcaster
     /// <summary>仓库服务 — 检查/存取仓库物品。</summary>
     private readonly VaultService _vaultService;
 
+    /// <summary>装备自动换装服务 — 背包有更好装备就换上。</summary>
+    private readonly EquipmentCompareService _equipmentCompare;
+
+    /// <summary>技能自动学习服务 — 有技能书就学。</summary>
+    private readonly SkillLearnService _skillLearn;
+
+    /// <summary>SKILL 执行器 — 统一管理条件+执行脚本。</summary>
+    private readonly Skills.SkillExecutor _skillExecutor;
+
+    /// <summary>后台任务管理器 — 管理所有 Fire-and-Forget 操作。</summary>
+    private readonly AITaskManager _taskManager;
+
+    /// <summary>运行时学习者 — 记录击杀/掉落，更新 KG 边权重。</summary>
+    private readonly KnowledgeGraphRuntimeLearner? _runtimeLearner;
+
+    /// <summary>健康检查服务 — 每心跳检查内存/CPU/残留任务。</summary>
+    private readonly HealthCheckService _healthCheck;
+
+    /// <summary>规则热更新监控 — 监听 scripts-rules.json 变更。</summary>
+    private readonly RuleWatcherService _ruleWatcher;
+
+    /// <summary>技能栏管理器 — 自动设置快捷键。</summary>
+    private readonly SkillBarManager _skillBar;
+
+    /// <summary>背包维护 MVP — 多阶段背包整理。</summary>
+    private readonly InventoryMaintenanceMvp _inventoryMvp;
+
+    /// <summary>NPC 购物 MVP — 商店购买/修理。</summary>
+    private readonly NpcShoppingMvp _npcShopMvp;
+
+    /// <summary>玩家交易 MVP — 处理交易请求。</summary>
+    private readonly PlayerTradeMvp _playerTradeMvp;
+
+    /// <summary>背包维护时间戳（每30秒触发一次）。</summary>
+    private DateTime _lastMaintenanceTime = DateTime.MinValue;
+
     /// <summary>跨地图路由规划器。</summary>
     private readonly Warp.WarpPlanner _warpPlanner;
 
-    /// <summary>看板脚本执行器 — 当前活跃任务的 ScriptExecutor。</summary>
-    private ScriptExecutor? _scriptExecutor;
+    /// <summary>事件处理器 — 委托到 EventHandlers 类处理外部事件和材料重评估。</summary>
+    private readonly EventHandlers _eventHandlers;
 
-    /// <summary>中断上下文。</summary>
-    private InterruptContext? _pendingInterrupt;
+    /// <summary>决策系统 — 任务选择/失败/阻塞/推进逻辑。</summary>
+    private readonly DecisionSystem _decisionSystem;
+
+    /// <summary>状态机执行器 — 负责任务执行、中断、跨图移动、生存补给。</summary>
+    private readonly AIStateMachineExecutor _stateMachine;
 
     private int _idleTicks;
     private int _noTargetStreak;
     private bool _wasDead;
     private DateTime? _deathStartTime;
     private int _taskTicks;
+
+    // Respawn death-loop break: tracks rapid death cycles
+    private int _respawnDeathStreak;
+    private DateTime _lastDeathTime;
     private MissionItem? _lastTask; // 当前任务已执行 tick 数
     private int _npcDialogTicks;    // NPC 对话已持续 tick 数
 
@@ -90,35 +142,24 @@ public sealed class HeartbeatService : IEventBroadcaster
     /// <summary>低法力阈值。</summary>
     private const float LowMpThreshold = 0.25f;
 
-    /// <summary>血量药水定义 (Group, Number, Name)。</summary>
-    private static readonly (byte Group, short Number)[] HpPotions =
-    {
-        (14, 3),   // Large Healing
-        (14, 2),   // Medium Healing
-        (14, 1),   // Small Healing
-    };
-
-    /// <summary>法力药水定义 (Group, Number, Name)。</summary>
-    private static readonly (byte Group, short Number)[] MpPotions =
-    {
-        (14, 6),   // Large Mana
-        (14, 5),   // Medium Mana
-        (14, 4),   // Small Mana
-    };
-
-    /// <summary>药水冷却跟踪。</summary>
-    private DateTime _lastHpPotionTime = DateTime.MinValue;
-
-    /// <summary>法力药水冷却跟踪。</summary>
-    private DateTime _lastMpPotionTime = DateTime.MinValue;
-
-    /// <summary>药水冷却 (2秒)。</summary>
-    private static readonly TimeSpan PotionCooldown = TimeSpan.FromSeconds(2);
-
     /// <summary>AI 事件总线。</summary>
     public AiEventBus EventBus { get; } = new();
 
-    public IBehaviorSubModule? ActiveModule { get; private set; }
+    /// <summary>
+    /// Drain EventBus queue, dispatching queued events to registered handlers.
+    /// Called externally by AiPlayerLogic after ScriptExecutor.TickAsync so that
+    /// DeathEvent/RespawnEvent from ScriptExecutor reach OnDeath/OnRespawn
+    /// without requiring BeatAsync to run.
+    /// </summary>
+    public void DrainEventBus() => this.EventBus.DrainEvents();
+
+    /// <summary>获取看板状态（供外部 API 访问测试结果等）。</summary>
+    public BoardState BoardState => this._missionBoard.BoardState;
+
+    /// <summary>热重载规则（供外部 API 调用）。</summary>
+    public void ReloadRules() => this._ruleWatcher.Reload();
+
+    public IBehaviorSubModule? ActiveModule => this._stateMachine.ActiveModule;
     public string State => this._activeState;
     private string _activeState = "初始化";
 
@@ -136,36 +177,98 @@ public sealed class HeartbeatService : IEventBroadcaster
         this._adapter = adapter;
         this._logger = logger;
 
-        this._survival = new SurvivalMode(player, adapter, logger);
-        this._itemFarm = new ItemFarmModule(player, adapter, logger);
+        // Initialize RuntimeLearner from the static KnowledgeGraph holder.
+        // This records kills and drops to continuously improve KG edge weights.
+        if (KnowledgeGraphHolder.Graph is { } kg)
+        {
+            this._runtimeLearner = new KnowledgeGraphRuntimeLearner(kg, logger);
+        }
+
         this._marketPrice = new MarketPriceService(logger);
         this._valueAssessment = new ValueAssessmentService(player, logger, this._marketPrice);
         this._transactionMonitor = new TransactionMonitor(this._marketPrice, logger);
         this._inventoryManager = new InventoryManagerService(player, adapter, logger, this._valueAssessment);
-
-        this._modules["quest_executor"] = new QuestExecutor(player, adapter, logger);
-        this._modules["item_farm"] = this._itemFarm;
-        this._modules["survival"] = this._survival;
-
-        this._crafting = new CraftingModule(player, adapter, logger);
         this._materialKnowledge = new MaterialKnowledgeService(player.GameContext!.Configuration, logger);
-        this._eventExecutor = new EventExecutorModule(player, adapter, this._missionBoard.BoardState, logger, this._materialKnowledge);
-        this._materialFarm = new MaterialFarmModule(player, adapter, logger);
+
+        // ScriptLibrary 统一管理所有 IBehaviorSubModule 实例
+        this._scriptLib = new ScriptLibrary(
+            player, adapter, this._missionBoard.BoardState, context, logger,
+            this._materialKnowledge, this._valueAssessment);
+
+        // 提取直接在 BeatAsync 中使用的模块引用
+        this._survival = (SurvivalMode)this._scriptLib.Get("survival")!;
+        this._petHandler = (PetHandlerModule)this._scriptLib.Get("pet_handler")!;
+
+        // 填充 _modules 字典（向下兼容 DecisionSystem / AIStateMachineExecutor）
+        foreach (var kvp in this._scriptLib.GetAll())
+        {
+            this._modules[kvp.Key] = kvp.Value;
+        }
+
         this._missionGenerator = new DynamicMissionGenerator(player, adapter, this._missionBoard.BoardState, logger, this._valueAssessment);
         this._goalScheduler = new GoalScheduler(player, adapter, logger);
         this._missionGenerator.SetGoalScheduler(this._goalScheduler);
-        this._modules["crafting_executor"] = this._crafting;
-        this._modules["event_executor"] = this._eventExecutor;
-        this._modules["material_farm"] = this._materialFarm;
-        this._modules["vault_executor"] = new VaultModule(player, adapter, logger);
-        this._itemPickupManager = new ItemPickupManager(player, adapter, context, logger, this._valueAssessment);
-        this._modules["item_pickup_manager"] = this._itemPickupManager;
+
+        // 规则引擎初始化
+        this._ruleEngine = new RuleEngine(this._scriptLib, logger);
+
+        // 行为日志服务（引用群体经验服务）
+        this._expService = this._context.ExpService ?? new Decision.Experience.ExperienceService(AppContext.BaseDirectory, logger);
+
+        this._decisionSystem = new DecisionSystem(
+            player, adapter, this._missionBoard, context,
+            this._missionGenerator, this._goalScheduler,
+            this._inventoryManager, this._marketPrice,
+            (IReadOnlyDictionary<string, IBehaviorSubModule>)this._modules.AsReadOnly(), logger);
 
         this._eventInterrupt = new EventInterruptService(player, logger);
         this._vaultService = new VaultService(player, logger);
+        this._equipmentCompare = new EquipmentCompareService(player, adapter, logger);
+        this._skillLearn = new SkillLearnService(player, adapter, logger);
 
+        // 新 SKILL/MVP 实例化
+        this._skillBar = new SkillBarManager(player, logger);
+        this._inventoryMvp = new InventoryMaintenanceMvp(player, this._inventoryManager, logger);
         this._npcService = new NpcInteractionService(player, logger);
+        this._npcShopMvp = new NpcShoppingMvp(player, adapter, this._npcService, logger);
+        this._playerTradeMvp = new PlayerTradeMvp(player, logger);
+
+        // SKILL 执行器 — 注册所有条件+执行脚本
+        this._skillExecutor = new Skills.SkillExecutor(
+            new Skills.ISkill[]
+            {
+                new Skills.SurvivalHpSkill(logger),
+                new Skills.InventoryCleanupSkill(this._inventoryManager, logger),
+                new Skills.AutoEquipSkill(this._equipmentCompare, logger),
+                new Skills.LearnSkillSkill(this._skillLearn, logger),
+            },
+            logger);
+
+        // 后台任务管理器 — Fire-and-Forget 操作
+        this._taskManager = new AITaskManager(logger);
+
+        // 健康检查 — 内存/CPU/残留任务清理
+        this._healthCheck = new HealthCheckService(logger);
+
+        // 规则热更新监控 — 监听 scripts-rules.json 变更
+        var rulesFilePath = Path.Combine(AppContext.BaseDirectory, "Decision", "scripts-rules.json");
+        this._ruleWatcher = new RuleWatcherService(rulesFilePath, json => this._ruleEngine.ReloadFromJson(json), logger);
+
         this._warpPlanner = new Warp.WarpPlanner(player.GameContext!.Configuration, logger);
+
+        // 状态机执行器 — 承载所有任务执行和生存补给逻辑
+        this._stateMachine = new AIStateMachineExecutor(
+            player,
+            adapter,
+            this._context,
+            this._modules.AsReadOnly(),
+            this._npcService,
+            this._warpPlanner,
+            logger);
+
+        this._eventHandlers = new EventHandlers(
+            player, adapter, this._missionBoard, this._materialKnowledge,
+            this._eventInterrupt, logger);
         this._lastKnownHp = adapter.GetCurrentHp();
         this._lastKnownMaxHp = adapter.GetMaxHp();
         this._lastKnownLevel = adapter.GetPlayerLevel();
@@ -191,7 +294,10 @@ public sealed class HeartbeatService : IEventBroadcaster
             ga.ChatMessageReceived += (sender, msg, type) =>
             {
                 if (type == ChatMessageType.Normal)
+                {
                     this._transactionMonitor.ProcessChatMessage(sender, msg);
+                    this._playerTradeMvp.HandleChatMessage(sender, msg);
+                }
             };
         }
     }
@@ -205,7 +311,245 @@ public sealed class HeartbeatService : IEventBroadcaster
             await this._missionBoard.InitializeAsync().ConfigureAwait(false);
             this._goalScheduler.InitializeDefaultGoals();
             this._logger.LogInformation("[HB] 看板初始化完成，目标规划器已初始化");
+
+            // 首次启动时自动买药 — 这会在 NPC 购物 MVP 空闲时执行
+            if (!this._npcShopMvp.IsShopping)
+            {
+                this._npcShopMvp.BeginShopping(NpcShoppingMvp.ShopType.Potions);
+                this._logger.LogInformation("[HB] 自动买药已触发");
+            }
         }
+
+        // === Test Runner: 检测挂起的测试 ===
+        // 两阶段执行：
+        //   心跳1: executed=0 → 执行操作，设 executed=1
+        //   心跳2: executed=1 → 读取结果，设 completed=true（等待 test-result API 读取后清除）
+        var pendingTest = this._missionBoard.BoardState.PendingTest;
+        if (pendingTest is not null)
+        {
+            var testType = pendingTest.GetValueOrDefault("type") as string;
+            var executed = pendingTest.TryGetValue("executed", out var execObj) && execObj is int execCount ? execCount : 0;
+
+            if (executed > 0)
+            {
+                // 已执行过 — 检查是否需要写入最终结果
+                if (pendingTest.GetValueOrDefault("status") as string == "check_result")
+                {
+                    // 第二次进入 → 检查结果
+                    if (testType == "auto_equip")
+                    {
+                        var inv = this._player.Inventory;
+                        var equipSlots = inv?.Items
+                            .Where(i => i.ItemSlot <= 11)
+                            .Select(i => (i.Definition?.Name.ToString() ?? "?"))
+                            .ToList() ?? new();
+                        pendingTest["result"] = string.Join(",", equipSlots);
+                        pendingTest["swordInBag"] = inv?.Items.Any(i =>
+                            i.Definition?.Group == 0 && i.Definition?.Number == 16 && i.ItemSlot > 11) == true;
+                        pendingTest["completed"] = true;
+                        this._logger.LogInformation("[TestRunner] auto_equip 完成: swordInBag={InBag}", pendingTest["swordInBag"]);
+                    }
+                    else if (testType == "learn_skill")
+                    {
+                        var inv = this._player.Inventory;
+                        var skillId = pendingTest.GetValueOrDefault("skillId") is int si ? si : 0;
+                        var slot = pendingTest.GetValueOrDefault("skillBookSlot") is int sl ? sl : 0;
+                        var bookStillInBag = inv?.Items.Any(i =>
+                            i.Definition?.Group == 15 && i.ItemSlot == slot) == true;
+                        var skillLearned = this._player.SkillList?.ContainsSkill((ushort)skillId) == true;
+
+                        pendingTest["bookConsumed"] = !bookStillInBag;
+                        pendingTest["skillLearned"] = skillLearned;
+                        pendingTest["completed"] = true;
+                        this._logger.LogInformation("[TestRunner] learn_skill 完成: bookConsumed={Consumed}, skillLearned={Learned}",
+                            !bookStillInBag, skillLearned);
+                    }
+                    else if (testType == "survival_hp")
+                    {
+                        var inv = this._player.Inventory;
+                        var potionSlot = pendingTest.GetValueOrDefault("potionSlot") is int ps ? ps : 0;
+                        var potionConsumed = inv?.Items.Any(i => i.ItemSlot == potionSlot && i.Durability > 0) != true;
+                        var initialHp = pendingTest.GetValueOrDefault("initialHp") is int ih ? ih : 0;
+                        var currentHp = this._adapter.GetCurrentHp();
+                        var hpImproved = currentHp > initialHp;
+
+                        pendingTest["potionConsumed"] = potionConsumed;
+                        pendingTest["currentHp"] = currentHp;
+                        pendingTest["hpImproved"] = hpImproved;
+                        pendingTest["completed"] = true;
+                        this._logger.LogInformation("[TestRunner] survival_hp 完成: potionConsumed={Consumed}, HP={Hp}(was {Init})",
+                            potionConsumed, currentHp, initialHp);
+                    }
+                    else if (testType == "rule_engine_chain")
+                    {
+                        var inv = this._player.Inventory;
+                        var equipSlots = inv?.Items
+                            .Where(i => i.ItemSlot <= 11)
+                            .Select(i => (i.Definition?.Name.ToString() ?? "?"))
+                            .ToList() ?? new();
+                        var swordInBag = inv?.Items.Any(i =>
+                            i.Definition?.Group == 0 && i.Definition?.Number == 16 && i.ItemSlot > 11) == true;
+                        var freeSlotCount = this._inventoryManager.GetFreeSlotCount();
+                        var skillBookConsumed = inv?.Items.Any(i =>
+                            i.Definition?.Group == 15) != true;
+
+                        pendingTest["equipped"] = string.Join(",", equipSlots);
+                        pendingTest["swordInBag"] = swordInBag;
+                        pendingTest["freeSlots"] = freeSlotCount;
+                        pendingTest["skillBookConsumed"] = skillBookConsumed;
+                        pendingTest["completed"] = true;
+                        this._logger.LogInformation("[TestRunner] rule_engine_chain 完成: equipped={Eq}, freeSlots={Fs}, skillConsumed={Sc}",
+                            string.Join(",", equipSlots), freeSlotCount, skillBookConsumed);
+                    }
+				}
+				// completed 为 true → 跳过（等待 test-result API 读取后清除 PendingTest）
+				if (pendingTest.TryGetValue("completed", out var compObj) && compObj is true)
+				{
+					goto AfterPendingTest;
+				}
+				// status=check_result 但未 completed → 继续等下一 tick
+				goto AfterPendingTest;
+			}
+
+            // 首次执行
+            this._logger.LogInformation("[TestRunner] 执行挂起测试: {Type}", testType);
+
+            if (testType == "auto_equip")
+            {
+                // 先清理装备位的药水/消耗品，避免引擎在心跳间隙自动补给药水干扰换装判定
+                var invClean = this._player.Inventory;
+                if (invClean is not null)
+                {
+                    var potionItems = invClean.Items
+                    .Where(i => i.ItemSlot <= InventoryConstants.LastEquippableItemSlotIndex
+                                && i.Definition?.ItemSlot is null)
+                    .ToList();
+                    foreach (var p in potionItems)
+                    {
+                    invClean.ItemStorage.Items.Remove(p);
+                    }
+                    if (potionItems.Count > 0)
+                    {
+                        await this._player.SaveProgressAsync().ConfigureAwait(false);
+                        this._logger.LogInformation("[TestRunner] auto_equip: 已清理 {Count} 件装备位药水/消耗品", potionItems.Count);
+                    }
+                }
+
+                if (this._equipmentCompare is not null)
+                {
+                    await this._equipmentCompare.AutoEquipIfBetterAsync().ConfigureAwait(false);
+                    // 设 executed=1 + status=check_result，下次心跳再读取结果
+                    pendingTest["executed"] = 1;
+                    pendingTest["status"] = "check_result";
+                    this._logger.LogInformation("[TestRunner] auto_equip 已执行，等待下次心跳检查装备结果");
+                    goto AfterPendingTest;
+                }
+            }
+            else if (testType == "inventory_cleanup")
+            {
+                var beforeFree = this._inventoryManager.GetFreeSlotCount();
+                await this._inventoryManager.ForceCleanupAsync().ConfigureAwait(false);
+                var afterFree = this._inventoryManager.GetFreeSlotCount();
+                pendingTest["executed"] = 1;
+                pendingTest["beforeFree"] = beforeFree;
+                pendingTest["afterFree"] = afterFree;
+                pendingTest["freeSlotIncrease"] = afterFree - beforeFree;
+                pendingTest["completed"] = true;
+                this._logger.LogInformation("[TestRunner] inventory_cleanup 完成: {Before}->{After}", beforeFree, afterFree);
+            }
+            else if (testType == "learn_skill")
+            {
+                if (this._skillLearn is not null)
+                {
+                    var learned = await this._skillLearn.TryLearnSkillsAsync().ConfigureAwait(false);
+                    pendingTest["executed"] = 1;
+                    pendingTest["status"] = "check_result";
+                    pendingTest["immediateLearned"] = learned;
+                    this._logger.LogInformation("[TestRunner] learn_skill 已执行(learned={Learned})，等待下次心跳验证", learned);
+                    goto AfterPendingTest;
+                }
+            }
+            else if (testType == "survival_hp")
+            {
+                // 直接模仿心跳的 survival_hp 逻辑：找药水、喝药
+                var inv = this._player.Inventory;
+                var beforeHp = this._adapter.GetCurrentHp();
+                var hpPotion = inv?.Items.FirstOrDefault(i =>
+                    i.Definition?.Group == 14 && i.Durability > 0);
+                if (hpPotion is not null)
+                {
+                    await this._adapter.ConsumeItemAsync(hpPotion.ItemSlot).ConfigureAwait(false);
+                    this._logger.LogInformation("[TestRunner] survival_hp: 已喝药水(Slot={Slot}, HP={Hp}->{After})",
+                        hpPotion.ItemSlot, beforeHp, this._adapter.GetCurrentHp());
+                }
+                else
+                {
+                    this._logger.LogWarning("[TestRunner] survival_hp: 背包中无药水");
+                }
+                pendingTest["executed"] = 1;
+                pendingTest["status"] = "check_result";
+                pendingTest["beforeHp"] = beforeHp;
+                goto AfterPendingTest;
+            }
+            else if (testType == "rule_engine_chain")
+            {
+                // 执行一轮规则引擎评估（只匹配最高优先级规则）
+                var chainResult = this._ruleEngine.Evaluate(this._player, this._adapter);
+                if (chainResult is not null)
+                {
+                    pendingTest["matchedRule"] = chainResult.Rule.RuleId;
+                    pendingTest["matchedPriority"] = chainResult.Rule.Priority;
+                    pendingTest["matchedDescription"] = chainResult.Rule.Description;
+
+                    // 按规则类型分发执行
+                    switch (chainResult.Rule.RuleId)
+                    {
+                        case "inventory_cleanup":
+                            var bf = this._inventoryManager.GetFreeSlotCount();
+                            await this._inventoryManager.ForceCleanupAsync().ConfigureAwait(false);
+                            var af = this._inventoryManager.GetFreeSlotCount();
+                            pendingTest["beforeCleanup"] = bf;
+                            pendingTest["afterCleanup"] = af;
+                            break;
+                        case "auto_equip":
+                            if (this._equipmentCompare is not null)
+                                await this._equipmentCompare.AutoEquipIfBetterAsync().ConfigureAwait(false);
+                            break;
+                        case "learn_skill":
+                            if (this._skillLearn is not null)
+                                await this._skillLearn.TryLearnSkillsAsync().ConfigureAwait(false);
+                            break;
+                        case "survival_hp":
+                            var survInv = this._player.Inventory;
+                            var pot = survInv?.Items.FirstOrDefault(i =>
+                                i.Definition?.Group == 14 && i.Durability > 0);
+                            if (pot is not null)
+                            {
+                                await this._adapter.ConsumeItemAsync(pot.ItemSlot).ConfigureAwait(false);
+                                pendingTest["potionConsumed"] = true;
+                            }
+                            break;
+                        default:
+                            this._logger.LogDebug("[TestRunner] rule_engine_chain: 规则 {RuleId} 无特殊处理，直接放行", chainResult.Rule.RuleId);
+                            break;
+                    }
+
+                    this._logger.LogInformation("[TestRunner] rule_engine_chain: 匹配规则 {RuleId}(Priority={P})", chainResult.Rule.RuleId, chainResult.Rule.Priority);
+                }
+                else
+                {
+                    pendingTest["matchedRule"] = "none";
+                    pendingTest["matchedPriority"] = -1;
+                    this._logger.LogWarning("[TestRunner] rule_engine_chain: 无规则匹配");
+                }
+
+                pendingTest["executed"] = 1;
+                pendingTest["status"] = "check_result";
+                goto AfterPendingTest;
+            }
+        }
+
+    AfterPendingTest:
 
         this._logger.LogDebug("[HB] Beat: state={State}", this._activeState);
 
@@ -272,6 +616,25 @@ public sealed class HeartbeatService : IEventBroadcaster
             await this.PostRespawnSupplyAsync().ConfigureAwait(false);
         }
 
+        // === 1.6) 宠物处理：暗黑骑士行为管理 ===
+        await this._petHandler.ExecuteStepAsync(new MissionItem()).ConfigureAwait(false);
+
+        // === 1.7) 跨地图传送检测（优先级高于行走检测）===
+        // CraftingModule / EventExecutorModule 返回 NoTarget 时标记目标地图，
+        // 决策系统会切换到跨地图传送任务。需要在行走检测之前执行，
+        // 否则 AI 在巡逻行走时永远不会触发跨图传送。
+        if (this._context.TargetMapNumber.HasValue)
+        {
+            var targetMap = this._context.TargetMapNumber.Value;
+            var arrived = await this._stateMachine.ExecuteWarpAsync(targetMap).ConfigureAwait(false);
+            if (!arrived)
+            {
+                this.SetActiveState($"传送至地图 #{targetMap}");
+                return;
+            }
+            this._logger.LogInformation("[HB] ✅ 到达目标地图 #{Map}，继续执行任务", targetMap);
+        }
+
         // === 2) 行走 / NPC 对话跳过 ===
         if (this._adapter.IsPlayerWalking()) { this.SetActiveState("行走中"); return; }
 
@@ -289,7 +652,7 @@ public sealed class HeartbeatService : IEventBroadcaster
                 return;
             }
 
-            if (this._scriptExecutor is null)
+            if (!this._stateMachine.HasActiveScript)
             {
                 this.SetActiveState("NPC对话");
                 return;
@@ -305,39 +668,25 @@ public sealed class HeartbeatService : IEventBroadcaster
         // 先在死亡/行走之前主动嗑药（无论当前什么状态）
         await this.TryConsumePotionsAsync().ConfigureAwait(false);
 
+        // 注：不再调用 _survival.ExecuteStepAsync 喝红
+        // 统一由 Step 5.6 的 survival_hp 规则管理喝红动作
+        // 这里只打日志，不做实际执行（避免两套逻辑冲突）
         if (this._lowHpFlag || (maxHp > 0 && (float)hp / maxHp < LowHpThreshold))
         {
             this._lowHpFlag = false;
-            this._logger.LogDebug("[HB] ❤️ 血量 {Hp}/{MaxHp} 偏低", hp, maxHp);
+            this._logger.LogDebug("[HB] ❤️ 血量 {Hp}/{MaxHp} 偏低 — 由规则引擎处理喝红", hp, maxHp);
             this.SetActiveState("低血恢复");
-            var recoveryItem = new MissionItem { Id = "hp_recovery", Title = "低血量恢复", Priority = 0, Type = MissionType.Survival, Module = "survival" };
-            var recoveryResult = await this._survival.ExecuteStepAsync(recoveryItem).ConfigureAwait(false);
-            if (recoveryResult == StepResult.Completed)
-                this._logger.LogInformation("[HB] ❤️ 血量恢复完成");
             if (this._adapter.IsPlayerWalking()) return;
         }
 
         // === 4) 中断处理 ===
-        if (this._pendingInterrupt is not null)
+        if (this._stateMachine.PendingInterrupt is not null)
         {
             await this.HandleInterruptAsync().ConfigureAwait(false);
             return;
         }
 
-        // === 5) NoTarget 熔断 + 跨地图传送检测 ===
-        // CraftingModule / EventExecutorModule 返回 NoTarget 时标记目标地图，
-        // 决策系统会切换到跨地图传送任务
-        if (this._context.TargetMapNumber.HasValue)
-        {
-            var targetMap = this._context.TargetMapNumber.Value;
-            var arrived = await this.ExecuteCrossMapWarpAsync(targetMap).ConfigureAwait(false);
-            if (!arrived)
-            {
-                this.SetActiveState($"传送至地图 #{targetMap}");
-                return;
-            }
-            this._logger.LogInformation("[HB] ✅ 到达目标地图 #{Map}，继续执行任务", targetMap);
-        }
+        // === 5) NoTarget 熔断（跨地图传送检测已移到 1.7） ===
 
         if (this._noTargetStreak >= NoTargetCircuitBreaker)
         if (this._noTargetStreak >= NoTargetCircuitBreaker)
@@ -350,16 +699,58 @@ public sealed class HeartbeatService : IEventBroadcaster
             return;
         }
 
-        // === 5.5) 背包检测：满包时回城贩卖 ===
-        if (this._inventoryManager.NeedsInventoryCleanup())
+        // === 5.5) 健康检查 + 后台任务轮询（先清理再发射新任务） ===
+        var health = this._healthCheck.Check(this._taskManager);
+        if (health.GcTriggered || health.StaleTasksCleaned > 0)
         {
-            this._logger.LogInformation("[HB] 🎒 背包满({Fullness:F1}%), 启动回城贩卖", this._inventoryManager.Fullness * 100);
-            await this._inventoryManager.CleanupInventoryAsync().ConfigureAwait(false);
-            return;
+            this._logger.LogDebug("[HB] 健康检查: Mem={Mem}MB Tasks={Active} GC={Gc} Cleaned={Clean}",
+                health.MemoryMB, health.ActiveBackgroundTasks, health.GcTriggered, health.StaleTasksCleaned);
+        }
+
+        // 轮询已完成的后台任务结果
+        var completedTasks = this._taskManager.PollResults();
+        foreach (var result in completedTasks)
+        {
+            this._logger.LogDebug("[HB] 后台任务完成: {Type} Status={Status} ({Duration:F1}s)",
+                result.TaskType, result.Status, result.Duration.TotalSeconds);
+        }
+
+        // === 5.55) 技能栏更新（同步、非阻塞） ===
+        this._skillBar.UpdateSkillBar();
+
+        // === 5.56) MVP: 背包维护（每 30 秒执行一次） ===
+        if (this._inventoryMvp.IsActive() && this._npcShopMvp.IsShopping)
+        {
+            // 让购物先完成
+        }
+        else if (this._inventoryMvp.IsActive())
+        {
+            await this._inventoryMvp.ExecuteAsync().ConfigureAwait(false);
+        }
+        else if ((DateTime.UtcNow - this._lastMaintenanceTime).TotalSeconds > 30)
+        {
+            this._inventoryMvp.BeginMaintenance();
+            this._lastMaintenanceTime = DateTime.UtcNow;
+            this._logger.LogDebug("[HB] 触发背包维护");
+        }
+
+        // === 5.57) MVP: NPC 购物（激活时执行） ===
+        if (this._npcShopMvp.IsShopping)
+        {
+            await this._npcShopMvp.ExecuteAsync().ConfigureAwait(false);
+        }
+
+        // === 5.6) SKILL 执行器 — Fire-and-Forget 模式 ===
+        // 内部按 Priority 遍历所有 SKILL: survival_hp(1) → inventory_cleanup(10) → auto_equip(20) → learn_skill(25)
+        // 发射到后台 AITaskManager，心跳不等待
+        if (this._skillExecutor.FireAndForget(this._player, this._adapter, this._taskManager).Count > 0)
+        {
+            // 有 SKILL 已发射到后台执行，但心跳继续进入决策系统
+            // 不像旧的同步模式那样 return 阻塞 tick
         }
 
         // === 6) 决策：选当前任务 ===
-        var current = await this.SelectCurrentTaskAsync().ConfigureAwait(false);
+        var current = await this._decisionSystem.SelectCurrentTaskAsync().ConfigureAwait(false);
         if (current is null)
         {
             this._logger.LogDebug("[HB] SelectCurrentTask 无任务, 等待下一 tick");
@@ -378,12 +769,9 @@ public sealed class HeartbeatService : IEventBroadcaster
             this._lastTask = current;
         }
 
-        // === 8) 执行当前任务的当前阶段 ===
+        // === 8) 执行当前任务的当前阶段（Fire-and-Forget 到后台） ===
         this._taskTicks++;
         this.SetActiveState(current.Title);
-
-        // 记录决策日志
-        var decisionSw = Stopwatch.StartNew();
 
         // 任务级超时：一个任务执行太长时间也没推进 → 跳过
         const int maxTaskTicks = 2500; // ~16 分钟 @ 400ms/tick
@@ -394,19 +782,23 @@ public sealed class HeartbeatService : IEventBroadcaster
             return;
         }
 
-        // 快速跳过：不可执行的任务（无活跃 Quest 且无杀怪需求的系统任务）
-        // InstanceEvent 类任务跳过此检测（由 EventExecutorModule 模块执行）
+        // 检查该任务是否已有后台任务在运行（防止重复发射）
+        var missionTaskType = $"mission_{current.Id}";
+        if (this._taskManager.HasActiveTask(missionTaskType))
+        {
+            this._logger.LogDebug("[HB] {Title} 已在后台执行，跳过本次发射", current.Title);
+            return;
+        }
+
+        // 快速跳过+任务切换检测（这部分需要同步做）
         if (current.Category is QuestCategory.Survival ||
             (current.Type == MissionType.Quest && current.QuestDef is not null && current.Category != QuestCategory.InstanceEvent))
         {
-            // Survival 任务是兜底，不放这里跳过
-
             if (current.Type == MissionType.Quest && current.QuestDef is not null)
             {
-                // 有脚本的任务放行 — ScriptExecutor 的 no_active_quest 条件会自动走 accept_quest 段落
                 if (current.Script is not null)
                 {
-                    // 不做快速跳过，让脚本流程自然运行
+                    // 有脚本的任务放行
                 }
                 else
                 {
@@ -425,50 +817,55 @@ public sealed class HeartbeatService : IEventBroadcaster
             }
         }
 
-        var stageResult = await this.ExecuteCurrentStageAsync(current).ConfigureAwait(false);
+        // 发射到后台执行，心跳不等待
+        this._taskManager.RunTask(
+            missionTaskType,
+            async ct =>
+            {
+                var stageResult = await this._stateMachine.ExecuteStepAsync(current).ConfigureAwait(false);
+                if (ct.IsCancellationRequested) return;
 
-        // 记录决策到 BehaviorContext（供 Web UI 调试面板使用）
-        decisionSw.Stop();
-        this._context.RecordDecision(current.Module, decisionSw.Elapsed);
+                // 记录决策到 BehaviorContext
+                this._context.RecordDecision(current.Module, TimeSpan.Zero);
 
-        switch (stageResult)
-        {
-            case StageResult.Completed:
-                this._logger.LogInformation("[HB] ✅ {Title} (stage={Stage}) 完成", current.Title, current.CurrentStageIndex);
-                this.AdvanceTask(current);
-                break;
-            case StageResult.InProgress:
-                this._noTargetStreak = 0;
-                break;
-            case StageResult.Failed:
-                this._logger.LogWarning("[HB] ❌ {Title} 失败", current.Title);
-                // InstanceEvent 类任务用 InstanceModuleMissing，不占用 NotExecutable 重试槽位
-                var failReason = current.Category == QuestCategory.InstanceEvent
-                    ? FailureReason.InstanceModuleMissing
-                    : FailureReason.NotExecutable;
-                this.MarkTaskFailed(current, current.FailureRetryable ? failReason : FailureReason.NotRetryable);
-                break;
-            case StageResult.NoTarget:
-                // 模块返回 NoTarget 表示需要跨地图移动
-                // CraftingModule 在 NPC 不在当前地图时会返回 NoTarget 并设置 TargetMap
-                // EventExecutorModule 在活动不在当前地图时同样返回 NoTarget
-                if (this._context.TargetMapNumber.HasValue)
+                switch (stageResult)
                 {
-                    this._logger.LogInformation("[HB] 🗺 {Title} 需要跨地图到 #{Target}，切换到传送", current.Title, this._context.TargetMapNumber.Value);
-                    break; // 让下一 tick 的跨地图检测执行传送
+                    case StepResult.Completed:
+                        this._logger.LogInformation("[HB] ✅ {Title} (stage={Stage}) 完成", current.Title, current.CurrentStageIndex);
+                        this.RecordActionLog(current, Experience.BehaviorResult.Completed);
+                        this.AdvanceTask(current);
+                        break;
+                    case StepResult.InProgress:
+                        break;
+                    case StepResult.Failed:
+                        this._logger.LogWarning("[HB] ❌ {Title} 失败", current.Title);
+                        var failReason = current.Category == QuestCategory.InstanceEvent
+                            ? FailureReason.InstanceModuleMissing
+                            : FailureReason.NotExecutable;
+                        this.RecordActionLog(current, Experience.BehaviorResult.Failed);
+                        this.MarkTaskFailed(current, current.FailureRetryable ? failReason : FailureReason.NotRetryable);
+                        break;
+                    case StepResult.NoTarget:
+                        if (this._context.TargetMapNumber.HasValue)
+                        {
+                            this._logger.LogInformation("[HB] 🗺 {Title} 需要跨地图到 #{Target}，切换到传送",
+                                current.Title, this._context.TargetMapNumber.Value);
+                            break;
+                        }
+                        this._idleTicks++;
+                        this._noTargetStreak++;
+                        if (this._idleTicks > 15)
+                        {
+                            this._logger.LogInformation("[HB] ⏭ {Title} 长时间无目标(idle={Idle})，标记失败可重试",
+                                current.Title, this._idleTicks);
+                            this.MarkTaskFailed(current, FailureReason.NoTarget);
+                            this._idleTicks = 0;
+                            this._noTargetStreak = 0;
+                        }
+                        break;
                 }
-
-                this._idleTicks++;
-                this._noTargetStreak++;
-                if (this._idleTicks > 15)
-                {
-                    this._logger.LogInformation("[HB] ⏭ {Title} 长时间无目标(idle={Idle})，标记失败可重试", current.Title, this._idleTicks);
-                    this.MarkTaskFailed(current, FailureReason.NoTarget);
-                    this._idleTicks = 0;
-                    this._noTargetStreak = 0;
-                }
-                break;
-        }
+            },
+            TimeSpan.FromSeconds(15));
 
         // === 9) 兜底检测：所有狩猎热点均为兜底占位（无实际怪物刷点）→ Blocked ===
         if (this._idleTicks > 10 &&
@@ -487,625 +884,45 @@ public sealed class HeartbeatService : IEventBroadcaster
         {
             this._marketPrice.DecayOffsets();
         }
-    }
 
-    // ===================== 决策核心 — 三层全看板扫描 =====================
-
-    /// <summary>
-    /// 每 tick 全看板6层扫描，选择当前要执行的任务。
-    ///
-    /// Layer 1: Active — 正在进行的，继续执行
-    /// Layer 1.5: 检查阻塞任务是否恢复
-    /// Layer 2: Failed — 失败的，判断是否可重试
-    /// Layer 3: 注入系统事件+道具需求任务
-    /// Layer 4: Pending — 新任务，检查依赖条件
-    /// Layer 5: Fallback 生存兜底
-    /// </summary>
-    private async ValueTask<MissionItem?> SelectCurrentTaskAsync()
-    {
-        var board = this._missionBoard.BoardState;
-
-        // Layer 1: Active
-        var active = board.Missions.FirstOrDefault(m => m.Status == MissionStatus.Active);
-        if (active is not null) return active;
-
-        // Layer 1.5: Unblock
-        this.TryUnblockTasks();
-
-        // Layer 2: Failed retryable
-        var retryable = this.SelectRetryableFailedTask(board);
-        if (retryable is not null) return retryable;
-
-        // Layer 3: 注入系统事件+道具需求任务
-        await this._missionGenerator.GenerateMissionsAsync().ConfigureAwait(false);
-        board.Missions.Sort((a, b) => a.Priority.CompareTo(b.Priority));
-
-        // Layer 4: Pending
-        var pending = this.SelectPendingTask(board);
-        if (pending is not null) return pending;
-
-        // Layer 5: Fallback survival
-        return this.GetOrCreateFallbackTask(board);
-    }
-
-    /// <summary>
-    /// Layer 2: 从 Failed 任务中选出一个可重试的。
-    /// 跳过规则：NotRetryable / IsDeadTask / 超3次 / 超1年。
-    /// 可重试 → 重置回 Active 开始执行。
-    /// </summary>
-    private MissionItem? SelectRetryableFailedTask(BoardState board)
-    {
-        foreach (var task in board.Missions)
+        // Periodically apply learned drop rates to KG (every ~100s = 250 ticks)
+        if (this._taskTicks > 0 && this._taskTicks % 250 == 0)
         {
-            if (task.Status != MissionStatus.Failed)
-                continue;
-
-            // 不可重试原因 → 跳过
-            if (task.FailureReason == FailureReason.NotRetryable)
+            if (this._runtimeLearner is { } rl)
             {
-                task.IsDeadTask = true;
-                continue;
-            }
-
-            // 已标记死任务 → 跳过
-            if (task.IsDeadTask)
-            {
-                // Fix G: Goal 任务死掉时同步通知 GoalScheduler（兜底保护）
-                if (task.Id.StartsWith("goal_"))
+                var adjusted = rl.ApplyLearnedDropRates();
+                if (adjusted > 0)
                 {
-                    this._goalScheduler.MarkGoalFailed(task.Id);
-                }
-                continue;
-            }
-
-            // 重试 >= 3 次 → 标死任务，跳过
-            if (task.RetryCount >= 3)
-            {
-                this._logger.LogInformation("[HB] 💀 任务 {Title} 已重试 {N} 次，标记 IsDeadTask", task.Title, task.RetryCount);
-                task.IsDeadTask = true;
-                continue;
-            }
-
-            // 首次失败超 1 年且重试 >= 3 次 → 标死任务，跳过
-            if (task.FirstFailedAt is not null &&
-                (DateTime.UtcNow - task.FirstFailedAt.Value).TotalDays > 365 &&
-                task.RetryCount >= 3)
-            {
-                this._logger.LogInformation("[HB] 💀 任务 {Title} 失败超 1 年且重试 {N} 次，标记 IsDeadTask", task.Title, task.RetryCount);
-                task.IsDeadTask = true;
-                continue;
-            }
-
-            // 不可重接 → 跳过 (Layer 2 不做标记，系统层面不再尝试)
-            if (!task.FailureRetryable)
-                continue;
-
-            // AR-29: 重试前检查阻塞条件
-            if (task.QuestDef is not null)
-            {
-                if (task.QuestDef.RequiredStartMoney > 0 && this._player.Money < task.QuestDef.RequiredStartMoney)
-                {
-                    this._logger.LogInformation("[HB] ⏸ 重试任务 {Title} 金币不足，标记 Blocked 而非 Failed", task.Title);
-                    task.Status = MissionStatus.Blocked;
-                    task.BlockedReason = BlockedReason.PrerequisiteNotMet;
-                    continue;  // 不计重试
-                }
-                if (task.QuestDef.MinimumCharacterLevel > 0 && this._player.Level < task.QuestDef.MinimumCharacterLevel)
-                {
-                    this._logger.LogInformation("[HB] ⏸ 重试任务 {Title} 等级不足，标记 Blocked 而非 Failed", task.Title);
-                    task.Status = MissionStatus.Blocked;
-                    task.BlockedReason = BlockedReason.PrerequisiteNotMet;
-                    continue;  // 不计重试
+                    this._logger.LogInformation("[RuntimeLearner] Applied {Count} drop rate adjustments to KG", adjusted);
                 }
             }
-
-            // ✅ 可重试 → 激活
-            this._logger.LogInformation("[HB] 🔄 重试任务 {Title} (重试 #{N})", task.Title, task.RetryCount + 1);
-            task.Status = MissionStatus.Active;
-            task.FailureReason = null;
-            this.BuildScriptForTask(task);
-            return task;
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Layer 3: 从 Pending 任务中选出一个依赖条件满足的可执行任务。
-    /// </summary>
-    private MissionItem? SelectPendingTask(BoardState board)
-    {
-        foreach (var task in board.Missions)
-        {
-            if (task.Status != MissionStatus.Pending)
-                continue;
-
-            // 检查依赖：所有前置任务必须已完成
-            if (task.Dependencies.Length > 0 &&
-                task.Dependencies.Any(dep => board.Missions.Any(mm => mm.Id == dep && mm.Status != MissionStatus.Completed)))
-                continue;
-
-            // AR-29: 阻塞检测 — 在 BuildScriptForTask 之前拦截
-            if (task.QuestDef is not null)
-            {
-                if (task.QuestDef.RequiredStartMoney > 0 && this._player.Money < task.QuestDef.RequiredStartMoney)
-                {
-                    this._logger.LogInformation("[HB] ⏸ 任务 {Title} 金币不足 ({Money}/{Need})，跳过激活",
-                        task.Title, this._player.Money, task.QuestDef.RequiredStartMoney);
-                    task.Status = MissionStatus.Blocked;
-                    task.BlockedReason = BlockedReason.PrerequisiteNotMet;
-                    continue;
-                }
-                if (task.QuestDef.MinimumCharacterLevel > 0 && this._player.Level < task.QuestDef.MinimumCharacterLevel)
-                {
-                    this._logger.LogInformation("[HB] ⏸ 任务 {Title} 等级不足 ({Level}/{Need})，跳过激活",
-                        task.Title, this._player.Level, task.QuestDef.MinimumCharacterLevel);
-                    task.Status = MissionStatus.Blocked;
-                    task.BlockedReason = BlockedReason.PrerequisiteNotMet;
-                    continue;
-                }
-            }
-
-            // 满足条件 → 激活
-            this._logger.LogInformation("[HB] ➡️ 激活新任务 {Title}", task.Title);
-            task.Status = MissionStatus.Active;
-            this.BuildScriptForTask(task);
-            return task;
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Layer 5: 创建或获取生存兜底任务。
-    /// 如果看板已有非完成/非死亡的 survival 任务，激活它。
-    /// 否则新建一个 survival 任务并激活。
-    /// </summary>
-    private MissionItem? GetOrCreateFallbackTask(BoardState board)
-    {
-        var survival = board.Missions.FirstOrDefault(m =>
-            m.Id == "survival" && m.Status != MissionStatus.Completed && !m.IsDeadTask);
-        if (survival is not null)
-        {
-            survival.Status = MissionStatus.Active;
-            this._logger.LogInformation("[HB] Layer 6: 使用现有生存兜底");
-            return survival;
-        }
-
-        var newSurvival = new MissionItem
-        {
-            Id = "survival",
-            Title = "生存模式 -- 自由刷怪/练级",
-            Priority = 999,
-            Type = MissionType.Survival,
-            Category = QuestCategory.Survival,
-            Module = "survival",
-            FailureRetryable = true,
-            MaxRepeatCount = -1,
-        };
-        board.Missions.Add(newSurvival);
-        newSurvival.Status = MissionStatus.Active;
-        this._logger.LogInformation("[HB] Layer 6: 创建新的生存兜底任务");
-        return newSurvival;
-    }
-
-    /// <summary>
-    /// 标记任务失败，记录失败原因/重试计数/首次失败时间/死任务判定。
-    /// </summary>
-    private void MarkTaskFailed(MissionItem task, FailureReason reason)
-    {
-        task.Status = MissionStatus.Failed;
-        task.FailureReason = reason;
-        task.RetryCount++;
-
-        if (task.FirstFailedAt is null)
-            task.FirstFailedAt = DateTime.UtcNow;
-
-        // IsDeadTask 判定
-        if (!task.FailureRetryable || reason == FailureReason.NotRetryable)
-        {
-            task.IsDeadTask = true;
-        }
-        else if (task.RetryCount >= 3)
-        {
-            task.IsDeadTask = true;
-        }
-        else if (task.FirstFailedAt is not null &&
-                 (DateTime.UtcNow - task.FirstFailedAt.Value).TotalDays > 365 &&
-                 task.RetryCount >= 3)
-        {
-            task.IsDeadTask = true;
-        }
-
-        if (task.IsDeadTask)
-        {
-            this._logger.LogInformation("[HB] 💀 任务 {Title} 标记为死任务 (原因={Reason}, 重试#{Retry})",
-                task.Title, reason, task.RetryCount);
-        }
-
-        // Fix F: Goal 任务死掉时通知 GoalScheduler 跳过
-        if (task.IsDeadTask && task.Id.StartsWith("goal_"))
-        {
-            this._goalScheduler.MarkGoalFailed(task.Id);
-            this._logger.LogInformation("[HB] Goal 任务 {Id} 永久失败, 通知 GoalScheduler", task.Id);
-        }
-
-        this._taskTicks = 0;
-        this._lastTask = null;
-        this._scriptExecutor = null;
-    }
-
-    /// <summary>
-    /// 标记任务阻塞 — 条件不足时暂挂，不累计重试计数/不标死任务。
-    /// Blocked ≠ Failed: 不影响重试计数、不标 IsDeadTask、不积累超时。
-    /// </summary>
-    private void MarkTaskBlocked(MissionItem task, BlockedReason reason)
-    {
-        task.Status = MissionStatus.Blocked;
-        task.BlockedReason = reason;
-        task.BlockedEverChecked = false;
-        this._taskTicks = 0;
-        this._lastTask = null;
-        this._scriptExecutor = null;
-        this._logger.LogInformation("[HB] ⏸ 任务 {Title} 阻塞 (原因={Reason})", task.Title, reason);
-    }
-
-    /// <summary>
-    /// 每 tick 检查阻塞任务的条件是否恢复。
-    /// 只读系统 API（Money/Level），不执行脚本。
-    /// </summary>
-    private void TryUnblockTasks()
-    {
-        var board = this._missionBoard.BoardState;
-        foreach (var task in board.Missions)
-        {
-            if (task.Status != MissionStatus.Blocked) continue;
-            if (task.BlockedReason != BlockedReason.PrerequisiteNotMet) continue;
-            if (task.QuestDef is null) continue;
-
-            var money = this._player.Money;
-            var level = this._player.Level;
-
-            bool stillBlocked = false;
-
-            // 金币恢复检查
-            if (task.QuestDef.RequiredStartMoney > 0 && money < task.QuestDef.RequiredStartMoney)
-            {
-                if (!task.BlockedEverChecked)
-                {
-                    this._logger.LogInformation("[HB] 任务 {Title} 仍阻塞: 金币不足 ({Money}/{Need})",
-                        task.Title, money, task.QuestDef.RequiredStartMoney);
-                }
-                stillBlocked = true;
-            }
-
-            // 等级检查
-            if (!stillBlocked && task.QuestDef.MinimumCharacterLevel > level)
-            {
-                if (!task.BlockedEverChecked)
-                {
-                    this._logger.LogInformation("[HB] 任务 {Title} 仍阻塞: 等级不足 ({Level}/{Need})",
-                        task.Title, level, task.QuestDef.MinimumCharacterLevel);
-                }
-                stillBlocked = true;
-            }
-
-            task.BlockedEverChecked = true;
-
-            if (!stillBlocked)
-            {
-                // 条件满足 → 恢复为 Pending（让决策层重新激活）
-                task.Status = MissionStatus.Pending;
-                task.BlockedReason = null;
-                task.BlockedEverChecked = false;
-                this._logger.LogInformation("[HB] ✅ 任务 {Title} 条件恢复，重新加入候选", task.Title);
-            }
         }
     }
 
-    /// <summary>推进任务：标记完成，不操作索引（三层扫描自然推进）。</summary>
+    // ===================== 决策委托 =====================
+
+    /// <summary>推进任务:合成任务触发材料重评估,其余委托决策系统。</summary>
     private void AdvanceTask(MissionItem current)
     {
-        current.Status = MissionStatus.Completed;
-        // 可重复任务递增计数
-        if (current.MaxRepeatCount > 0)
+        // 合成任务的材料重评估（决策层不做，心跳层负责）
+        if (current.Id.StartsWith("craft_", StringComparison.OrdinalIgnoreCase))
         {
-            current.RepeatCount++;
+            this.ReevaluateMaterialsAfterCraft(current);
         }
-        var board = this._missionBoard.BoardState;
-        if (!string.IsNullOrEmpty(current.Id) && !board.CompletedMissionIds.Contains(current.Id))
-            board.CompletedMissionIds.Add(current.Id);
-        this._idleTicks = 0;
-        this._noTargetStreak = 0;
-        this._taskTicks = 0;
-        this._lastTask = null;
-        this._scriptExecutor = null; // 切换任务时释放旧 ScriptExecutor
+
+        this._decisionSystem.AdvanceTask(current);
     }
 
-    /// <summary>为任务的当前阶段生成/切换脚本。</summary>
-    private void BuildScriptForTask(MissionItem task)
-    {
-        if (task.Script is not null) return; // 已有脚本
+    private void MarkTaskFailed(MissionItem task, FailureReason reason) => this._decisionSystem.MarkTaskFailed(task, reason);
 
-        // 先构建阶段树（如果没有）
-        if (task.Stages.Count == 0 && task.QuestDef is not null)
-        {
-            var activeQuests = this._adapter.GetActiveQuests();
-            var aq = activeQuests.FirstOrDefault(q => q.Group == task.QuestGroup && q.Number == task.QuestNumber);
-            if (aq is not null)
-            {
-                this._missionBoard.BuildStagesForEntry(task, aq);
-            }
-        }
+    private void MarkTaskBlocked(MissionItem task, BlockedReason reason) => this._decisionSystem.MarkTaskBlocked(task, reason);
 
-        // 根据任务类型构建段落脚本
-        if (task.Type == MissionType.Quest && task.QuestDef is not null)
-        {
-            var hotspots = this.BuildHotspotsFromQuestDef(task.QuestDef);
-
-            task.Script = BuildQuestScript(
-                task.QuestGroup, task.QuestNumber,
-                task.QuestDef.QuestGiver?.Number,
-                hotspots, task.QuestDef.RequiredMonsterKills is { Count: > 0 });
-        }
-    }
-
-    /// <summary>从 QuestDef 的 RequiredMonsterKills 推导狩猎热点坐标。</summary>
-    private List<HotspotDef> BuildHotspotsFromQuestDef(QuestDefinition qdef)
-    {
-        if (qdef.RequiredMonsterKills is not { Count: > 0 })
-            return new List<HotspotDef>();
-
-        var config = this._player.GameContext?.Configuration;
-        if (config is null)
-            return new List<HotspotDef>();
-
-        var results = new List<HotspotDef>();
-        foreach (var kr in qdef.RequiredMonsterKills)
-        {
-            var monsterDef = kr.Monster;
-            if (monsterDef is null)
-                continue;
-
-            // 在所有地图的 MonsterSpawns 中找这个怪的所有刷出区域
-            foreach (var mapDef in config.Maps)
-            {
-                if (mapDef.MonsterSpawns is null)
-                    continue;
-
-                var spawns = mapDef.MonsterSpawns
-                    .Where(s => s.MonsterDefinition?.Number == monsterDef.Number)
-                    .ToList();
-                if (spawns.Count == 0)
-                    continue;
-
-                // 随机选一个刷点
-                var spawn = spawns[Random.Shared.Next(spawns.Count)];
-                var centerX = (byte)((spawn.X1 + spawn.X2) / 2);
-                var centerY = (byte)((spawn.Y1 + spawn.Y2) / 2);
-                var mapName = mapDef.Name.ToString() ?? $"Map#{mapDef.Number}";
-                this._logger.LogInformation("[P0D] Hotspot: monster #{Monster} '{Name}' -> map={Map}, spawn area ({X1},{Y1})-({X2},{Y2}), center=({Cx},{Cy})",
-                    monsterDef.Number, monsterDef.Designation, mapName,
-                    spawn.X1, spawn.Y1, spawn.X2, spawn.Y2, centerX, centerY);
-                results.Add(new HotspotDef
-                {
-                    X = centerX,
-                    Y = centerY,
-                    X1 = spawn.X1,
-                    X2 = spawn.X2,
-                    Y1 = spawn.Y1,
-                    Y2 = spawn.Y2,
-                    MapNumber = (ushort)mapDef.Number,
-                    Name = $"{monsterDef.Designation}({mapName})",
-                });
-
-                // 每个怪物类型只选一个热点（随机的那一个已添加）
-                break;
-            }
-        }
-
-        this._logger.LogInformation("[P0D] BuildHotspotsFromQuestDef: qdef G{Group}#{Num}, monsterKills={KillCount}, results={ResultCount}, fallback={IsFallback}",
-            qdef.Group, qdef.Number,
-            qdef.RequiredMonsterKills?.Count ?? 0,
-            results.Count,
-            results.Count == 0 ? "YES (0,0)" : "NO");
-
-        // 如果一个 spawn 都找不到, 用兜底占位（供 Blocked 判断）
-        if (results.Count == 0)
-        {
-            this._logger.LogInformation("[HB] Quest {Group}#{Number} 杀怪需求在 MonsterSpawns 中找不到对应刷点, 使用兜底占位",
-                qdef.Group, qdef.Number);
-            results.Add(new HotspotDef { X = 0, Y = 0, Name = "兜底占位", IsNoSpawnFallback = true });
-        }
-
-        return results;
-    }
-
-    /// <summary>执行当前任务的当前阶段。</summary>
-    private async ValueTask<StageResult> ExecuteCurrentStageAsync(MissionItem task)
-    {
-        // 没有阶段树或所有阶段完成 → 整任务完成
-        if (task.Stages.Count == 0 || task.CurrentStageIndex >= task.Stages.Count)
-        {
-            // 脚本模式
-            if (task.Script is not null)
-            {
-                var scriptResult = await this.ExecuteScriptAsync(task).ConfigureAwait(false);
-                return scriptResult;
-            }
-
-            // 无阶段树也无脚本 → 模块模式
-            if (!this._modules.TryGetValue(task.Module, out var module))
-            {
-                this._logger.LogWarning("[HB] 未知模块: {Mod}", task.Module);
-                return StageResult.Failed;
-            }
-
-            this.ActiveModule = module;
-            return await module.ExecuteStepAsync(task).ConfigureAwait(false) switch
-            {
-                StepResult.Completed => StageResult.Completed,
-                StepResult.InProgress => StageResult.InProgress,
-                StepResult.Failed => StageResult.Failed,
-                StepResult.NoTarget => StageResult.NoTarget,
-                _ => StageResult.InProgress,
-            };
-        }
-
-        // 有阶段树 → 按阶段执行
-        var stage = task.Stages[task.CurrentStageIndex];
-        this._logger.LogDebug("[HB] ▶ {Title} stage={StageLabel}({StageIdx})", task.Title, stage.Label, task.CurrentStageIndex);
-
-        // 脚本优先：有脚本时不管哪个阶段都用 ScriptExecutor
-        // ScriptExecutor 的段落脚本会处理 accept/hunt/submit 的全自动流转
-        if (task.Script is not null)
-        {
-            return await this.ExecuteScriptAsync(task).ConfigureAwait(false);
-        }
-
-        // 无脚本时的狩猎阶段：用模块执行
-        if (stage.Id == "hunt" && this._modules.TryGetValue(task.Module, out var huntModule))
-        {
-            this.ActiveModule = huntModule;
-            var result = await huntModule.ExecuteStepAsync(task).ConfigureAwait(false);
-            if (result == StepResult.Completed)
-            {
-                stage.Status = TaskStageStatus.Completed;
-                task.CurrentStageIndex++;
-                this._logger.LogInformation("[HB] ✅ stage={Stage} 完成 → 进入下一阶段", stage.Label);
-                return StageResult.InProgress; // 继续下一阶段
-            }
-            return StageResult.InProgress;
-        }
-
-        // fallback: 模块模式
-        if (!this._modules.TryGetValue(task.Module, out var mod))
-            return StageResult.Failed;
-        this.ActiveModule = mod;
-        return await mod.ExecuteStepAsync(task).ConfigureAwait(false) switch
-        {
-            StepResult.Completed => StageResult.Completed,
-            StepResult.InProgress => StageResult.InProgress,
-            StepResult.Failed => StageResult.Failed,
-            StepResult.NoTarget => StageResult.NoTarget,
-            _ => StageResult.InProgress,
-        };
-    }
-
-    /// <summary>用 ScriptExecutor 执行脚本一步。</summary>
-    private async ValueTask<StageResult> ExecuteScriptAsync(MissionItem item)
-    {
-        if (item.Script is null) return StageResult.Failed;
-
-        var scriptId = item.Script.Id;
-        var lastScriptId = this._scriptExecutor?.Script?.Id;
-
-        if (this._scriptExecutor is null && item.Script is not null)
-        {
-            // 使用 AiPlayerLogic 的主 BehaviorContext — WorldState 每 tick 被刷新
-            this._scriptExecutor = new ScriptExecutor(this._player, this._context, item.Script!);
-        }
-        else if (item.Script is not null && scriptId != lastScriptId)
-        {
-            this._scriptExecutor!.ReloadScript(item.Script);
-        }
-
-        var tickResult = await this._scriptExecutor!.TickAsync().ConfigureAwait(false);
-        if (tickResult.State == ScriptTaskState.Completed)
-        {
-            // 脚本完成 → 标记当前阶段完成并推进
-            if (item.CurrentStageIndex < item.Stages.Count)
-            {
-                item.Stages[item.CurrentStageIndex].Status = TaskStageStatus.Completed;
-                item.CurrentStageIndex++;
-            }
-            // 没有更多阶段 → 整个任务完成
-            if (item.CurrentStageIndex >= item.Stages.Count)
-                return StageResult.Completed;
-            return StageResult.InProgress; // 继续下阶段
-        }
-        if (tickResult.State == ScriptTaskState.Stuck)
-            return StageResult.Failed;
-        return StageResult.InProgress;
-    }
-
-    // ===================== 构建脚本 =====================
-
-    private static BehaviorScript BuildQuestScript(
-        short questGroup, short questNumber, short? questNpcNumber,
-        List<HotspotDef> hotspots, bool hasKillRequirement)
-    {
-        var huntNodes = new List<PriorityNode>
-        {
-            // 0: 条件满足 → 提交
-            new() { Name = "quest_check", Condition = "quest_conditions_met", Action = "goto @submit_quest" },
-            // 1: 跨地图 warp — 如果所有热点都在另一张地图，直接warp过去
-            new() { Name = "warp_to_hunt_map", Condition = "not_on_hunt_map", Action = "warp_to_hunt_map" },
-            // 2: 无目标 → 索敌
-            new() { Name = "find_target", Condition = "no_target", Action = "find_nearest_monster" },
-            // 3: 在攻击范围 → 攻击
-            new() { Name = "attack", Condition = "has_target_in_range", Action = "attack_target" },
-            // 4: 不在攻击范围 → 走近
-            new() { Name = "approach", Condition = "has_target_not_in_range", Action = "walk_to_target" },
-            // 5: 多次无怪 → 去下一个热点
-            new() { Name = "relocate_if_away", Condition = "no_monsters_recently", Action = "relocate_to_hotspot" },
-            // 6: 兜底巡逻
-            new() { Name = "no_target_patrol", Condition = "always", Action = "random_patrol" },
-        };
-
-        return new BehaviorScript
-        {
-            Id = $"board_{questGroup}_{questNumber}",
-            Parameters = new ScriptParameters
-            {
-                QuestGroup = questGroup,
-                QuestNumber = questNumber,
-                QuestNpcNumber = questNpcNumber,
-                HpThreshold = 0.35f,
-                SearchRange = 60,
-                NoMonsterTicksLimit = 30,
-                Hotspots = hotspots,
-            },
-            Paragraphs = new List<ScriptParagraph>
-            {
-                new()
-                {
-                    Label = "start",
-                    Nodes = new List<PriorityNode>
-                    {
-                        new() { Name = "hp_check", Condition = "hp_below_threshold", Action = "use_hp_potion" },
-                        new() { Name = "submit_ready", Condition = "quest_conditions_met", Action = "goto @submit_quest" },
-                        new() { Name = "accept_if_none", Condition = "no_active_quest", Action = "goto @accept_quest" },
-                        new() { Name = "has_quest_go_hunt", Condition = "has_active_quest", Action = "goto @hunt" },
-                        new() { Name = "enter_hunt", Condition = "always", Action = "goto @hunt" },
-                    },
-                },
-                new()
-                {
-                    Label = "accept_quest",
-                    Nodes = new List<PriorityNode>
-                    {
-                        new() { Name = "walk_to_npc", Condition = "always", Action = "walk_to_quest_npc", Parameters = new ScriptParameters { QuestNpcNumber = questNpcNumber } },
-                        new() { Name = "check_accepted", Condition = "can_accept_quest", Action = "start_quest" },
-                        new() { Name = "close_dialog", Condition = "always", Action = "close_npc_dialog" },
-                        new() { Name = "go_hunt", Condition = "always", Action = "goto @hunt" },
-                    },
-                },
-                new() { Label = "hunt", Nodes = huntNodes },
-                new()
-                {
-                    Label = "submit_quest",
-                    Nodes = new List<PriorityNode>
-                    {
-                        new() { Name = "walk_to_npc", Condition = "always", Action = "walk_to_quest_npc" },
-                        new() { Name = "check_ready", Condition = "quest_completable", Action = "complete_quest" },
-                        new() { Name = "close_dialog", Condition = "always", Action = "close_npc_dialog" },
-                        new() { Name = "done", Condition = "always", Action = "stop" },
-                    },
-                },
-            },
-        };
-    }
+    /// <summary>
+    /// 合成后材料重评估。检查目标物品是否已出现在背包(合成成功),
+    /// 否则重新注入 farm 任务。
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Design", "VSTHRD100", Justification = "Fire-and-forget: called from non-async AdvanceTask, no caller to await")]
+    private void ReevaluateMaterialsAfterCraft(MissionItem current) => this._eventHandlers.ReevaluateMaterialsAfterCraft(current);
 
     // ===================== 被动状态检测 =====================
 
@@ -1135,296 +952,123 @@ public sealed class HeartbeatService : IEventBroadcaster
 
     public void Interrupt(string reason)
     {
-        this._pendingInterrupt = new InterruptContext
+        this._stateMachine.PendingInterrupt = new InterruptContext
         {
             Reason = reason,
         };
         this._logger.LogInformation("[HB] 中断: {Reason}", reason);
     }
 
-    private async ValueTask HandleInterruptAsync()
-    {
-        var ctx = this._pendingInterrupt!;
-        this.SetActiveState($"中断: {ctx.Reason}");
+    private async ValueTask HandleInterruptAsync() => await this._stateMachine.HandleInterruptAsync();
 
-        var temp = new MissionItem { Id = $"intr_{ctx.Reason}", Title = ctx.Reason, Priority = 0, Type = MissionType.Emergency, Module = "survival" };
-        var result = await this._survival.ExecuteStepAsync(temp).ConfigureAwait(false);
-        if (result != StepResult.InProgress)
-        {
-            this._pendingInterrupt = null;
-            this._logger.LogInformation("[HB] 中断处理完毕");
-        }
-    }
-
-    /// <summary>
-    /// 手动复活 AI 玩家：当游戏引擎自动重生（~3秒）失败时作为 fallback。
-    /// 通过 WarpToSafezoneAsync 将玩家传送到安全区，触发游戏引擎的复活流程。
-    /// </summary>
     /// <summary>
     /// 使用 NPC 对话关闭动作关闭当前对话框。
     /// </summary>
-    private async ValueTask CloseNpcDialogAsync()
-    {
-        var closeAction = new GameLogic.PlayerActions.CloseNpcDialogAction();
-        await closeAction.CloseNpcDialogAsync(this._player).ConfigureAwait(false);
-    }
+    private async ValueTask CloseNpcDialogAsync() => await this._stateMachine.CloseNpcDialogAsync();
 
     /// <summary>
-    /// 跨地图移动：使用 WarpPlanner 计算路线并执行多跳传送。
-    /// 如果当前有活跃路由，推进路由步骤。否则用 WarpPlanner 算新路由。
-    /// 路由完成后将 TargetMap 置 null。
+    /// 嗑药：委托给状态机执行器。
     /// </summary>
-    private async ValueTask<bool> ExecuteCrossMapWarpAsync(ushort targetMap)
-    {
-        var currentMapNum = (ushort)(this._adapter.GetCurrentMap()?.Definition.Number ?? 0);
-        if (currentMapNum == targetMap)
-        {
-            this._context.TargetMapNumber = null;
-            return true;
-        }
-
-        // 如果当前有活跃路由，先推进
-        if (this._context.ActiveWarpRoute is not null)
-        {
-            var stepIdx = this._context.ActiveWarpStepIndex;
-            var steps = this._context.ActiveWarpRoute.Steps;
-
-            if (stepIdx >= steps.Count)
-            {
-                // 路由完成
-                this._context.ActiveWarpRoute = null;
-                this._context.ActiveWarpStepIndex = 0;
-                this._context.TargetMapNumber = null;
-                this._logger.LogInformation("[WarpRoute] ✅ 跨图传送完成（目标地图 #{Map}）", targetMap);
-                return true;
-            }
-
-            // 检查当前是否在地图传送等待中
-            if (this._context.WarpInProgress)
-            {
-                // 等待地图切换完成
-                if (this._adapter.GetCurrentMap() is not null)
-                {
-                    this._context.WarpInProgress = false;
-                    this._context.ActiveWarpStepIndex++;
-                }
-                return false;
-            }
-
-            // 执行下一步
-            await this.ExecuteWarpStepAsync(steps[stepIdx]).ConfigureAwait(false);
-            return false;
-        }
-
-        // 没有活跃路由 → 计算新路由
-        var route = this._warpPlanner.ComputeRoute(
-            (short)currentMapNum,
-            (short)targetMap,
-            this._adapter.GetPlayerLevel(),
-            this._player.Money);
-
-        if (route is null || !route.IsFeasible)
-        {
-            this._logger.LogWarning("[WarpRoute] 无法找到从地图 #{From} 到 #{To} 的可行路线",
-                currentMapNum, targetMap);
-            return false;
-        }
-
-        this._context.ActiveWarpRoute = route;
-        this._context.ActiveWarpStepIndex = 0;
-        this._context.TargetMapNumber = targetMap;
-        this._logger.LogInformation("[WarpRoute] 开始跨图传送: {From}→{To} ({Steps}步, 金币={Gold})",
-            currentMapNum, targetMap, route.Steps.Count, route.TotalGoldCost);
-        return false;
-    }
+    private async ValueTask TryConsumePotionsAsync() => await this._stateMachine.TryConsumePotionsAsync();
 
     /// <summary>
-    /// 执行路由单步（门传送或传送菜单）。
-    /// 复用 ScriptExecutor 的 ExecuteGateStepAsync / ExecuteWarpMenuStepAsync 逻辑。
+    /// 复活补给：委托给状态机执行器。
     /// </summary>
-    private async ValueTask ExecuteWarpStepAsync(Warp.WarpStep step)
-    {
-        if (step.Method == Warp.WarpEdgeType.Gate)
-        {
-            // 门传送：走到门中心 → 进门
-            var currentMap = this._adapter.GetCurrentMap();
-            if (currentMap is null) return;
-
-            var pos = this._adapter.GetPlayerPosition();
-            var atGate = Math.Abs(pos.X - step.GateCenter.X) <= 3
-                      && Math.Abs(pos.Y - step.GateCenter.Y) <= 3;
-
-            if (!atGate)
-            {
-                await this._adapter.WalkToAsync(step.GateCenter, currentMap).ConfigureAwait(false);
-                return;
-            }
-
-            if (step.EnterGate is not null)
-            {
-                var warpAction = new GameLogic.PlayerActions.WarpGateAction();
-                await warpAction.EnterGateAsync(this._player, step.EnterGate).ConfigureAwait(false);
-                this._context.WarpInProgress = true;
-            }
-        }
-        else if (step.WarpInfo is not null)
-        {
-            // 传送菜单：直接使用 WarpAction
-            var warpAction = new GameLogic.PlayerActions.WarpAction();
-            await warpAction.WarpToAsync(this._player, step.WarpInfo).ConfigureAwait(false);
-            this._context.WarpInProgress = true;
-        }
-    }
+    private async ValueTask PostRespawnSupplyAsync() => await this._stateMachine.PostRespawnSupplyAsync();
 
     /// <summary>
-    /// 尝试使用背包中的 HP/MP 药水。
-    /// 血量 < LowHpThreshold 时使用 HP 药水；法力 < LowMpThreshold 时使用 MP 药水。
-    /// 带 2 秒冷却防止连续嗑药浪费。
+    /// 手动复活：委托给状态机执行器。
     /// </summary>
-    private async ValueTask TryConsumePotionsAsync()
+    private async ValueTask RespawnPlayerAsync() => await this._stateMachine.RespawnPlayerAsync();
+
+    /// <summary>
+    /// 记录行为日志。MissionItem 执行完成或失败后调用。
+    /// 日志 = 规则原料，聚合后产出规则候选。
+    /// </summary>
+    private void RecordActionLog(MissionItem mission, Experience.BehaviorResult result)
     {
         try
         {
-            var inv = this._player.Inventory;
-            if (inv is null) return;
-
-            var maxHp = this._adapter.GetMaxHp();
-            var hp = this._adapter.GetCurrentHp();
-            var maxMp = this._adapter.GetMaxMp();
-            var mp = this._adapter.GetCurrentMp();
-            var now = DateTime.UtcNow;
-
-            // HP 药水
-            if (maxHp > 0 && (float)hp / maxHp < LowHpThreshold
-                && now - this._lastHpPotionTime >= PotionCooldown)
+            var player = this._player;
+            var log = new Experience.ActionLog
             {
-                foreach (var (group, number) in HpPotions)
+                AiRoleName = player.Name ?? "unknown",
+                AiLevel = player.Level,
+                AiClass = player.SelectedCharacter?.CharacterClass?.Name.ValueInNeutralLanguage ?? "unknown",
+                BehaviorType = mission.Category switch
                 {
-                    var potion = inv.Items.FirstOrDefault(i =>
-                        i.Definition?.Group == group && i.Definition?.Number == number && i.Durability > 0);
-                    if (potion is null) continue;
-
-                    await this._adapter.ConsumeItemAsync(potion.ItemSlot).ConfigureAwait(false);
-                    this._lastHpPotionTime = now;
-                    this._logger.LogDebug("[HB] ❤️ 使用 HP 药水 (G{Group}N{Number})", group, number);
-                    break;
-                }
-            }
-
-            // MP 药水
-            if (maxMp > 0 && (float)mp / maxMp < LowMpThreshold
-                && now - this._lastMpPotionTime >= PotionCooldown)
-            {
-                foreach (var (group, number) in MpPotions)
-                {
-                    var potion = inv.Items.FirstOrDefault(i =>
-                        i.Definition?.Group == group && i.Definition?.Number == number && i.Durability > 0);
-                    if (potion is null) continue;
-
-                    await this._adapter.ConsumeItemAsync(potion.ItemSlot).ConfigureAwait(false);
-                    this._lastMpPotionTime = now;
-                    this._logger.LogDebug("[HB] 💙 使用 MP 药水 (G{Group}N{Number})", group, number);
-                    break;
-                }
-            }
+                    QuestCategory.InstanceEvent => Experience.BehaviorType.MiniGame,
+                    QuestCategory.Survival => Experience.BehaviorType.Hunting,
+                    _ => Experience.BehaviorType.Quest,
+                },
+                MapId = this._adapter.GetCurrentMap()?.MapId ?? 0,
+                Result = result,
+                DurationSeconds = (int)(DateTime.UtcNow - this._lastBeatTime).TotalSeconds,
+                WorthRepeating = result == Experience.BehaviorResult.Completed,
+            };
+            this._expService.RecordBehavior(log);
         }
-        catch (Exception ex)
+        catch
         {
-            this._logger.LogWarning("[HB] 嗑药失败: {Msg}", ex.Message);
+            // 日志记录失败不影响主循环
         }
     }
+
+    private DateTime _lastBeatTime = DateTime.UtcNow;
 
     /// <summary>
-    /// 复活后补给：购买药水 + 修理装备。
-    /// 复活后通常在安全区，Potion Girl (NPC #226) 在旁边。
-    /// 自动寻找并交互。
+    /// 经验服务引用（由外部注入）。
     /// </summary>
-    private async ValueTask PostRespawnSupplyAsync()
-    {
-        try
-        {
-            var map = this._adapter.GetCurrentMap();
-            if (map is null) return;
-
-            var npc = map.GetNpcsInRange(this._player.Position, 50)
-                .FirstOrDefault(n => n.Definition?.Number == 226
-                                  || n.Definition?.Number == 240
-                                  || n.Definition?.Number == 233);
-            if (npc is null)
-            {
-                this._logger.LogDebug("[HB] 复活补给: 附近无商店NPC");
-                return;
-            }
-
-            if (this._player.Position.EuclideanDistanceTo(npc.Position) > 3f)
-            {
-                await this._adapter.WalkToAsync(
-                    new Point((byte)npc.Position.X, (byte)npc.Position.Y), map).ConfigureAwait(false);
-                return;
-            }
-
-            if (this._player.OpenedNpc != npc)
-            {
-                var talkAction = new GameLogic.PlayerActions.TalkNpcAction();
-                await talkAction.TalkToNpcAsync(this._player, npc).ConfigureAwait(false);
-                return;
-            }
-
-            await this._npcService.RepairAllEquipmentAsync(this._player).ConfigureAwait(false);
-            await this._npcService.BuyPotionsAsync(this._player, 10).ConfigureAwait(false);
-
-            await this.CloseNpcDialogAsync().ConfigureAwait(false);
-            this._logger.LogInformation("[HB] ✅ 复活补给完成 (修理+买药)");
-        }
-        catch (Exception ex)
-        {
-            this._logger.LogWarning("[HB] 复活补给失败: {Msg}", ex.Message);
-        }
-    }
-
-    private async ValueTask RespawnPlayerAsync()
-    {
-        try
-        {
-            this._logger.LogWarning("[HB] 💀 执行手动复活...");
-            await this._player.WarpToSafezoneAsync().ConfigureAwait(false);
-            this._logger.LogInformation("[HB] ✅ WarpToSafezoneAsync 完成");
-
-            // WarpToSafezoneAsync 只传送不恢复HP — 手动恢复满属性
-            foreach (var regen in Stats.IntervalRegenerationAttributes)
-            {
-                this._player.Attributes![regen.CurrentAttribute] = this._player.Attributes[regen.MaximumAttribute];
-            }
-            this._player.IsAlive = true;
-
-            // 重置 ScriptExecutor 状态，确保复活后能正常处理任务
-            this._scriptExecutor = null;
-
-            // 如果传送后 CurrentMap 为 null（等待客户端确认），直接确认地图变换
-            if (this._player.CurrentMap is null)
-            {
-                await this._player.ClientReadyAfterMapChangeAsync().ConfigureAwait(false);
-                this._logger.LogInformation("[HB] ✅ ClientReadyAfterMapChangeAsync 完成（手动复活）");
-            }
-
-            this._deathStartTime = null;
-            this._wasDead = false;
-            this._idleTicks = 0;
-            this._noTargetStreak = 0;
-            this._lowHpFlag = false;
-            this._logger.LogWarning("[HB] 💀 手动复活流程完成，HP/MP 已恢复");
-        }
-        catch (Exception ex)
-        {
-            this._logger.LogError(ex, "[HB] 💀 手动复活异常");
-        }
-    }
+    internal Experience.ExperienceService ExpService => this._expService;
 
     #region 事件处理器
 
     private void OnHpLow(HpLowEvent evt) { this._lowHpFlag = true; this.SetActiveState("低血事件"); this._logger.LogInformation("[Event] ❤️ 血量过低: {Hp}/{MaxHp}", evt.Hp, evt.MaxHp); }
-    private void OnDeath(DeathEvent evt) { this._wasDead = true; this.SetActiveState("已死亡"); this._lowHpFlag = false; this._logger.LogInformation("[Event] 💀 角色死亡"); }
-    private void OnRespawn(RespawnEvent evt) { this._wasDead = false; this._deathStartTime = null; this._idleTicks = 0; this._noTargetStreak = 0; this._lowHpFlag = false; this.SetActiveState("复活恢复"); this._logger.LogInformation("[Event] 🔄 角色复活于 ({X},{Y})", evt.Position.X, evt.Position.Y); }
+    private void OnDeath(DeathEvent evt)
+    {
+        this._wasDead = true;
+        this.SetActiveState("已死亡");
+        this._lowHpFlag = false;
+        this._logger.LogInformation("[Event] 💀 角色死亡");
+
+        // Track rapid death streak for respawn loop-breaking
+        var now = DateTime.UtcNow;
+        if ((now - this._lastDeathTime).TotalSeconds < 30)
+        {
+            this._respawnDeathStreak++;
+            this._logger.LogWarning("[DeathLoop] 快速死亡 #{Streak}，距上次死亡 {Sec}s",
+                this._respawnDeathStreak, (now - this._lastDeathTime).TotalSeconds.ToString("F1"));
+        }
+        else
+        {
+            this._respawnDeathStreak = 1;
+        }
+
+        this._lastDeathTime = now;
+    }
+    private void OnRespawn(RespawnEvent evt)
+    {
+        this._wasDead = false;
+        this._deathStartTime = null;
+        this._idleTicks = 0;
+        this._noTargetStreak = 0;
+        this._lowHpFlag = false;
+        this.SetActiveState("复活恢复");
+        this._logger.LogInformation("[Event] 🔄 角色复活于 ({X},{Y})", evt.Position.X, evt.Position.Y);
+
+        // Death-loop break: if the AI has died 3+ times in rapid succession,
+        // force a retreat to a safe map (Devias #3) and clear all missions
+        // so the AI re-evaluates from scratch instead of going back to the
+        // dangerous hotspot.
+        if (this._respawnDeathStreak >= 3)
+        {
+            this._logger.LogWarning("[DeathLoop] 检测到死亡循环 ({Streak}次)，强制退回安全地图 #3 (Devias)",
+                this._respawnDeathStreak);
+            this._context.TargetMapNumber = 3;
+            this._missionBoard.ClearAllMissions();
+            this._respawnDeathStreak = 0; // Reset after escalation
+        }
+    }
 
     private void OnDamaged(DamagedEvent evt)
     {
@@ -1442,6 +1086,10 @@ public sealed class HeartbeatService : IEventBroadcaster
     {
         this._logger.LogDebug("[Event] 💀 击杀 #{Monster}「{Name}」", evt.MonsterNumber, evt.MonsterName);
         this._noTargetStreak = 0;
+        this._respawnDeathStreak = 0; // Successful kill breaks the death loop
+
+        // Feed into RuntimeLearner for KG weight updates
+        this._runtimeLearner?.RecordMonsterKill((short)evt.MonsterNumber);
     }
 
     private void OnQuestStateChanged(QuestStateChangedEvent evt)
@@ -1467,185 +1115,27 @@ public sealed class HeartbeatService : IEventBroadcaster
         this._logger.LogDebug("[Event] 🗺️ NPC #{Num}「{Name}」进入感知范围", evt.NpcNumber, evt.NpcName);
     }
 
-    private void OnEventOpen(EventOpenEvent evt)
-    {
-        this._logger.LogInformation("[EventWatcher] 🔔 {Name} Lv.{Level} 入场窗口已打开!", evt.Name, evt.GameLevel);
-
-        var miniGameDef = this.FindMiniGameDefinition(evt.Type, evt.GameLevel);
-        if (miniGameDef is null)
-        {
-            this._logger.LogWarning("[EventInterrupt] 未找到 MiniGameDefinition: {Type} Lv.{Level}", evt.Type, evt.GameLevel);
-            return;
-        }
-
-        // Step 1: 检查当前任务是否可中断
-        if (this._eventInterrupt.ShouldInterruptForEvent(this._lastTask, evt))
-        {
-            // 中断当前任务（标记为 Suspended，不标 Failed）
-            if (this._lastTask is not null && this._lastTask.Status == MissionStatus.Active)
-            {
-                this._lastTask.Status = MissionStatus.Suspended;
-                this._logger.LogInformation("[EventInterrupt] ⏸ 暂停当前任务 {Title}", this._lastTask.Title);
-            }
-
-            // 设置中断上下文，下一 tick 的 === 4) 中断处理 阶段会自然处理
-            this.Interrupt($"事件开放: {evt.Name}");
-        }
-
-        // Step 2: 检查事件条件
-        var readiness = this._eventInterrupt.GetEventReadiness(miniGameDef);
-        this._logger.LogInformation("[EventInterrupt] {Name} 入场准备状态: {Readiness}", evt.Name, readiness);
-
-        // Step 3: 确保看板有这个事件任务（先注入，后续根据 readiness 决定是否激活）
-        var eventId = $"event_{evt.Type}_{evt.GameLevel}";
-        if (!this._missionBoard.BoardState.Missions.Any(m => m.Id == eventId && !m.IsDeadTask))
-        {
-            this._missionBoard.BoardState.Missions.Add(new MissionItem
-            {
-                Id = eventId,
-                Title = $"{evt.Name} Lv.{evt.GameLevel}",
-                Priority = 15,
-                Type = MissionType.Quest,
-                Category = QuestCategory.InstanceEvent,
-                Goal = QuestGoal.Instance,
-                Source = QuestSource.GameSystem,
-                Module = "event_executor",
-                FailureRetryable = true,
-                MaxRepeatCount = -1,
-            });
-            this._logger.LogInformation("[EventWatcher] ➕ 注入开放事件: {Id}", eventId);
-        }
-
-        // Step 4: 根据 readiness 处理
-        switch (readiness)
-        {
-            case EventReadiness.Ready:
-                // 直接激活事件任务，下一 tick SelectCurrentTask 会选中
-                var eventTask = this._missionBoard.BoardState.Missions.FirstOrDefault(m => m.Id == eventId);
-                if (eventTask is not null && eventTask.Status != MissionStatus.Active)
-                {
-                    eventTask.Status = MissionStatus.Active;
-                    this._logger.LogInformation("[EventInterrupt] ✅ 条件满足，直接激活事件任务: {Id}", eventId);
-                }
-
-                break;
-
-            case EventReadiness.NeedVault:
-                // 仓库有门票/材料 → 注入 vault_ 提取任务
-                this.InjectVaultRetrieveMission(miniGameDef);
-                break;
-
-            case EventReadiness.NeedTicket:
-                // 背包有材料但无门票 → 事件任务的 HandleMissingTicket 会处理合成链路
-                // 激活事件任务，让 EventExecutorModule 的 HandleMissingTicket 触发合成任务
-                var eventTask2 = this._missionBoard.BoardState.Missions.FirstOrDefault(m => m.Id == eventId);
-                if (eventTask2 is not null && eventTask2.Status != MissionStatus.Active)
-                {
-                    eventTask2.Status = MissionStatus.Active;
-                    this._logger.LogInformation("[EventInterrupt] 🎫 需要合成门票，激活事件任务触发合成链路: {Id}", eventId);
-                }
-
-                break;
-
-            case EventReadiness.NeedFarm:
-                // 无门票无材料 → 不参与，事件任务自然失败
-                this._logger.LogInformation("[EventInterrupt] ⏭ {Name} 无门票无材料，跳过参与", evt.Name);
-                break;
-
-            case EventReadiness.LevelTooLow:
-            case EventReadiness.NotEnoughMoney:
-                this._logger.LogInformation("[EventInterrupt] ⏭ {Name} 条件不足: {Readiness}", evt.Name, readiness);
-                break;
-        }
-    }
+    private void OnEventOpen(EventOpenEvent evt) => this._eventHandlers.OnEventOpen(evt);
 
     /// <summary>
     /// 注入仓库取物任务 — 从仓库中取出门票或合成材料。
     /// </summary>
-    private void InjectVaultRetrieveMission(MiniGameDefinition miniGameDef)
-    {
-        var missionId = $"vault_ticket_{miniGameDef.Type}_{miniGameDef.GameLevel}";
-        if (this._missionBoard.BoardState.Missions.Any(m => m.Id == missionId))
-        {
-            return;
-        }
+    private void InjectVaultRetrieveMission(MiniGameDefinition miniGameDef) => this._eventHandlers.InjectVaultRetrieveMission(miniGameDef);
 
-        var eventId = $"event_{miniGameDef.Type}_{miniGameDef.GameLevel}";
-
-        var vaultMission = new MissionItem
-        {
-            Id = missionId,
-            Title = $"从仓库取{miniGameDef.Name}门票",
-            Priority = 10,  // 高优先级（比事件任务 15 高，先取物再入场）
-            Type = MissionType.ItemFarm,
-            Category = QuestCategory.AiCustom,
-            Module = "vault_executor",
-            FailureRetryable = true,
-            MaxRepeatCount = 3,
-        };
-
-        this._missionBoard.BoardState.Missions.Add(vaultMission);
-
-        // 设为事件任务的前置依赖（取完门票/材料后再走 event_executor）
-        var existing = this._missionBoard.BoardState.Missions.FirstOrDefault(m => m.Id == eventId);
-        if (existing is not null)
-        {
-            existing.Dependencies = new[] { missionId };
-        }
-
-        this._logger.LogInformation("[EventInterrupt] ➕ 注入仓库取物任务: {Id}", missionId);
-    }
+    /// <summary>
+    /// 注入打门票材料任务 — 无门票无材料时，创建 farm_ticket 任务并设为事件前驱。
+    /// 用 MaterialKnowledgeService 确定掉落目标（怪物、地图、材料等级）。
+    /// </summary>
+    private void InjectFarmTicketMission(MiniGameDefinition miniGameDef) => this._eventHandlers.InjectFarmTicketMission(miniGameDef);
 
     /// <summary>
     /// 从配置文件查找匹配的 MiniGameDefinition。
     /// </summary>
-    private MiniGameDefinition? FindMiniGameDefinition(MiniGameType miniGameType, int gameLevel)
-    {
-        var config = this._player.GameContext?.Configuration;
-        if (config is null)
-        {
-            return null;
-        }
+    private MiniGameDefinition? FindMiniGameDefinition(MiniGameType miniGameType, int gameLevel) => this._eventHandlers.FindMiniGameDefinition(miniGameType, gameLevel);
 
-        return config.MiniGameDefinitions
-            .FirstOrDefault(d => d.Type == miniGameType && d.GameLevel == gameLevel);
-    }
+    private void OnEventReminder(EventReminderEvent evt) => this._eventHandlers.OnEventReminder(evt);
 
-    private void OnEventReminder(EventReminderEvent evt)
-    {
-        if (evt.MinutesLeft == 0)
-        {
-            this._logger.LogInformation("[EventWatcher] ⏰ {Name} Lv.{Level} 已开放, 尽快入场!", evt.Name, evt.GameLevel);
-        }
-        else
-        {
-            this._logger.LogInformation("[EventWatcher] ⏰ {Name} Lv.{Level} 进行中...", evt.Name, evt.GameLevel);
-        }
-
-        // 确保看板有事件任务（如果之前被移除）
-        var eventId = $"event_{evt.Type}_{evt.GameLevel}";
-        if (!this._missionBoard.BoardState.Missions.Any(m => m.Id == eventId && m.Status == MissionStatus.Active))
-        {
-            // 把事件任务推到 Active 层
-            var existing = this._missionBoard.BoardState.Missions.FirstOrDefault(m => m.Id == eventId);
-            if (existing is not null && existing.Status != MissionStatus.Active && !existing.IsDeadTask)
-            {
-                existing.Status = MissionStatus.Active;
-                this._logger.LogInformation("[EventWatcher] 🔄 重新激活事件任务: {Id}", eventId);
-            }
-        }
-    }
-
-    private void OnEventClosed(EventClosedEvent evt)
-    {
-        this._logger.LogInformation("[EventWatcher] 🔴 {Name} Lv.{Level} 已结束", evt.Name, evt.GameLevel);
-        var eventId = $"event_{evt.Type}_{evt.GameLevel}";
-        var existing = this._missionBoard.BoardState.Missions.FirstOrDefault(m => m.Id == eventId);
-        if (existing is not null && existing.Status == MissionStatus.Active)
-        {
-            this.MarkTaskFailed(existing, FailureReason.NotExecutable);
-        }
-    }
+    private void OnEventClosed(EventClosedEvent evt) => this._eventHandlers.OnEventClosed(evt);
 
     // ===================== IEventBroadcaster Explicit Implementation =====================
 
@@ -1665,6 +1155,21 @@ public sealed class HeartbeatService : IEventBroadcaster
     void IEventBroadcaster.OnEventClosed(MiniGameType type, int gameLevel, string name)
     {
         this.OnEventClosed(new EventClosedEvent(type, gameLevel, name));
+    }
+
+    /// <summary>
+    /// 从共享规则引擎同步学习规则 — OAPS 旁观者系统桥梁。
+    /// 由 AiPlayerManager 在每个 SyncLearning 周期后调用。
+    /// </summary>
+    public void SyncLearnedRules(RuleEngine sharedEngine)
+    {
+        foreach (var rule in sharedEngine.Rules)
+        {
+            if (rule.AutoGenerated && !this._ruleEngine.Rules.Any(r => r.ScriptId == rule.ScriptId))
+            {
+                this._ruleEngine.AddSingleLearnedRule(rule);
+            }
+        }
     }
 
     #endregion

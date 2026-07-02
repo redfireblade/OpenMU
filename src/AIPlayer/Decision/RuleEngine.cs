@@ -143,6 +143,15 @@ public sealed class RuleEngine
     }
 
     /// <summary>
+    /// 注入单条已处理的规则（用于各 AI 角色从共享 RuleEngine 同步学习规则）。
+    /// 不调整优先级偏移（调用者已处理）。
+    /// </summary>
+    public void AddSingleLearnedRule(RuleDef rule)
+    {
+        this._rules.Add(rule);
+    }
+
+    /// <summary>
     /// 从程序集目录的 Decision/scripts-rules.json 加载规则（开发/生产模式通用）。
     /// 失败时静默降级（保留内置规则）。
     /// </summary>
