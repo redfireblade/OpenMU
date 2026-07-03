@@ -95,13 +95,16 @@ public sealed class OapsKnowledgeBridge
 
             // 5. 蒸馏 → 写入规则库文件（解耦架构：观察者只写文件，AI独立读取）
             var ready = _bucketStore.GetBucketsReadyForDistill();
+            // 生成每条规则时，同时创建对应的脚本文件名。
+            // 规则是Agent的Skill，脚本是Skill的MCP执行计划。
+            var learnedScriptId = $"learned_{playerName}_{events.Max(e => e.Level)}";
             var defs = ready.Select(b =>
             {
-                var scriptId = MapCapacityToScriptId(b.Capacity);
                 return new RuleDef(
                     RuleId: $"learned_{b.Capacity}_{playerName}",
                     Priority: 50, Category: "learned",
-                    Condition: $"on_map_{b.MapNumber}", ScriptId: scriptId,
+                    Condition: $"on_map_{b.MapNumber}",
+                    ScriptId: learnedScriptId, // 指向学习的JSON脚本(不是C#模块)
                     MinLevel: 0, MaxLevel: 0, RequiredClass: null, ItemRequired: null,
                     Description: $"从{playerName}学到的{b.Capacity}({b.EvidenceCount}条)",
                     Parameters: new Dictionary<string, string> { ["mapNumber"] = b.MapNumber.ToString() },

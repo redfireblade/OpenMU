@@ -755,10 +755,13 @@ public sealed class HeartbeatService : IEventBroadcaster
             this._player, this._adapter, this._ruleEngine, this._scriptLib);
 
         // 执行规则集对应的脚本序列
+        // 规则→脚本：Rule.ScriptId指JSON脚本文件 → 通过ScriptExecutor加载→执行
+        // 规则→模块：如果ScriptLibrary有对应C#模块 → 通过模块.ExecuteStepAsync
         foreach (var (match, module) in ruleSet)
         {
             if (module is not null && match.GeneratedMission is not null)
             {
+                // C#模块路径（combat/survival/inventory等）
                 try
                 {
                     await module.ExecuteStepAsync(match.GeneratedMission).ConfigureAwait(false);
@@ -766,7 +769,29 @@ public sealed class HeartbeatService : IEventBroadcaster
                 }
                 catch (Exception ex)
                 {
-                    this._logger.LogWarning(ex, "[HB] 规则 {RuleId} 脚本执行失败", match.Rule.RuleId);
+                    this._logger.LogWarning(ex, "[HB] 规则 {RuleId} 模块执行失败", match.Rule.RuleId);
+                }
+            }
+            else if (match.Rule.ScriptId.StartsWith("learned_"))
+            {
+                // JSON脚本路径（learned_fashi01_13等）
+                var scriptPath = Path.Combine(AppContext.BaseDirectory, "scripts", "learned", $"{match.Rule.ScriptId}.json");
+                if (File.Exists(scriptPath))
+                {
+                    try
+                    {
+                        var script = Scripting.ScriptExecutor.LoadFromFile(scriptPath);
+                        if (script is not null && this._player.Logic is not null)
+                        {
+                            this._player.Logic.ReloadScript(script);
+                            this._context.RecordDecision(match.Rule.ScriptId, TimeSpan.Zero);
+                            this._logger.LogInformation("[HB] 规则 {RuleId} → 加载脚本 {ScriptId}", match.Rule.RuleId, match.Rule.ScriptId);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        this._logger.LogWarning(ex, "[HB] 规则 {RuleId} 脚本加载失败", match.Rule.RuleId);
+                    }
                 }
             }
         }
