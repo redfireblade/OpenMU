@@ -364,9 +364,133 @@ public sealed class AiPlayerLogic : IDisposable
             Task.FromResult(adapter.GetCurrentHp() <= 0));
 
         // 条件函数：in_safezone
-        _luaEngine.Globals["in_safezone"] = false; // Will be set per-tick via WorldState
+        _luaEngine.Globals["in_safezone"] = false;
 
-        player.Logger.LogInformation("[LuaEngine] Initialized with {Count} registered functions", _luaEngine.Globals.Count + 9);
+        // === 外挂级功能函数 ===
+
+        // 自动喝药(HP%,MP%)
+        _luaEngine.RegisterFunction("auto_potion", (args, _) =>
+        {
+            var hpPct = adapter.GetCurrentHp() / (float)Math.Max(1, adapter.GetMaxHp());
+            var hpThreshold = args.Length > 0 && float.TryParse(args[0], out var h) ? h / 100f : 0.4f;
+            if (hpPct < hpThreshold) { useHpPotion(); }
+            return Task.FromResult(true);
+            async void useHpPotion()
+            {
+                var inv = player.Inventory;
+                if (inv is null) return;
+                foreach (var (g, n) in new[] { (14, 3), (14, 2), (14, 1) })
+                {
+                    var p = inv.Items.FirstOrDefault(i => i.Definition?.Group == g && i.Definition?.Number == n && i.Durability > 0);
+                    if (p is not null) { await adapter.ConsumeItemAsync(p.ItemSlot).ConfigureAwait(false); return; }
+                }
+            }
+        });
+
+        // 传送到指定地图
+        _luaEngine.RegisterFunction("warp_to_map", async (args, _) =>
+        {
+            if (args.Length > 0 && ushort.TryParse(args[0], out var mapNum))
+            {
+                await adapter.WarpToMapAsync(mapNum).ConfigureAwait(false);
+                return true;
+            }
+            return false;
+        });
+
+        // 选择NPC对话选项
+        _luaEngine.RegisterFunction("select_dialog", async (args, _) =>
+        {
+            if (args.Length > 0 && int.TryParse(args[0], out var option))
+            {
+                try
+                {
+                    var closeAction = new MUnique.OpenMU.GameLogic.PlayerActions.CloseNpcDialogAction();
+                    await closeAction.CloseNpcDialogAsync(player).ConfigureAwait(false);
+                    return true;
+                }
+                catch { return false; }
+            }
+            return false;
+        });
+
+        // 关闭NPC对话
+        _luaEngine.RegisterFunction("close_dialog", async (_, _) =>
+        {
+            try
+            {
+                var closeAction = new MUnique.OpenMU.GameLogic.PlayerActions.CloseNpcDialogAction();
+                await closeAction.CloseNpcDialogAsync(player).ConfigureAwait(false);
+                return true;
+            }
+            catch { return false; }
+        });
+
+        // 范围内随机走动
+        _luaEngine.RegisterFunction("random_walk", async (args, _) =>
+        {
+            var range = args.Length > 0 && int.TryParse(args[0], out var r) ? r : 10;
+            var pos = adapter.GetPlayerPosition();
+            var map = adapter.GetCurrentMap();
+            if (map is null) return false;
+            var x = (byte)Math.Clamp(pos.X + Random.Shared.Next(-range, range + 1), 0, 255);
+            var y = (byte)Math.Clamp(pos.Y + Random.Shared.Next(-range, range + 1), 0, 255);
+            await adapter.WalkToAsync(new MUnique.OpenMU.Pathfinding.Point(x, y), map).ConfigureAwait(false);
+            return true;
+        });
+
+        // 离开安全区
+        _luaEngine.RegisterFunction("leave_safezone", async (_, _) =>
+        {
+            var pos = adapter.GetPlayerPosition();
+            var map = adapter.GetCurrentMap();
+            if (map is null) return false;
+            // Walk toward the gate (east from safe zone center)
+            var exitX = (byte)Math.Min(255, pos.X + 20);
+            await adapter.WalkToAsync(new MUnique.OpenMU.Pathfinding.Point(exitX, pos.Y), map).ConfigureAwait(false);
+            return true;
+        });
+
+        // 施放最高攻击技能
+        _luaEngine.RegisterFunction("use_best_skill", async (_, _) =>
+        {
+            var skillList = player.SkillList;
+            if (skillList is null) return false;
+            var best = skillList.Skills?
+                .OrderByDescending(s => s.Skill?.AttackDamage ?? 0)
+                .FirstOrDefault();
+            if (best?.Skill is null) return false;
+            var pos = adapter.GetPlayerPosition();
+            var map = adapter.GetCurrentMap();
+            if (map is null) return false;
+            var target = map.GetAttackablesInRange(pos, 10).FirstOrDefault(m => m.IsAlive);
+            if (target is null) return false;
+            await adapter.HitWithSkillAsync(target, best).ConfigureAwait(false);
+            return true;
+        });
+
+        // 传送到指定地图
+        _luaEngine.RegisterFunction("warp_to_map", async (args, _) =>
+        {
+            if (args.Length > 0 && ushort.TryParse(args[0], out var mapNum))
+            {
+                await this._adapter.WarpToMapAsync(mapNum).ConfigureAwait(false);
+                return true;
+            }
+            return false;
+        });
+
+        // 条件：monsters_nearby(num)
+        _luaEngine.RegisterFunction("monsters_nearby", (args, _) =>
+        {
+            var threshold = args.Length > 0 && int.TryParse(args[0], out var t) ? t : 1;
+            var pos = adapter.GetPlayerPosition();
+            var map = adapter.GetCurrentMap();
+            var count = map?.GetAttackablesInRange(pos, 15).Count(m => m.IsAlive) ?? 0;
+            return Task.FromResult(count >= threshold);
+        });
+
+        player.Logger.LogInformation("[LuaEngine] Initialized with 20 registered game functions");
     }
 
     /// <summary>Initializes Fugu v4.0 components. Called by AiPlayerManager after AiPlayerLogic creation.</summary>
