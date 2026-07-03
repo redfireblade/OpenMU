@@ -41,6 +41,37 @@ public sealed class SurvivalMode : IBehaviorSubModule
         var map = this._adapter.GetCurrentMap();
         if (map is null) return StepResult.Failed;
 
+        // NPC交互 → 找Buff NPC（从学习规则传入的npcNumber参数）
+        if (item.Context.TryGetValue("npcNumber", out var npcStr)
+            && short.TryParse(npcStr, out var targetNpc))
+        {
+            var pos = this._adapter.GetPlayerPosition();
+            var npc = map.GetAttackablesInRange(pos, 100)
+                .OfType<NonPlayerCharacter>()
+                .FirstOrDefault(n => n.Definition?.Number == targetNpc);
+
+            if (npc is not null)
+            {
+                var dist = pos.EuclideanDistanceTo(npc.Position);
+                if (dist > 3)
+                {
+                    await this._adapter.WalkToAsync(npc.Position, map).ConfigureAwait(false);
+                    return StepResult.InProgress;
+                }
+
+                // 到达NPC → 打开对话（Elf Soldier BUFF请求由服务器插件处理）
+                try
+                {
+                    var buffAction = new MUnique.OpenMU.GameLogic.PlayerActions.Quests.ElfSoldierBuffRequestAction();
+                    await buffAction.RequestBuffAsync(this._player).ConfigureAwait(false);
+                    this._logger.LogInformation("[Survival] NPC#{Npc} buff requested", targetNpc);
+                }
+                catch { /* buff may not apply */ }
+
+                return StepResult.InProgress;
+            }
+        }
+
         // 低血 → 用药水 + 短距离脱离战斗
         var hp = this._adapter.GetCurrentHp();
         var maxHp = this._adapter.GetMaxHp();
