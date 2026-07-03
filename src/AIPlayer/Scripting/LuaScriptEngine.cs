@@ -48,7 +48,7 @@ public sealed class LuaScriptEngine
     /// <summary>执行Lua风格脚本。</summary>
     public async Task<bool> ExecuteAsync(string script, CancellationToken ct = default)
     {
-        var lines = script.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var lines = script.Replace("\r", "").Split('\n', StringSplitOptions.RemoveEmptyEntries);
         int pc = 0;
         var stack = new Stack<(string, int)>(); // (context, return_pc) for loops
 
@@ -89,29 +89,43 @@ public sealed class LuaScriptEngine
         string line, int pc, string[] lines, CancellationToken ct)
     {
         // --- if CONDITION then STATEMENT end ---
-        var ifMatch = Regex.Match(line, @"^if\s+(.+?)\s+then\s+(.+?)\s*(end)?$");
-        if (ifMatch.Success)
+        // 简化解析：按 " then " 和 " end" 分割
+        if (line.StartsWith("if ") && line.Contains(" then "))
         {
-            var condition = ifMatch.Groups[1].Value.Trim();
-            var statement = ifMatch.Groups[2].Value.Trim();
+            var thenIdx = line.IndexOf(" then ");
+            var condition = line[3..thenIdx].Trim();
+            var afterThen = line[(thenIdx + 6)..].Trim();
+            if (afterThen.EndsWith(" end")) afterThen = afterThen[..^4].Trim();
+
             if (EvaluateCondition(condition))
             {
-                var (_, r) = await ExecuteLineAsync(statement, pc, lines, ct).ConfigureAwait(false);
-                return (pc + 1, r);
+                foreach (var stmt in afterThen.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var s = stmt.Trim();
+                    if (s.Length > 0)
+                    {
+                        var (_, r) = await ExecuteFunctionCallAsync(s, pc, ct).ConfigureAwait(false);
+                        if (!r) break;
+                    }
+                }
+                return (pc + 1, true);
             }
             return (pc + 1, true);
         }
 
         // --- if CONDITION then STATEMENT else STATEMENT end ---
-        var ifElseMatch = Regex.Match(line, @"^if\s+(.+?)\s+then\s+(.+?)\s+else\s+(.+?)\s*end$");
-        if (ifElseMatch.Success)
+        if (line.StartsWith("if ") && line.Contains(" then ") && line.Contains(" else "))
         {
-            var condition = ifElseMatch.Groups[1].Value.Trim();
-            var trueStmt = ifElseMatch.Groups[2].Value.Trim();
-            var falseStmt = ifElseMatch.Groups[3].Value.Trim();
+            var thenIdx = line.IndexOf(" then ");
+            var elseIdx = line.IndexOf(" else ");
+            var condition = line[3..thenIdx].Trim();
+            var trueStmt = line[(thenIdx + 6)..elseIdx].Trim();
+            var falseStmt = line[(elseIdx + 6)..].Trim();
+            if (falseStmt.EndsWith(" end")) falseStmt = falseStmt[..^4].Trim();
+
             if (EvaluateCondition(condition))
             {
-                var (_, r) = await ExecuteLineAsync(trueStmt, pc, lines, ct).ConfigureAwait(false);
+                var (_, r) = await ExecuteFunctionCallAsync(trueStmt, pc, ct).ConfigureAwait(false);
                 return (pc + 1, r);
             }
             else

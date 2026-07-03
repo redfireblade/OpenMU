@@ -45,8 +45,9 @@ public static class LuaGameFunctions
         {
             if (args.Length < 1 || !short.TryParse(args[0], out var num)) return false;
             var m = a.GetCurrentMap(); if (m is null) return false;
-            var npc = m.GetAttackablesInRange(a.GetPlayerPosition(), 200)
-                .OfType<NonPlayerCharacter>().FirstOrDefault(n => n.Definition?.Number == num);
+            // 用 GetNpcsInRange 查询NPC（非怪物列表）
+            var npc = m.GetNpcsInRange(a.GetPlayerPosition(), 200)
+                .FirstOrDefault(n => n.Definition?.Number == num);
             if (npc is null) return false;
             await a.WalkToAsync(npc.Position, m).ConfigureAwait(false); return true;
         });
@@ -110,7 +111,7 @@ public static class LuaGameFunctions
         {
             if (args.Length < 1 || !short.TryParse(args[0], out var num)) return false;
             var pos = a.GetPlayerPosition(); var m = a.GetCurrentMap(); if (m is null) return false;
-            var npc = m.GetAttackablesInRange(pos, 100).OfType<NonPlayerCharacter>()
+            var npc = m.GetNpcsInRange(pos, 200)
                 .FirstOrDefault(n => n.Definition?.Number == num);
             if (npc is null) return false;
             if (pos.EuclideanDistanceTo(npc.Position) > 3) await a.WalkToAsync(npc.Position, m).ConfigureAwait(false);
@@ -200,6 +201,12 @@ public static class LuaGameFunctions
         });
         e.RegisterFunction("has_stat_points", (_, _) => Task.FromResult((p.SelectedCharacter?.LevelUpPoints ?? 0) > 0));
         e.RegisterFunction("is_walking", (_, _) => Task.FromResult(p.IsWalking));
+        e.RegisterFunction("not_buffed", (_, _) =>
+        {
+            var effects = p.MagicEffectList?.VisibleEffects;
+            if (effects is null || effects.Count == 0) return Task.FromResult(true);
+            return Task.FromResult(!effects.Any(e => e.Definition.Number >= 3 && e.Definition.Number <= 6));
+        });
     }
 
     static async Task ExecuteUseHpPotion(AiPlayer p, IGameAdapter a)

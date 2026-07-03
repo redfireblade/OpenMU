@@ -5,6 +5,7 @@
 namespace MUnique.OpenMU.AIPlayer;
 
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using MUnique.OpenMU.GameLogic;
@@ -67,6 +68,9 @@ public sealed class AiPlayerLogic : IDisposable
 
     /// <summary>Lua风格DSL解释器 — 驱动AI角色游戏内行为。</summary>
     private Scripting.LuaScriptEngine? _luaEngine;
+    private string? _luaScriptPath;      // 脚本文件路径
+    private string? _luaScriptText;      // 已加载的脚本文本
+    private bool _luaScriptLoaded;       // 是否已加载
 
     /// <summary>AI behavior collector — feeds AI events into BehaviorEventStore for continuous learning.</summary>
     private AiBehaviorCollector? _behaviorCollector;
@@ -118,6 +122,12 @@ public sealed class AiPlayerLogic : IDisposable
 
         // Lua风格DSL解释器 — 注册游戏函数给脚本调用（无论1D还是DAG模式）
         this.InitializeLuaEngine();
+
+        // 根据职业选择默认脚本（类似外挂的"刷怪脚本"）
+        var clsNum = player.SelectedCharacter?.CharacterClass?.Number ?? 0;
+        _luaScriptPath = clsNum == 8 // Fairy Elf
+            ? Path.Combine(AppContext.BaseDirectory, "aiplayer_data", "default_hunt_noria.lua")
+            : Path.Combine(AppContext.BaseDirectory, "aiplayer_data", "default_hunt_lorencia.lua");
 
         // Load behavior execution engine: ScriptExecutor (1D) or Heartbeat (Decision)
         if (script is not null)
@@ -521,9 +531,28 @@ public sealed class AiPlayerLogic : IDisposable
             }
         }
 
+        // 1.5 Lua脚本引擎 — AI行为驱动力（外挂脚本模式）
+        if (_luaEngine is not null && this._player.PlayerState.CurrentState == GameLogic.PlayerState.EnteredWorld)
+        {
+            try
+            {
+                // 外挂风格：死亡→安全区 → NPC buff(不走路时) → 打怪 → 捡东西 → 巡逻
+                var script = @"if is_dead() then return_to_safezone()
+if not_buffed() then walk_to_npc(257)
+if not_buffed() then get_buff()
+if not is_walking() then random_walk(20) end
+if hp_below(35) then use_hp_potion()
+if has_target() then attack_target()
+pickup_nearby()";
+                await _luaEngine.ExecuteAsync(script, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                this._player.Logger.LogWarning(ex, "[LuaEngine] Script execution error");
+            }
+        }
+
         // 2. Run game engine's built-in auto-bot (OfflinePlayer 内挂 handlers)
-        // Handles combat, healing, pickup, buff, repair — all at the engine level.
-        // This replaces the script-level combat/pickup/patrol with battle-tested GameLogic code.
         if (this._offlineHelper is not null
             && this._player.PlayerState.CurrentState == GameLogic.PlayerState.EnteredWorld)
         {

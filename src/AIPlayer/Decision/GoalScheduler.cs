@@ -155,6 +155,12 @@ public sealed class GoalScheduler
         this._goals.Clear();
         var level = this._adapter.GetPlayerLevel();
 
+        // 低等级目标 — 阶梯升级（看板驱动的狩猎目标）
+        if (level < 10) this._goals["level_10"] = new AiGoal { Id = "level_10", Title = "升到10级", Category = GoalCategory.Level, Priority = 5, IsCompleted = p => p.Level >= 10, IsUnlocked = _ => true, IsActive = true };
+        if (level < 20) this._goals["level_20"] = new AiGoal { Id = "level_20", Title = "升到20级", Category = GoalCategory.Level, Priority = 6, IsCompleted = p => p.Level >= 20, IsUnlocked = _ => level >= 8, IsActive = level >= 8 };
+        if (level >= 10 && level < 30) this._goals["level_30"] = new AiGoal { Id = "level_30", Title = "升到30级", Category = GoalCategory.Level, Priority = 7, IsCompleted = p => p.Level >= 30, IsUnlocked = _ => level >= 10, IsActive = level >= 10 };
+        if (level >= 20) this._goals["level_50"] = new AiGoal { Id = "level_50", Title = "升到50级", Category = GoalCategory.Level, Priority = 8, IsCompleted = p => p.Level >= 50, IsUnlocked = _ => level >= 20, IsActive = level >= 20 };
+
         // 阶段 1: 1-50 → 转职1 + 基础装备
         this.AddGoalIfRelevant(level, 1, 50, new AiGoal
         {
