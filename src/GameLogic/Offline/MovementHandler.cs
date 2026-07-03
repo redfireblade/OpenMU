@@ -94,19 +94,34 @@ public sealed class MovementHandler
         try
         {
             pathFinder.ResetPathFinder();
-            var path = pathFinder.FindPath(this._player.Position, target, map.Terrain.AIgrid, false);
+
+            // 使用当前位置而非起止偏移判断，避免 WalkToAsync 中 offset>3 触发 MoveType.Instant 瞬移
+            var currentPos = this._player.Position;
+            var path = pathFinder.FindPath(currentPos, target, map.Terrain.AIgrid, false);
             if (path is null || path.Count == 0)
             {
-                return false;
+                // 路径不通 → 找最近的可行走目标
+                var altTarget = map.Terrain.GetRandomCoordinate(target, 3);
+                currentPos = this._player.Position;
+                path = pathFinder.FindPath(currentPos, altTarget, map.Terrain.AIgrid, false);
+                if (path is null || path.Count == 0) return false;
+                target = altTarget;
             }
 
-            var stepsCount = Math.Min(path.Count, 16);
+            var stepsCount = Math.Min(path.Count, 10); // 10步最多，避免长途路径中间偏移
             var steps = new WalkingStep[stepsCount];
+            var actualStart = this._player.Position;
             for (int i = 0; i < stepsCount; i++)
             {
                 var node = path[i];
-                var prevPos = i == 0 ? this._player.Position : steps[i - 1].To;
+                var prevPos = i == 0 ? actualStart : steps[i - 1].To;
                 steps[i] = new WalkingStep(prevPos, node.Point, prevPos.GetDirectionTo(node.Point));
+            }
+
+            // 确保第一步的起点与当前位置一致
+            if (stepsCount > 0 && steps[0].From.EuclideanDistanceTo(actualStart) > 2)
+            {
+                steps[0] = new WalkingStep(actualStart, steps[0].To, actualStart.GetDirectionTo(steps[0].To));
             }
 
             await this._player.WalkToAsync(target, steps).ConfigureAwait(false);
