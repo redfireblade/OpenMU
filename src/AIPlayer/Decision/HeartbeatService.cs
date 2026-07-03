@@ -748,15 +748,27 @@ public sealed class HeartbeatService : IEventBroadcaster
             // 不像旧的同步模式那样 return 阻塞 tick
         }
 
-        // === 6) v4.0 决策核心：三轨评估 → 选任务 ===
-        // T1(RuleEngine)→T2(ScriptExecutor)→T3(SoftRouter) 三轨评估
-        var dCoreResult = await this._decisionCore.DecideAsync(
-            this._player, this._adapter, this._ruleEngine, this._scriptLib).ConfigureAwait(false);
+        // === 6) v4.0 决策：规则库→规则集→脚本序列→执行 ===
+        // Kanban 看板任务阶段 → RuleEngine.EvaluateAll → 规则集
+        // → 每个规则加载对应 ScriptLibrary 脚本 → 形成执行序列
+        var ruleSet = this._decisionCore.DecideAsync(
+            this._player, this._adapter, this._ruleEngine, this._scriptLib);
 
-        // 学习规则匹配且执行成功 → 记录决策，继续看板任务选择
-        if (dCoreResult.IsLearnedRule)
+        // 执行规则集对应的脚本序列
+        foreach (var (match, module) in ruleSet)
         {
-            this._context.RecordDecision(dCoreResult.ActionName, TimeSpan.Zero);
+            if (module is not null && match.GeneratedMission is not null)
+            {
+                try
+                {
+                    await module.ExecuteStepAsync(match.GeneratedMission).ConfigureAwait(false);
+                    this._context.RecordDecision(match.Rule.ScriptId, TimeSpan.Zero);
+                }
+                catch (Exception ex)
+                {
+                    this._logger.LogWarning(ex, "[HB] 规则 {RuleId} 脚本执行失败", match.Rule.RuleId);
+                }
+            }
         }
 
         var current = await this._decisionSystem.SelectCurrentTaskAsync().ConfigureAwait(false);
