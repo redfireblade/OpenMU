@@ -42,7 +42,8 @@ public sealed class SurvivalMode : IBehaviorSubModule
         if (map is null) return StepResult.Failed;
 
         // NPC交互 → 找Buff NPC（从学习规则传入的npcNumber参数）
-        if (item.Context.TryGetValue("npcNumber", out var npcStr)
+        if (item.Context.TryGetValue("npcNumber", out var npcObj)
+            && npcObj?.ToString() is { } npcStr
             && short.TryParse(npcStr, out var targetNpc))
         {
             var pos = this._adapter.GetPlayerPosition();
