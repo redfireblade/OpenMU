@@ -65,6 +65,9 @@ public sealed class AiPlayerLogic : IDisposable
     /// <summary>Fugu v4.0 DAG script executor — parallel candidate evaluation.</summary>
     private Scripting.DagScriptExecutor? _dagExecutor;
 
+    /// <summary>Lua风格DSL解释器 — 驱动AI角色游戏内行为。</summary>
+    private Scripting.LuaScriptEngine? _luaEngine;
+
     /// <summary>AI behavior collector — feeds AI events into BehaviorEventStore for continuous learning.</summary>
     private AiBehaviorCollector? _behaviorCollector;
 
@@ -112,6 +115,9 @@ public sealed class AiPlayerLogic : IDisposable
         {
             GameAdapter = this._adapter,
         };
+
+        // Lua风格DSL解释器 — 注册游戏函数给脚本调用（无论1D还是DAG模式）
+        this.InitializeLuaEngine();
 
         // Load behavior execution engine: ScriptExecutor (1D) or Heartbeat (Decision)
         if (script is not null)
@@ -243,6 +249,125 @@ public sealed class AiPlayerLogic : IDisposable
 
     /// <summary>Gets the FuguScriptBridge, or null if not initialized.</summary>
     public Scripting.FuguScriptBridge? FuguBridge => _fuguBridge;
+
+    /// <summary>初始化Lua脚本引擎并注册游戏函数。</summary>
+    private void InitializeLuaEngine()
+    {
+        _luaEngine = new Scripting.LuaScriptEngine(this._player.Logger);
+        var adapter = this._adapter;
+        var player = this._player;
+
+        // 移动
+        _luaEngine.RegisterFunction("walk_to", async (args, ct) =>
+        {
+            if (args.Length >= 2 && byte.TryParse(args[0], out var x) && byte.TryParse(args[1], out var y))
+            {
+                var map = adapter.GetCurrentMap();
+                if (map is null) return false;
+                await adapter.WalkToAsync(new MUnique.OpenMU.Pathfinding.Point(x, y), map).ConfigureAwait(false);
+                return true;
+            }
+            return false;
+        });
+
+        // 攻击当前目标
+        _luaEngine.RegisterFunction("attack", async (_, _) =>
+        {
+            var pos = adapter.GetPlayerPosition();
+            var map = adapter.GetCurrentMap();
+            if (map is null) return false;
+            var target = map.GetAttackablesInRange(pos, 10).FirstOrDefault(m => m.IsAlive);
+            if (target is null) return false;
+            await adapter.HitAsync(target, 0, 0).ConfigureAwait(false);
+            return true;
+        });
+
+        // 与NPC对话
+        _luaEngine.RegisterFunction("talk_npc", async (args, _) =>
+        {
+            if (args.Length >= 1 && short.TryParse(args[0], out var npcNum))
+            {
+                var pos = adapter.GetPlayerPosition();
+                var map = adapter.GetCurrentMap();
+                if (map is null) return false;
+                var npc = map.GetAttackablesInRange(pos, 100)
+                    .OfType<MUnique.OpenMU.GameLogic.NPC.NonPlayerCharacter>()
+                    .FirstOrDefault(n => n.Definition?.Number == npcNum);
+                if (npc is null) return false;
+                var dist = pos.EuclideanDistanceTo(npc.Position);
+                if (dist > 3) await adapter.WalkToAsync(npc.Position, map).ConfigureAwait(false);
+                // Open NPC dialog
+                var talkAction = new MUnique.OpenMU.GameLogic.PlayerActions.TalkNpcAction();
+                await talkAction.TalkToNpcAsync(player, npc).ConfigureAwait(false);
+                return true;
+            }
+            return false;
+        });
+
+        // 获得BUFF（Elf Soldier）
+        _luaEngine.RegisterFunction("get_buff", async (_, _) =>
+        {
+            try
+            {
+                var buffAction = new MUnique.OpenMU.GameLogic.PlayerActions.Quests.ElfSoldierBuffRequestAction();
+                await buffAction.RequestBuffAsync(player).ConfigureAwait(false);
+                return true;
+            }
+            catch { return false; }
+        });
+
+        // 拾取附近物品
+        _luaEngine.RegisterFunction("pickup_nearby", async (_, _) =>
+        {
+            var pos = adapter.GetPlayerPosition();
+            var map = adapter.GetCurrentMap();
+            if (map is null) return false;
+            var drops = map.GetDropsInRange(pos, 8);
+            foreach (var drop in drops)
+            {
+                try { await adapter.PickupItemAsync(drop.Id).ConfigureAwait(false); return true; }
+                catch { }
+            }
+            return false;
+        });
+
+        // 喝HP药水
+        _luaEngine.RegisterFunction("use_hp_potion", async (_, _) =>
+        {
+            var inv = player.Inventory;
+            if (inv is null) return false;
+            var potion = inv.Items.FirstOrDefault(i =>
+                i.Definition?.Group == 14 && i.Definition?.Number >= 1 && i.Definition?.Number <= 3 && i.Durability > 0);
+            if (potion is null) return false;
+            await adapter.ConsumeItemAsync(potion.ItemSlot).ConfigureAwait(false);
+            return true;
+        });
+
+        // 回城
+        _luaEngine.RegisterFunction("return_to_safezone", async (_, _) =>
+        {
+            await player.WarpToSafezoneAsync().ConfigureAwait(false);
+            return true;
+        });
+
+        // 条件函数：has_target
+        _luaEngine.RegisterFunction("has_target", (args, _) =>
+        {
+            var pos = adapter.GetPlayerPosition();
+            var map = adapter.GetCurrentMap();
+            var has = map?.GetAttackablesInRange(pos, 10).Any(m => m.IsAlive) ?? false;
+            return Task.FromResult(has);
+        });
+
+        // 条件函数：is_dead
+        _luaEngine.RegisterFunction("is_dead", (_, _) =>
+            Task.FromResult(adapter.GetCurrentHp() <= 0));
+
+        // 条件函数：in_safezone
+        _luaEngine.Globals["in_safezone"] = false; // Will be set per-tick via WorldState
+
+        player.Logger.LogInformation("[LuaEngine] Initialized with {Count} registered functions", _luaEngine.Globals.Count + 9);
+    }
 
     /// <summary>Initializes Fugu v4.0 components. Called by AiPlayerManager after AiPlayerLogic creation.</summary>
     public void InitializeFuguComponents(Knowledge.SharedMemoryLayer sharedMemory, Decision.FuguKanbanBoard? kanban = null, string? sftWeightsPath = null)
