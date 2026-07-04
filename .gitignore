@@ -319,3 +319,9 @@ src/AdminPanel/wwwroot/content/js/app.js.map
 
 # Mac OS filesystem files
 .DS_Store
+
+# AI Player 运行时产物 — 按角色 ID 生成的 goals/hotspots,不应入版本库
+# 历史上 171 个此类 JSON 被误提交,已通过 git rm --cached 移除跟踪
+src/Startup/aiplayer_data/goals_*.json
+src/Startup/aiplayer_data/_*_hotspots.json
+src/Startup/aiplayer_data/_*_hotspots.json.tmp
