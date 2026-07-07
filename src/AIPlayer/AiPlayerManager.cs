@@ -130,7 +130,7 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
         this._eventWatcher = new EventWatcherService(gameContext, this, logger);
 
         // 创建 AI 角色系统（Phase 0）
-        this.InitializeAiSystem(gameContext);
+        this.InitializeAiSystem();
     }
 
     /// <summary>
@@ -152,6 +152,9 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
             this._logger = logger;
         }
         KnowledgeLoader.Load();
+
+        // 创建 AI 角色系统（Phase 0）— 延迟初始化，等待 Context 就绪
+        this.InitializeAiSystem();
     }
 
     private readonly IGameServerContextResolver? _delayedContextResolver;
@@ -176,10 +179,7 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
                     this.EnsureOapsInitialized();
 
                     // Phase 0: AI 角色系统初始化（延迟初始化场景）
-                    if (this._aiHost is null)
-                    {
-                        this.InitializeAiSystem(ctx);
-                    }
+                    // InitializeAiSystem 通过延时 Task 自动触发，此处不再重复调用
                 }
             }
 
@@ -1357,35 +1357,47 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
 
     /// <summary>
     /// 初始化 AI 角色系统 — 创建 AiHost 和 9 个 AI 角色。
-    /// Phase 0 新增。
+    /// Phase 0 新增。延迟等待 IGameContext 就绪后自动启动。
     /// </summary>
-    private void InitializeAiSystem(IGameContext gameContext)
+    private void InitializeAiSystem()
     {
-        try
+        _ = Task.Run(async () =>
         {
-            this._aiHost = new AiHost(gameContext, this._logger as ILogger<AiHost> ?? new Microsoft.Extensions.Logging.Abstractions.NullLogger<AiHost>());
-            this._aiTimer = new Timer(this.AiTimerTick, null, TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(200));
-
-            // 延迟创建 AI 角色（等待地图就绪）
-            _ = Task.Run(async () =>
+            try
             {
-                await Task.Delay(8000);
-                try
+                // 等待 IGameContext 可用
+                IGameContext ctx;
+                while (true)
                 {
-                    await this.CreateDefaultAiTeamAsync(gameContext);
+                    try
+                    {
+                        ctx = this.Context;
+                        break;
+                    }
+                    catch
+                    {
+                        await Task.Delay(1000);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    this._logger.LogWarning(ex, "[AiSystem] 创建 AI 角色失败（服务器可能尚未完全就绪）");
-                }
-            });
 
-            this._logger.LogInformation("[AiSystem] AI 角色系统已启动（Phase 0）");
-        }
-        catch (Exception ex)
-        {
-            this._logger.LogWarning(ex, "[AiSystem] 初始化 AI 角色系统失败");
-        }
+                // 创建 AiHost
+                var logger = this._logger as ILogger<AiHost> ?? new Microsoft.Extensions.Logging.Abstractions.NullLogger<AiHost>();
+                this._aiHost = new AiHost(ctx, logger);
+
+                // 启动 AI 定时器
+                this._aiTimer = new Timer(this.AiTimerTick, null, TimeSpan.FromSeconds(3), TimeSpan.FromMilliseconds(200));
+
+                // 延迟创建 9 个 AI 角色（等待地图就绪）
+                await Task.Delay(8000);
+                await this.CreateDefaultAiTeamAsync(ctx);
+
+                this._logger.LogInformation("[AiSystem] AI 角色系统已启动（Phase 0）");
+            }
+            catch (Exception ex)
+            {
+                this._logger.LogWarning(ex, "[AiSystem] 初始化 AI 角色系统失败");
+            }
+        });
     }
 
     /// <summary>

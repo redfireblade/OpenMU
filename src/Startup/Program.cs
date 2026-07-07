@@ -209,21 +209,8 @@ internal sealed class Program : IDisposable
                             bots.Add((name, classId, mapId, (string?)null, dir, 1));
                         }
                     }
-                    this._logger.Information("Generating {Count} AI bots across {Maps} maps...", bots.Count, maps.Length);
-                    foreach (var (name, classId, mapId, botScriptPath, direction, level) in bots)
-                    {
-                        var config = new MUnique.OpenMU.AIPlayer.AiPlayerCreateConfig(name, classId, mapId, botScriptPath, direction);
-                        var result = await aiService.CreateAiPlayerAsync(config).ConfigureAwait(false);
-                        if (result.Success && result.PlayerId.HasValue)
-                        {
-                            this._logger.Information("Auto-created AI player {Name}(class={ClassId}) ID {Id} Lv.{Level} on map {Map} dir={Dir} script={Script}.",
-                                name, classId, result.PlayerId, level, mapId, direction, botScriptPath ?? "none");
-                        }
-                        else
-                        {
-                            this._logger.Warning("Failed to auto-create AI player {Name}: {Error}", name, result.ErrorMessage);
-                        }
-                    }
+                    this._logger.Information("Skipping legacy AI player creation (Phase 0: using AiHost instead)");
+                    // Phase 0: 旧 AiPlayer 系统已废弃，改用 AiHost 创建 AiEntity
 
                     // Log KG status from DI-registered singleton
                     try
