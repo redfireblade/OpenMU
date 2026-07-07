@@ -174,6 +174,12 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
 
                     // OAPS 学习系统自动初始化
                     this.EnsureOapsInitialized();
+
+                    // Phase 0: AI 角色系统初始化（延迟初始化场景）
+                    if (this._aiHost is null)
+                    {
+                        this.InitializeAiSystem(ctx);
+                    }
                 }
             }
 
