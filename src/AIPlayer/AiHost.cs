@@ -70,13 +70,13 @@ public sealed class AiHost : IDisposable
     /// </summary>
     public async ValueTask<AiEntity> CreateAsync(AiCreateConfig config, GameMap map)
     {
-        var persistence = this._gameContext.PersistenceContextProvider.CreateNewPlayerContext(this._gameContext.Configuration);
+        using var persistence = this._gameContext.PersistenceContextProvider.CreateNewPlayerContext(this._gameContext.Configuration);
         if (persistence == null)
             throw new InvalidOperationException("Cannot create persistence context");
 
         // 创建 MonsterDefinition
-        var definition = persistence.CreateNew<MonsterDefinition>();
-        definition.Number = 10000 + this._entities.Count;
+        var definition = persistence.CreateNew<MonsterDefinition>() ?? throw new InvalidOperationException("Cannot create MonsterDefinition");
+        definition.Number = (short)(10000 + this._entities.Count);
         definition.Designation = config.Name;
         definition.ObjectKind = NpcObjectKind.Monster;
         definition.NpcWindow = DataModel.Configuration.NpcWindow.Undefined;
@@ -89,11 +89,11 @@ public sealed class AiHost : IDisposable
         spawn.X1 = spawn.X2 = (byte)config.InitialPosition.X;
         spawn.Y1 = spawn.Y2 = (byte)config.InitialPosition.Y;
         spawn.Quantity = 1;
-        spawn.SpawnTrigger = DataModel.Configuration.SpawnTrigger.Automatic;
+        spawn.SpawnTrigger = SpawnTrigger.Automatic;
 
         var entity = new AiEntity(
             spawn, definition, map,
-            null, null, this._gameContext.PlugInManager,
+            null!, null!, this._gameContext.PlugInManager,
             config.Name, config.ClassNumber, config.Level);
 
         // 设置基础属性
@@ -133,7 +133,8 @@ public sealed class AiHost : IDisposable
     public async ValueTask RemoveAsync(AiEntity entity)
     {
         this._entities.Remove(entity);
-        await entity.CurrentMap?.RemoveAsync(entity)!;
+        if (entity.CurrentMap is not null)
+            await entity.CurrentMap.RemoveAsync(entity);
         entity.Dispose();
     }
 

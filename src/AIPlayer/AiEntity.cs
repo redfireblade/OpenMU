@@ -4,7 +4,6 @@
 
 namespace MUnique.OpenMU.AIPlayer;
 
-using MUnique.OpenMU.AttributeSystem;
 using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.DataModel.Entities;
 using MUnique.OpenMU.GameLogic;
@@ -18,52 +17,38 @@ using Nito.AsyncEx;
 
 /// <summary>
 /// AI 角色实体 — 服务端自主运行，不依赖客户端连接。
-/// 继承 AttackableNpcBase 以复用战斗和 AOI 系统。
+/// 继承 AttackableNpcBase 以复用战斗、血量、死亡、AOI 系统。
+/// 实现 IBucketMapObserver 以感知周围环境。
 /// </summary>
-public sealed class AiEntity : AttackableNpcBase, IBucketMapObserver, ISupportWalk
+public sealed class AiEntity : AttackableNpcBase, IAttacker, IBucketMapObserver, ISupportWalk
 {
     private readonly Walker _walker;
     private readonly AsyncLock _moveLock = new();
+    private readonly FullGridNetwork _network;
 
-    /// <summary>
-    /// Gets the AI 唯一标识。
-    /// </summary>
+    /// <summary>唯一标识。</summary>
     public Guid AiId { get; } = Guid.NewGuid();
 
-    /// <summary>
-    /// Gets the 角色名称。
-    /// </summary>
+    /// <summary>角色名称。</summary>
     public string Name { get; }
 
-    /// <summary>
-    /// Gets the 职业编号 0=DW, 4=DK, 8=Elf。
-    /// </summary>
+    /// <summary>职业编号 0=DW 4=DK 8=Elf。</summary>
     public byte ClassNumber { get; }
 
-    /// <summary>
-    /// Gets or sets the 等级。
-    /// </summary>
+    /// <summary>等级。</summary>
     public int Level { get; set; } = 1;
 
-    /// <summary>
-    /// Gets the 感知层。
-    /// </summary>
+    /// <summary>经验值。</summary>
+    public long Experience { get; set; }
+
+    /// <inheritdoc/>
+    public ComboStateMachine? ComboState => null;
+
+    /// <summary>感知层。</summary>
     public AiPerception Perception { get; }
 
-    /// <summary>
-    /// Gets the 主循环。
-    /// </summary>
+    /// <summary>主循环。</summary>
     public AiLoop Loop { get; }
-
-    /// <summary>
-    /// Gets the 行走引擎。
-    /// </summary>
-    public Walker Walker => this._walker;
-
-    /// <summary>
-    /// Gets the 移动锁。
-    /// </summary>
-    public AsyncLock MoveLock => this._moveLock;
 
     /// <inheritdoc/>
     public bool IsWalking => this._walker.CurrentTarget != default;
@@ -110,19 +95,14 @@ public sealed class AiEntity : AttackableNpcBase, IBucketMapObserver, ISupportWa
         this.Name = name;
         this.ClassNumber = classNumber;
         this.Level = level;
-        this._walker = new Walker(this, map);
+        this._network = new FullGridNetwork(allowDiagonals: true);
+        this._walker = new Walker(this, () => this.StepDelay);
         this.Perception = new AiPerception(this);
         this.Loop = new AiLoop(this);
     }
 
     /// <inheritdoc/>
-    public override async ValueTask ApplyPoisonDamageAsync(IAttacker attacker, uint damage)
-    {
-        if (this.MagicEffectList.ActiveEffects.OfType<PoisonMagicEffect>().FirstOrDefault() is { } poison)
-        {
-            await poison.UpdateAsync(damage).ConfigureAwait(false);
-        }
-    }
+    public override async ValueTask ApplyPoisonDamageAsync(IAttacker attacker, uint damage) { await ValueTask.CompletedTask; }
 
     /// <inheritdoc/>
     public override async ValueTask ApplyBleedingDamageAsync(IAttacker attacker, uint damage)
@@ -131,8 +111,7 @@ public sealed class AiEntity : AttackableNpcBase, IBucketMapObserver, ISupportWa
         if (this.Health <= 0)
         {
             this.Health = 0;
-            this.IsAlive = false;
-            await this.CurrentMap!.RemoveAsync(this).ConfigureAwait(false);
+            await this.OnDeathAsync(attacker).ConfigureAwait(false);
         }
     }
 
@@ -158,8 +137,7 @@ public sealed class AiEntity : AttackableNpcBase, IBucketMapObserver, ISupportWa
         var map = this.CurrentMap;
         if (map is null) return false;
 
-        using var pathFinder = new PathFinder(map.Terrain.AIgrid);
-        var path = pathFinder.FindPath(this.Position, target);
+        var path = this.FindPath(target, map);
         if (path is null || path.Count == 0) return false;
 
         var walkMap = map.Terrain.WalkMap;
@@ -171,94 +149,78 @@ public sealed class AiEntity : AttackableNpcBase, IBucketMapObserver, ISupportWa
 
         await this._walker.InitializeWalkToAsync(finalTarget, steps);
         await map.MoveAsync(this, finalTarget, this._moveLock, MoveType.Walk);
-        this._walker.StartWalkAsync(CancellationToken.None);
+        await this._walker.StartWalkAsync(Guid.NewGuid());
         return true;
     }
 
-    /// <summary>停止行走。</summary>
     public async ValueTask StopWalkingAsync() => await this._walker.StopAsync();
 
-    private WalkingStep[] BuildSteps(List<Point> nodes)
+    private IList<PathResultNode>? FindPath(Point target, GameMap map)
+    {
+        var pf = new PathFinder(this._network);
+        pf.ResetPathFinder();
+        return pf.FindPath(this.Position, target, map.Terrain.AIgrid, this.CanWalkOnSafezone);
+    }
+
+    private WalkingStep[] BuildSteps(IList<PathResultNode> nodes)
     {
         var steps = new WalkingStep[nodes.Count];
         var prev = this.Position;
         for (int i = 0; i < nodes.Count; i++)
         {
-            var dir = prev.GetDirectionTo(nodes[i]);
-            steps[i] = new WalkingStep(prev, nodes[i], dir);
-            prev = nodes[i];
+            var current = nodes[i].Point;
+            var dir = prev.GetDirectionTo(current);
+            steps[i] = new WalkingStep(prev, current, dir);
+            prev = current;
         }
         return steps;
     }
 
     // ===== AOI 感知 =====
 
-    /// <inheritdoc/>
     public async ValueTask LocateableAddedAsync(ILocateable item)
     {
-        if (item is Monster { IsAlive: true } monster
-            && !monster.IsAtSafezone()
-            && monster.Definition?.NpcWindow == DataModel.Configuration.NpcWindow.Undefined
-            && monster.Definition?.ObjectKind == NpcObjectKind.Monster)
-        {
-            this.Perception.AddMonster(monster);
-        }
-        if (item is NonPlayerCharacter npc && npc.Definition?.Number is >= 200 and <= 300)
-        {
-            this.Perception.AddNpc(npc);
-        }
-        if (item is DroppedItem || item is DroppedMoney)
-        {
+        if (item is Monster { IsAlive: true } m
+            && !m.IsAtSafezone()
+            && m.Definition?.NpcWindow == DataModel.Configuration.NpcWindow.Undefined
+            && m.Definition?.ObjectKind == NpcObjectKind.Monster)
+            this.Perception.AddMonster(m);
+        else if (item is DroppedItem || item is DroppedMoney)
             this.Perception.AddDrop(item);
-        }
         await ValueTask.CompletedTask;
     }
 
-    /// <inheritdoc/>
     public async ValueTask LocateableRemovedAsync(ILocateable item)
     {
         this.Perception.Remove(item);
         await ValueTask.CompletedTask;
     }
 
-    /// <inheritdoc/>
-    public async ValueTask NewLocateablesInScopeAsync(IEnumerable<ILocateable> newObjects)
+    public async ValueTask NewLocateablesInScopeAsync(IEnumerable<ILocateable> objects)
     {
-        foreach (var obj in newObjects) await this.LocateableAddedAsync(obj);
+        foreach (var obj in objects) await this.LocateableAddedAsync(obj);
     }
 
-    /// <inheritdoc/>
-    public async ValueTask LocateablesOutOfScopeAsync(IEnumerable<ILocateable> oldObjects)
+    public async ValueTask LocateablesOutOfScopeAsync(IEnumerable<ILocateable> objects)
     {
-        foreach (var obj in oldObjects) await this.LocateableRemovedAsync(obj);
+        foreach (var obj in objects) await this.LocateableRemovedAsync(obj);
     }
 
-    /// <inheritdoc/>
-    public bool CanWalkOn(Point target)
-    {
-        return this.CurrentMap?.Terrain.AIgrid[target.X, target.Y] == 1;
-    }
+    public bool CanWalkOn(Point target) => this.CurrentMap?.Terrain.AIgrid[target.X, target.Y] == 1;
 
-    /// <inheritdoc/>
     public ValueTask<int> GetDirectionsAsync(Memory<Direction> directions) => this._walker.GetDirectionsAsync(directions);
-
-    /// <inheritdoc/>
     public ValueTask<int> GetStepsAsync(Memory<WalkingStep> steps) => this._walker.GetStepsAsync(steps);
 
-    /// <summary>能否行动。</summary>
     public bool CanAct() => this.IsAlive && !this.IsTeleporting;
 
-    /// <summary>初始化实体：加入地图。</summary>
+    /// <summary>初始化：加入地图。</summary>
     public async ValueTask InitializeAsync()
     {
         if (this.CurrentMap is not null)
         {
             await this.CurrentMap.AddAsync(this);
-            this.IsAlive = true;
-            this.Health = (int)(this.Attributes?[Stats.MaximumHealth] ?? 1);
         }
     }
 
-    /// <inheritdoc/>
     public override string ToString() => $"[{this.Name}] Lv{this.Level} at {this.Position}";
 }

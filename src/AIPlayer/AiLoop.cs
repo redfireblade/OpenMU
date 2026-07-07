@@ -5,6 +5,7 @@
 namespace MUnique.OpenMU.AIPlayer;
 
 using Microsoft.Extensions.Logging;
+using MUnique.OpenMU.Pathfinding;
 
 /// <summary>
 /// AI 角色主循环 — 感知→决策→行动。
