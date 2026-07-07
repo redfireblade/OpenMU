@@ -180,14 +180,50 @@ public sealed class AiEntity : AttackableNpcBase, IAttacker, IBucketMapObserver,
 
     public async ValueTask LocateableAddedAsync(ILocateable item)
     {
-        if (item is Monster { IsAlive: true } m
-            && !m.IsAtSafezone()
-            && m.Definition?.NpcWindow == DataModel.Configuration.NpcWindow.Undefined
-            && m.Definition?.ObjectKind == NpcObjectKind.Monster)
+        if (item is Monster m && IsValidMonster(m))
             this.Perception.AddMonster(m);
         else if (item is DroppedItem || item is DroppedMoney)
             this.Perception.AddDrop(item);
         await ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// 综合判断目标是否为有效的野外怪物（不是守卫/NPC/安全区内目标）。
+    /// </summary>
+    private static bool IsValidMonster(Monster m)
+    {
+        if (!m.IsAlive) return false;
+        if (m.IsAtSafezone()) return false;
+
+        var def = m.Definition;
+        if (def is null) return false;
+
+        // 1. 必须是怪物类型
+        if (def.ObjectKind != NpcObjectKind.Monster) return false;
+
+        // 2. 不能有 NPC 功能窗口（Guard=15, Merchant=3, Vault=11 等）
+        if (def.NpcWindow != DataModel.Configuration.NpcWindow.Undefined) return false;
+
+        // 3. 守卫编号黑名单
+        var guardIds = new HashSet<short> { 247, 249, 251, 253, 254, 255, 240 };
+        if (guardIds.Contains(def.Number)) return false;
+
+        // 4. 守卫名称关键字过滤 (Designation 是 LocalizedString 结构体)
+        try
+        {
+            string name = def.Designation;
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                var upper = name.ToUpperInvariant();
+                if (upper.Contains("GUARD") || upper.Contains("SOLDIER")
+                    || upper.Contains("BOWGIRL") || upper.Contains("SIEGEWARFARE")
+                    || upper.Contains("SENATUS"))
+                    return false;
+            }
+        }
+        catch { /* 名称读取失败时放行 */ }
+
+        return true;
     }
 
     public async ValueTask LocateableRemovedAsync(ILocateable item)
