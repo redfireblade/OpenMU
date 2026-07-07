@@ -99,6 +99,9 @@ public sealed class AiHost : IDisposable
         // 设置基础属性
         SetupAttributes(entity, config);
 
+        // 设置出生坐标
+        entity.InitialPosition = config.InitialPosition;
+
         this._entities.Add(entity);
         await entity.InitializeAsync();
 

@@ -249,11 +249,24 @@ public sealed class AiEntity : AttackableNpcBase, IAttacker, IBucketMapObserver,
 
     public bool CanAct() => this.IsAlive && !this.IsTeleporting;
 
-    /// <summary>初始化：加入地图。</summary>
+    /// <summary>初始出生坐标（用于 InitializeAsync 前设置 Position）。</summary>
+    public Point InitialPosition { get; set; }
+
+    /// <summary>初始化：设置出生位置并加入地图。</summary>
     public async ValueTask InitializeAsync()
     {
         if (this.CurrentMap is not null)
         {
+            // 找到有效的出生点
+            if (this.InitialPosition != default)
+            {
+                this.Position = this.InitialPosition;
+            }
+            else
+            {
+                base.Initialize(); // 使用 SpawnArea 随机找出生点
+            }
+
             await this.CurrentMap.AddAsync(this);
         }
     }
