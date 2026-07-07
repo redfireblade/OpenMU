@@ -76,7 +76,7 @@ public sealed class AiHost : IDisposable
 
         // 创建 MonsterDefinition
         var definition = persistence.CreateNew<MonsterDefinition>() ?? throw new InvalidOperationException("Cannot create MonsterDefinition");
-        definition.Number = (short)(10000 + this._entities.Count);
+        definition.Number = 2; // 使用客户端已知的怪物编号(Budge Dragon)
         definition.Designation = config.Name;
         definition.ObjectKind = NpcObjectKind.Monster;
         definition.NpcWindow = DataModel.Configuration.NpcWindow.Undefined;
