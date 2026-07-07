@@ -24,6 +24,29 @@ public class GameMapTerrain
     public GameMapTerrain(GameMapDefinition definition)
         : this(definition?.TerrainData)
     {
+        // 安全区硬编码：洛伦西亚全图（前4次工作状态）
+        if (definition?.Number == 0)
+        {
+            MarkSafeRectangle(110, 80, 200, 170); // Lorencia 大安全区
+        }
+        else if (definition?.Number == 3) // Noria
+        {
+            MarkSafeRectangle(165, 110, 185, 140);
+        }
+        else if (definition?.Number == 2) // Devias
+        {
+            MarkSafeRectangle(220, 40, 235, 65);
+        }
+    }
+
+    private void MarkSafeRectangle(int x1, int y1, int x2, int y2)
+    {
+        for (int x = x1; x <= x2 && x < 256; x++)
+        for (int y = y1; y <= y2 && y < 256; y++)
+        {
+            this.SafezoneMap[x, y] = true;
+            this.UpdateAiGridValue((byte)x, (byte)y);
+        }
     }
 
     /// <summary>
@@ -34,7 +57,10 @@ public class GameMapTerrain
     {
         if (terrainData is { })
         {
-            this.ReadTerrainData(terrainData.AsSpan(3));
+            // .att 文件格式：3字节头 + 65536字节服务端地形 + 65536字节客户端纹理
+            // 只读取第一层（服务端地形），避免第二层客户端纹理数据覆盖安全区标记
+            var firstLayerLength = Math.Min(terrainData.Length - 3, 65536);
+            this.ReadTerrainData(terrainData.AsSpan(3, firstLayerLength));
         }
         else
         {
@@ -59,76 +85,45 @@ public class GameMapTerrain
 
     /// <summary>
     /// Gets a random drop coordinate at the specified point in the specified radius.
-    /// 如果指定半径内无可走格子，逐步扩大搜索半径（最多到 50 格），确保返回可走坐标。
-    /// 修复：出生/重生落在喷泉等不可走装饰物上的 BUG。
     /// </summary>
     /// <param name="point">The target point.</param>
     /// <param name="maximumRadius">The maximum radius around the specified coordinate.</param>
     /// <returns>The random drop coordinate.</returns>
     public Point GetRandomCoordinate(Point point, byte maximumRadius)
     {
-        return this.GetRandomCoordinate(point, maximumRadius, false);
+        byte tempx = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
+        byte tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
+        int i = 0;
+        while (!this.WalkMap[tempx, tempy] && i < 20)
+        {
+            tempx = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
+            tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
+            i++;
+        }
+
+        if (i == 20)
+        {
+            return point;
+        }
+
+        return new Point(tempx, tempy);
     }
 
     /// <summary>
-    /// 获取安全区内的可走随机坐标。优先在安全区内找，如果安全区内不可走则按普通逻辑。
-    /// 用于玩家出生/重生，保证不在非安全区外重生。
+    /// Gets a random safezone coordinate near the specified point.
     /// </summary>
     public Point GetRandomSafezoneCoordinate(Point point, byte maximumRadius)
     {
-        return this.GetRandomCoordinate(point, maximumRadius, true);
-    }
-
-    private Point GetRandomCoordinate(Point point, byte maximumRadius, bool requireSafezone)
-    {
-        // 快速尝试：在给定半径内随机找可走格
-        for (int attempt = 0; attempt < 50; attempt++)
+        for (int r = 0; r <= maximumRadius; r++)
         {
-            byte tempx = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
-            byte tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
-            if (this.WalkMap[tempx, tempy] && (!requireSafezone || this.SafezoneMap[tempx, tempy]))
+            for (int attempt = 0; attempt < 30; attempt++)
             {
-                return new Point(tempx, tempy);
+                byte tx = (byte)Rand.NextInt(Math.Max(0, point.X - r), Math.Min(255, point.X + r + 1));
+                byte ty = (byte)Rand.NextInt(Math.Max(0, point.Y - r), Math.Min(255, point.Y + r + 1));
+                if (this.WalkMap[tx, ty] && this.SafezoneMap[tx, ty])
+                    return new Point(tx, ty);
             }
         }
-
-        // 50 次还没找到 → 逐步扩大半径扫描（从 2 格到 50 格）
-        for (int radius = Math.Max(maximumRadius + 1, 2); radius <= 50; radius++)
-        {
-            for (int attempt = 0; attempt < 60; attempt++)
-            {
-                byte tempx = (byte)Rand.NextInt(Math.Max(0, point.X - radius), Math.Min(255, point.X + radius + 1));
-                byte tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - radius), Math.Min(255, point.Y + radius + 1));
-                if (this.WalkMap[tempx, tempy] && (!requireSafezone || this.SafezoneMap[tempx, tempy]))
-                {
-                    return new Point(tempx, tempy);
-                }
-            }
-        }
-
-        // 要求安全区但实在找不到 → 降级为不要求安全区
-        if (requireSafezone)
-        {
-            return this.GetRandomCoordinate(point, maximumRadius, false);
-        }
-
-        // 终极退路：全地图线性扫描找最近可走格
-        for (int r = 1; r <= 100; r++)
-        {
-            for (int dx = -r; dx <= r; dx++)
-            {
-                for (int dy = -r; dy <= r; dy++)
-                {
-                    int x = point.X + dx;
-                    int y = point.Y + dy;
-                    if (x >= 0 && x < 256 && y >= 0 && y < 256 && this.WalkMap[x, y])
-                    {
-                        return new Point((byte)x, (byte)y);
-                    }
-                }
-            }
-        }
-
         return point;
     }
 
@@ -154,10 +149,8 @@ public class GameMapTerrain
             byte x = (byte)(i & 0xFF);
             byte y = (byte)((i >> 8) & 0xFF);
             byte value = data[i];
-            // 原始 .att 地形数据中，值 0=空地, 1=安全区, 2-9=可行走地面纹理
-            // 值 10+ 包括装饰物(树/石头/喷泉)和边缘挡墙，但服务器端统一设为可走
-            // 避免玩家卡在看似可走的位置（如仙踪林树木间的缝隙）
-            this.WalkMap[x, y] = value != 0xFF;
+            // 匹配客户端可视地形：0xFF=墙壁, 5=水面, 10+=障碍物 → 不可走
+            this.WalkMap[x, y] = value != 0xFF && value != 5 && value < 10;
             this.SafezoneMap[x, y] = value == 1;
             this.UpdateAiGridValue(x, y);
         }

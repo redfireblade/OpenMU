@@ -12,3 +12,4 @@ using System.Runtime.CompilerServices;
 
 [assembly: InternalsVisibleTo("MUnique.OpenMU.Tests")]
 [assembly: InternalsVisibleTo("MUnique.OpenMU.Persistence.Initialization")]
+[assembly: InternalsVisibleTo("MUnique.OpenMU.AIPlayer")]

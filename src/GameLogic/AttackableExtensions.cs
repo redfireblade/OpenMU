@@ -49,6 +49,12 @@ public static class AttackableExtensions
     /// </returns>
     public static async ValueTask<HitInfo> CalculateDamageAsync(this IAttacker attacker, IAttackable defender, SkillEntry? skill, bool isCombo, double damageFactor = 1.0)
     {
+        // 安全区保护：目标在安全区内不受伤害
+        if (defender is ILocateable locatable && locatable.IsAtSafezone())
+        {
+            return new HitInfo(0, 0, DamageAttributes.Undefined);
+        }
+
         if (!attacker.IsAttackSuccessfulTo(defender))
         {
             return new HitInfo(0, 0, DamageAttributes.Undefined);

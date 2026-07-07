@@ -39,6 +39,7 @@
   <ItemGroup>
     <ProjectReference Include="..\DataModel\MUnique.OpenMU.DataModel.csproj" />
     <ProjectReference Include="..\GameLogic\MUnique.OpenMU.GameLogic.csproj" />
+    <ProjectReference Include="..\GameServer\MUnique.OpenMU.GameServer.csproj" />
     <ProjectReference Include="..\Interfaces\MUnique.OpenMU.Interfaces.csproj" />
     <ProjectReference Include="..\Orchestrator\MUnique.OpenMU.Orchestrator.csproj" />
     <ProjectReference Include="..\Persistence\MUnique.OpenMU.Persistence.csproj" />
