@@ -43,6 +43,12 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
     /// <summary>OAPS 旁观者系统 — 包装 PBO 采集行为事件。</summary>
     private OapsObserver? _oapsObserver;
 
+    /// <summary>AI 角色管理器（Phase 0 新增）。</summary>
+    private AiHost? _aiHost;
+
+    /// <summary>AI 角色定时器 — 驱动 AI Tick。</summary>
+    private Timer? _aiTimer;
+
     /// <summary>OAPS 知识桥接器 — 学习闭环协调。</summary>
     private OapsKnowledgeBridge? _knowledgeBridge;
 
@@ -122,6 +128,9 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
 
         // 启动群体级事件活动广播器（依赖已就绪的 IGameContext）
         this._eventWatcher = new EventWatcherService(gameContext, this, logger);
+
+        // 创建 AI 角色系统（Phase 0）
+        this.InitializeAiSystem(gameContext);
     }
 
     /// <summary>
@@ -490,6 +499,10 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
         // 停止 PBO 观察循环
         try { _pboCts?.Cancel(); } catch { }
         _pboCts?.Dispose();
+
+        // Phase 0: AI 角色系统清理
+        this._aiTimer?.Dispose();
+        this._aiHost?.Dispose();
     }
 
     /// <summary>
@@ -1334,5 +1347,98 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
     {
         EnsureOapsInitialized();
         _behaviorEventStore?.Save();
+    }
+
+    /// <summary>
+    /// 初始化 AI 角色系统 — 创建 AiHost 和 9 个 AI 角色。
+    /// Phase 0 新增。
+    /// </summary>
+    private void InitializeAiSystem(IGameContext gameContext)
+    {
+        try
+        {
+            this._aiHost = new AiHost(gameContext, this._logger as ILogger<AiHost> ?? new Microsoft.Extensions.Logging.Abstractions.NullLogger<AiHost>());
+            this._aiTimer = new Timer(this.AiTimerTick, null, TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(200));
+
+            // 延迟创建 AI 角色（等待地图就绪）
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(8000);
+                try
+                {
+                    await this.CreateDefaultAiTeamAsync(gameContext);
+                }
+                catch (Exception ex)
+                {
+                    this._logger.LogWarning(ex, "[AiSystem] 创建 AI 角色失败（服务器可能尚未完全就绪）");
+                }
+            });
+
+            this._logger.LogInformation("[AiSystem] AI 角色系统已启动（Phase 0）");
+        }
+        catch (Exception ex)
+        {
+            this._logger.LogWarning(ex, "[AiSystem] 初始化 AI 角色系统失败");
+        }
+    }
+
+    /// <summary>
+    /// 创建 9 个 AI 角色（3 DW, 3 DK, 3 Elf），初始到洛伦西亚。
+    /// </summary>
+    private async ValueTask CreateDefaultAiTeamAsync(IGameContext gameContext)
+    {
+        var map = await gameContext.GetMapAsync(0);
+        if (map is null)
+        {
+            this._logger.LogWarning("[AiSystem] 地图 0 (Lorencia) 未就绪，跳过 AI 创建");
+            return;
+        }
+
+        var configs = new[]
+        {
+            ("AIDW00", (byte)0), ("AIDW01", (byte)0), ("AIDW02", (byte)0),
+            ("AIDK00", (byte)4), ("AIDK01", (byte)4), ("AIDK02", (byte)4),
+            ("AIElf00", (byte)8), ("AIElf01", (byte)8), ("AIElf02", (byte)8),
+        };
+
+        var positions = new[] {
+            new MUnique.OpenMU.Pathfinding.Point(140, 120),
+            new MUnique.OpenMU.Pathfinding.Point(145, 125),
+            new MUnique.OpenMU.Pathfinding.Point(150, 118),
+            new MUnique.OpenMU.Pathfinding.Point(138, 130),
+            new MUnique.OpenMU.Pathfinding.Point(142, 135),
+            new MUnique.OpenMU.Pathfinding.Point(148, 128),
+            new MUnique.OpenMU.Pathfinding.Point(135, 122),
+            new MUnique.OpenMU.Pathfinding.Point(152, 132),
+            new MUnique.OpenMU.Pathfinding.Point(143, 115),
+        };
+
+        for (int i = 0; i < configs.Length && i < positions.Length; i++)
+        {
+            var (name, classNumber) = configs[i];
+            try
+            {
+                var entity = await this._aiHost!.CreateAsync(
+                    new AiCreateConfig(name, classNumber, 50, 0, positions[i]),
+                    map);
+                this._logger.LogDebug("[AiSystem] 创建 AI 角色 {Name}(class={Class}) at ({X},{Y})",
+                    name, classNumber, positions[i].X, positions[i].Y);
+            }
+            catch (Exception ex)
+            {
+                this._logger.LogWarning(ex, "[AiSystem] 创建 AI 角色 {Name} 失败", name);
+            }
+        }
+
+        this._logger.LogInformation("[AiSystem] AI 角色创建完成，共 {Count} 个", this._aiHost?.Count ?? 0);
+    }
+
+    /// <summary>
+    /// AI 定时器 Tick — 分帧驱动 AI 决策。
+    /// </summary>
+    private void AiTimerTick(object? state)
+    {
+        if (this._aiHost is null) return;
+        this._aiHost.OnGameTick();
     }
 }
