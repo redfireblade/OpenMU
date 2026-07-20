@@ -1160,10 +1160,37 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
         this.IsAlive = true;
 
         await this.CurrentMap!.AddAsync(this).ConfigureAwait(false);
-        if (!this.CurrentMap.Terrain.WalkMap[this.SelectedCharacter.PositionX, this.SelectedCharacter.PositionY]
-            || !this.CurrentMap.Terrain.SafezoneMap[this.SelectedCharacter.PositionX, this.SelectedCharacter.PositionY])
+        var posX = this.SelectedCharacter.PositionX;
+        var posY = this.SelectedCharacter.PositionY;
+        var terrain = this.CurrentMap.Terrain;
+        if (!terrain.WalkMap[posX, posY] || !terrain.SafezoneMap[posX, posY])
         {
-            await this.WarpToSafezoneAsync().ConfigureAwait(false);
+            // 当前坐标不可行走或不在安全区 → 在安全区内找一个可行走的格子
+            bool found = false;
+            var rand = new Random();
+            for (int radius = 0; radius < 20 && !found; radius++)
+            {
+                for (int dx = -radius; dx <= radius && !found; dx++)
+                {
+                    for (int dy = -radius; dy <= radius && !found; dy++)
+                    {
+                        int tx = posX + dx;
+                        int ty = posY + dy;
+                        if (tx >= 0 && tx < 256 && ty >= 0 && ty < 256
+                            && terrain.SafezoneMap[tx, ty]
+                            && terrain.WalkMap[tx, ty])
+                        {
+                            this.SelectedCharacter.PositionX = (byte)tx;
+                            this.SelectedCharacter.PositionY = (byte)ty;
+                            found = true;
+                        }
+                    }
+                }
+            }
+            if (!found)
+            {
+                try { await this.WarpToSafezoneAsync().ConfigureAwait(false); } catch { }
+            }
         }
 
         if (this.Summon?.Item1 is { IsAlive: true } summon)

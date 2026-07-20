@@ -5,6 +5,8 @@
 namespace MUnique.OpenMU.Persistence.Initialization;
 
 using System.ComponentModel.Design;
+using System.IO;
+using System.Reflection;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using MUnique.OpenMU.DataModel.Configuration;
@@ -227,7 +229,7 @@ public abstract class DataInitializationBase : IDataInitializationPlugIn
 
     private async ValueTask CreateConnectServerDefinitionAsync()
     {
-        var port = 44406;
+        var port = ReadServerConfigInt("ConnectServer", "StartPort", 44406);
         var clients = await this.Context.GetAsync<GameClientDefinition>().ConfigureAwait(false);
         foreach (var client in clients.OrderBy(c => c.Season))
         {
@@ -243,7 +245,7 @@ public abstract class DataInitializationBase : IDataInitializationPlugIn
 
     private async ValueTask CreateGameServerDefinitionsAsync(GameServerConfiguration gameServerConfiguration, int numberOfServers)
     {
-        var port = 55901;
+        var port = ReadServerConfigInt("GameServer", "StartPort", 55901);
         for (int i = 0; i < numberOfServers; i++)
         {
             var server = this.Context!.CreateNew<GameServerDefinition>();
@@ -277,7 +279,7 @@ public abstract class DataInitializationBase : IDataInitializationPlugIn
         var endPoint = this.Context.CreateNew<ChatServerEndpoint>();
         server.SetGuid(0);
         endPoint.Client = client;
-        endPoint.NetworkPort = 55980;
+        endPoint.NetworkPort = ReadServerConfigInt("ChatServer", "Port", 55980);
         server.Endpoints.Add(endPoint);
     }
 
@@ -307,5 +309,51 @@ public abstract class DataInitializationBase : IDataInitializationPlugIn
         var (type, param) = IpAddressResolverFactory.DetermineBestFittingResolver(Environment.GetCommandLineArgs());
         systemConfiguration.IpResolver = type;
         systemConfiguration.IpResolverParameter = param;
+    }
+
+    /// <summary>
+    /// 从 server_config.ini 读取整数值，文件不存在或节/键不存在时返回 defaultValue。
+    /// </summary>
+    private static int ReadServerConfigInt(string section, string key, int defaultValue)
+    {
+        try
+        {
+            var configPath = Path.Combine(
+                Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".",
+                "server_config.ini");
+            if (!File.Exists(configPath))
+                return defaultValue;
+
+            var lines = File.ReadAllLines(configPath);
+            var currentSection = string.Empty;
+            foreach (var line in lines)
+            {
+                var trimmed = line.Trim();
+                if (trimmed.StartsWith(';') || trimmed.StartsWith('#'))
+                    continue;
+                if (trimmed.StartsWith('[') && trimmed.EndsWith(']'))
+                {
+                    currentSection = trimmed[1..^1].Trim();
+                    continue;
+                }
+
+                var eqPos = trimmed.IndexOf('=');
+                if (eqPos > 0 && string.Equals(currentSection, section, StringComparison.OrdinalIgnoreCase))
+                {
+                    var k = trimmed[..eqPos].Trim();
+                    if (string.Equals(k, key, StringComparison.OrdinalIgnoreCase)
+                        && int.TryParse(trimmed[(eqPos + 1)..].Trim(), out var val))
+                    {
+                        return val;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // 忽略读取异常，使用默认值
+        }
+
+        return defaultValue;
     }
 }

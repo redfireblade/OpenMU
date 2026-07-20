@@ -1578,6 +1578,50 @@ internal sealed class Program : IDisposable
         var plugInManager = new PlugInManager(null, loggerFactory, serviceContainer, referenceHandler);
         plugInManager.DiscoverAndRegisterPlugInsOf<IDataInitializationPlugIn>();
         var initialization = plugInManager.GetStrategy<IDataInitializationPlugIn>(version) ?? throw new Exception("Data initialization plugin not found");
-        await initialization.CreateInitialDataAsync(3, true).ConfigureAwait(false);
+        var gameServerCount = ReadServerConfigInt("GameServer", "Count", 3);
+        await initialization.CreateInitialDataAsync((byte)gameServerCount, true).ConfigureAwait(false);
+    }
+
+    /// <summary>从 server_config.ini 读取整数值，文件不存在或节/键不存在时返回 defaultValue。</summary>
+    private static int ReadServerConfigInt(string section, string key, int defaultValue)
+    {
+        try
+        {
+            var configPath = Path.Combine(
+                Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".",
+                "server_config.ini");
+            if (!File.Exists(configPath))
+                return defaultValue;
+
+            var lines = File.ReadAllLines(configPath);
+            var currentSection = string.Empty;
+            foreach (var line in lines)
+            {
+                var trimmed = line.Trim();
+                if (trimmed.StartsWith(';') || trimmed.StartsWith('#'))
+                    continue;
+                if (trimmed.StartsWith('[') && trimmed.EndsWith(']'))
+                {
+                    currentSection = trimmed[1..^1].Trim();
+                    continue;
+                }
+
+                var eqPos = trimmed.IndexOf('=');
+                if (eqPos > 0 && string.Equals(currentSection, section, StringComparison.OrdinalIgnoreCase))
+                {
+                    var k = trimmed[..eqPos].Trim();
+                    if (string.Equals(k, key, StringComparison.OrdinalIgnoreCase)
+                        && int.TryParse(trimmed[(eqPos + 1)..].Trim(), out var val))
+                    {
+                        return val;
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return defaultValue;
     }
 }

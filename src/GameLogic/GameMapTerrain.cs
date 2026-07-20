@@ -24,19 +24,7 @@ public class GameMapTerrain
     public GameMapTerrain(GameMapDefinition definition)
         : this(definition?.TerrainData)
     {
-        // 安全区硬编码：洛伦西亚全图（前4次工作状态）
-        if (definition?.Number == 0)
-        {
-            MarkSafeRectangle(110, 80, 200, 170); // Lorencia 大安全区
-        }
-        else if (definition?.Number == 3) // Noria
-        {
-            MarkSafeRectangle(165, 110, 185, 140);
-        }
-        else if (definition?.Number == 2) // Devias
-        {
-            MarkSafeRectangle(220, 40, 235, 65);
-        }
+        // 安全区由 .att 文件定义 (value & 0x01) != 0 判定，无需硬编码
     }
 
     private void MarkSafeRectangle(int x1, int y1, int x2, int y2)
@@ -149,9 +137,10 @@ public class GameMapTerrain
             byte x = (byte)(i & 0xFF);
             byte y = (byte)((i >> 8) & 0xFF);
             byte value = data[i];
-            // 匹配客户端可视地形：0xFF=墙壁, 5=水面, 10+=障碍物 → 不可走
-            this.WalkMap[x, y] = value != 0xFF && value != 5 && value < 10;
-            this.SafezoneMap[x, y] = value == 1;
+            // 匹配客户端 TerrainWall 判定位掩码: 0x5C = NOMOVE(0x04)|NOGROUND(0x08)|WATER(0x10)|HEIGHT(0x40)
+            this.WalkMap[x, y] = value != 0xFF && (value & 0x5C) == 0;
+            // 安全区: 客户端判定 (v & 0x01) != 0，值 1/3/5/7 等都算安全区
+            this.SafezoneMap[x, y] = (value & 0x01) != 0;
             this.UpdateAiGridValue(x, y);
         }
     }
