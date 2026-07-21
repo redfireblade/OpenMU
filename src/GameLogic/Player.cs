@@ -1160,37 +1160,22 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
         this.IsAlive = true;
 
         await this.CurrentMap!.AddAsync(this).ConfigureAwait(false);
-        var posX = this.SelectedCharacter.PositionX;
-        var posY = this.SelectedCharacter.PositionY;
         var terrain = this.CurrentMap.Terrain;
-        if (!terrain.WalkMap[posX, posY] || !terrain.SafezoneMap[posX, posY])
+        var px = this.SelectedCharacter.PositionX;
+        var py = this.SelectedCharacter.PositionY;
+        System.Console.WriteLine($"[SpawnDebug] mapId={this.CurrentMap.Definition.Number} pos=({px},{py}) walk={terrain.WalkMap[px,py]} safe={terrain.SafezoneMap[px,py]}");
+        // 每次进入地图都使用 FindSpawnPoint 确保位置正确（不依赖 WalkMap 互补索引）
+        var spawnGate = this.CurrentMap.Definition.GetSafezoneGate();
+        var point = terrain.FindSpawnPoint(spawnGate);
+        if (point == null)
         {
-            // 当前坐标不可行走或不在安全区 → 在安全区内找一个可行走的格子
-            bool found = false;
-            var rand = new Random();
-            for (int radius = 0; radius < 20 && !found; radius++)
-            {
-                for (int dx = -radius; dx <= radius && !found; dx++)
-                {
-                    for (int dy = -radius; dy <= radius && !found; dy++)
-                    {
-                        int tx = posX + dx;
-                        int ty = posY + dy;
-                        if (tx >= 0 && tx < 256 && ty >= 0 && ty < 256
-                            && terrain.SafezoneMap[tx, ty]
-                            && terrain.WalkMap[tx, ty])
-                        {
-                            this.SelectedCharacter.PositionX = (byte)tx;
-                            this.SelectedCharacter.PositionY = (byte)ty;
-                            found = true;
-                        }
-                    }
-                }
-            }
-            if (!found)
-            {
-                try { await this.WarpToSafezoneAsync().ConfigureAwait(false); } catch { }
-            }
+            spawnGate = this.CurrentMap.Definition.ExitGates?.FirstOrDefault(g => g.IsSpawnGate);
+            point = terrain.FindSpawnPoint(spawnGate);
+        }
+        if (point != null)
+        {
+            this.SelectedCharacter.PositionX = point.Value.X;
+            this.SelectedCharacter.PositionY = point.Value.Y;
         }
 
         if (this.Summon?.Item1 is { IsAlive: true } summon)
@@ -2002,36 +1987,17 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
 
     private void PlaceAtGate(ExitGate gate)
     {
-        var x = (byte)Rand.NextInt(gate.X1, gate.X2);
-        var y = (byte)Rand.NextInt(gate.Y1, gate.Y2);
-
-        // 使用地形数据确保出生点在安全区+可走区域
-        // SafezoneMap + WalkMap 来自 .att 地图文件，标记了喷泉等不可走区域
-        if (this.CurrentMap?.Terrain is { } terrain)
+        // 统一调用 FindSpawnPoint 确保出生坐标可行
+        var point = this.CurrentMap?.Terrain.FindSpawnPoint(gate);
+        if (point == null)
         {
-            // AIgrid: bit0=walkable(1), bit7=safezone(128)
-            // 值129=可走安全区, 值1=可走非安全区, 值0/128=不可走
-            if ((terrain.AIgrid[x, y] & 0b1000_0001) != 0b1000_0001)
-            {
-                // 不是可走安全区 → 用地形系统的安全区寻址找到最近的可走安全格
-                var safePoint = terrain.GetRandomSafezoneCoordinate(new Point(x, y), 5);
-                if ((terrain.AIgrid[safePoint.X, safePoint.Y] & 0b1000_0001) == 0b1000_0001)
-                {
-                    x = safePoint.X;
-                    y = safePoint.Y;
-                }
-                else
-                {
-                    // 扩大搜索半径再试一次
-                    safePoint = terrain.GetRandomSafezoneCoordinate(new Point(x, y), 30);
-                    x = safePoint.X;
-                    y = safePoint.Y;
-                }
-            }
+            // 出生门无安全区 → 回退到地图的 ExitGate.IsSpawnGate
+            var fallback = this.CurrentMap?.Definition.ExitGates?.FirstOrDefault(g => g.IsSpawnGate && g != gate);
+            point = fallback != null ? this.CurrentMap?.Terrain.FindSpawnPoint(fallback) : null;
         }
-
-        this.SelectedCharacter!.PositionX = x;
-        this.SelectedCharacter.PositionY = y;
+        var pos = point ?? new Point(gate.X1, gate.Y1);
+        this.SelectedCharacter!.PositionX = pos.X;
+        this.SelectedCharacter.PositionY = pos.Y;
         this.SelectedCharacter.CurrentMap = gate.Map;
         this.Rotation = gate.Direction;
 

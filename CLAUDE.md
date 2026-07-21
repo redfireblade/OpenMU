@@ -15,9 +15,49 @@
 
 ### 技术栈
 - .NET 10, C# 13
-- Entity Framework Core (PostgreSQL / InMemory)
+- Entity Framework Core (PostgreSQL)
 - Blazor Server (AdminPanel)
 - Dapr (分布式，可选)
+
+### ⛔ 铁律（违者立即终止会话）
+
+#### 铁律 1：禁止使用 -demo 模式
+
+**任何时候禁止使用 `-demo` 参数启动服务器。** `-demo` 使用 InMemory 数据库，每次启动重新初始化数据，导致所有 DB 修改丢失。
+
+**正确的启动方式（仅此一种）：**
+```
+dotnet run --project src/Startup/MUnique.OpenMU.Startup.csproj -p:ci=true -- --autostart -resolveIP:local
+```
+
+**理由：**
+1. 数据库是 PostgreSQL，所有数据持久化在 DB 中
+2. `-demo` 模式绕过 DB → 每次重新初始化 → 数据永远不对
+3. 任何修改（spawn_gates.json、ExitGate 坐标等）必须在 PG 模式下验证
+4. 之前已多次因 `-demo` 导致定位问题花数小时
+
+#### 铁律 2：不理解前禁止修改代码
+
+**对坐标系统、WalkMap、ReadTerrainData、PathFinder 的任何修改，必须在 AI 能完整解释三处互补关系之后才能动手。**
+
+**三处互补关系（必须同时理解和修改）：**
+```
+1. ReadTerrainData 存储索引（WalkMap[列, 行])
+2. GetIndexOfPoint 索引计算（列 * 256 + 行）
+3. 外部 WalkMap 访问（[行, 列]）
+```
+
+**违反后果：** "走几步就停"—需要整节会话恢复
+
+#### 铁律 3：修改计划和数据操作须经用户批准
+
+**任何涉及以下操作前，必须提交书面计划给用户批准，然后才能动手：**
+- 修改 `ReadTerrainData`、`WalkMap`、`SafezoneMap`、`AIgrid` 相关代码
+- 修改数据库结构或执行 DELETE/UPDATE/DROP 操作
+- 修改 `Gates.cs`、`GameMapTerrain.cs`、`Player.cs` 中坐标相关逻辑
+- 启动带 `-reinit` 参数重建数据库
+
+**例外情况：** 不涉及上述内容的小修小改（如更新 spawn_gates.json、修改注释、新增日志输出）
 - SignalR (实时地图)
 
 ### 代码规范（强制）
@@ -26,13 +66,76 @@
 - 异步方法必须以 Async 结尾
 - 禁止从 Deathway/zTeam/IGCN 等泄露源码复制逻辑（Clean Room 原则）
 
+### 关键函数索引
+> [WIKI/90-function-index.md](WIKI/90-function-index.md) — AI 服务端关键函数说明（ReadTerrainData、FindSpawnPoint、PlaceAtGate、PathFinder、Gates.cs 等）
+
 ### 架构约束
 - 游戏逻辑必须写在 PlugIns/ 目录，通过 MUnique.OpenMU.PlugIns 接口注册
 - 网络协议包定义在 Network/Packets/，通过 XML + XSLT 生成
 - 数据模型在 DataModel/，持久化在 Persistence/
 - 禁止在 GameLogic/ 中直接操作数据库，必须通过 Repository 模式
 
-### 禁止事项（安全红线）
+### 坐标系统（强制 — 每次会话必读，再错永不录用）
+
+> 本规则为项目的**最大历史痛点**，AI 多次在此犯错导致角色出生在野外/走不了路。**任何涉及坐标的代码修改前，必须逐字阅读并严格遵守此规则。**
+> 
+> **核心事实：当前代码是一个稳定的互补系统。不理解整个链条之前，禁止修改任何一行坐标代码。**
+
+#### 现状（不可改 — 系统依赖互补关系）
+
+| 组件 | 当前实现 | 说明 |
+|------|----------|------|
+| `.att` 文件 | `i = 行 * 256 + 列` | 原版格式，不可改变 |
+| `ReadTerrainData` | `WalkMap[i&0xFF=列, i>>8=行]` | **存 `[列, 行]`** —和 .att 原始顺序"不同"但互补 |
+| `GetIndexOfPoint` | `(pos.Y << 8) + pos.X` = `列 * 256 + 行` | PathFinder 内部索引，和存储互补 |
+| 外部 `WalkMap` 访问 | `[posX=行, posY=列]` = `[行, 列]` | 和存储 `[列, 行]` 互补 |
+| `FindSpawnPoint` | `WalkMap[col=Y1, row=X1]` | 内部用 `[列, 行]` 和存储一致 |
+| `SpawnGate` / `ExitGate` | `X1=行, Y1=列` | 数据库语义 |
+
+**为什么这样但能工作：** 
+- `.att` 文件是行优先(`行*256+列`)，但代码解析时用了列优先索引(`i&0xFF=列`)
+- `GetIndexOfPoint` 也用了列优先(`列*256+行`) — 两个"错误"抵消
+- 最终：**.att 中 `(行,列)` 的值存到了 `WalkMap[列, 行]`，外部 `[行, 列]` 读到的互补位置恰好和 PathFinder 索引一致**
+
+#### 关键数据流（当前正确的代码）
+```
+spawn_gates.json → [X=行, Y=列, X=行, Y=列]
+    ↓ PlaceAtGate / ClientReady
+FindSpawnPoint:  WalkMap[col=Gate.Y1, row=Gate.X1]  ← 内部[列,行]和存储一致
+    ↓
+返回 Point(row, col) = Point(行, 列)
+    ↓
+PositionX = point.X = 行, PositionY = point.Y = 列 ✅
+```
+
+#### 如果要统一（未来计划），必须同时改三个地方：
+```csharp
+// 1. ReadTerrainData — 存 [行, 列]
+this.WalkMap[i>>8 (=行), i&0xFF (=列)] = ...;
+
+// 2. GetIndexOfPoint — 行优先
+return (pos.X << 8) + pos.Y;  // 行 * 256 + 列
+
+// 3. 外部 WalkMap 访问不变 — [posX, posY] = [行, 列] 已经正确
+// 4. FindSpawnPoint — WalkMap[row=Gate.X1, col=Gate.Y1]
+```
+
+> **⚠️ 在真正理解所有三点之前，禁止做任何统一尝试。当前互补系统是稳定的。**
+
+#### 常见错误模式（AI 反复犯的 — 记住教训）
+- ❌ 单独改 `ReadTerrainData` 索引 → "走几步就停"
+- ❌ 以为 `Gate.X1=列` → 错，X1=行(PositionX)
+- ❌ 以为 `Gate.Y1=行` → 错，Y1=列(PositionY)
+- ❌ 用 `-demo` 模式测试 → 数据全部丢失
+- ❌ 直接删除 DB 记录而不是更新坐标 → 外键断裂导致传送失效
+- ❌ `FindSpawnPoint` 返回 `Point(col, row)` → Position 被设为 (列,行)
+- ❌ `ClientReadyAfterMapChangeAsync` 中用 `WalkMap` 检查位置 → 互补索引导致读到错误位置
+
+#### PlaceAtGate 说明（AI 添加的辅助方法）
+
+在 `WarpToAsync`（传送门/地图列表传送）和 `RespawnAtAsync`（死亡复活）中被调用。行为：使用 `FindSpawnPoint` 在出生门区域内随机选择安全区+可行走位置，而非固定在门左上角。
+
+设计意图：避免玩家传到不可行走坐标（雕像/墙壁等）。**不是原始 OpenMU 行为，但有益。** 如需恢复原始行为（固定门左上角），删除 `PlaceAtGate` 中的 `FindSpawnPoint` 调用，直接使用 `new Point(gate.X1, gate.Y1)`。
 - ❌ 不要修改 Startup/ 中的硬编码服务注册，除非新增独立插件
 - ❌ 不要删除现有迁移（Migrations/），如需改模型，新增迁移
 - ❌ 不要引入非 .NET 原生依赖（如 Python 运行时），外部工具通过 CLI 调用

@@ -47,8 +47,21 @@ public static class GameMapDefinitionExtensions
     /// <returns>The safezone gate of a map.</returns>
     public static ExitGate? GetSafezoneGate(this GameMapDefinition gameMapDefinition, GameMapTerrain? terrain = null)
     {
-        terrain ??= new GameMapTerrain(gameMapDefinition);
-        return gameMapDefinition.ExitGates?.FirstOrDefault(g => g.IsSpawnGate && terrain.SafezoneMap[g.X1, g.Y1])
-               ?? gameMapDefinition.ExitGates?.FirstOrDefault(g => g.IsSpawnGate);
+        // 优先从 spawn_gates.json 配置读取出生门区域
+        var area = SpawnGateConfig.GetSpawnArea(gameMapDefinition.Number);
+        if (area != null)
+        {
+            return new ExitGate
+            {
+                Map = gameMapDefinition,
+                X1 = (byte)area.X1,
+                Y1 = (byte)area.Y1,
+                X2 = (byte)area.X2,
+                Y2 = (byte)area.Y2,
+            };
+        }
+
+        // 没有配置 → 从 ExitGate 找第一个 IsSpawnGate=true 的门
+        return gameMapDefinition.ExitGates?.FirstOrDefault(g => g.IsSpawnGate);
     }
 }
