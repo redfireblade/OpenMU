@@ -1160,25 +1160,47 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
         this.IsAlive = true;
 
         await this.CurrentMap!.AddAsync(this).ConfigureAwait(false);
+        var posX = this.SelectedCharacter.PositionX;
+        var posY = this.SelectedCharacter.PositionY;
         var terrain = this.CurrentMap.Terrain;
-        var px = this.SelectedCharacter.PositionX;
-        var py = this.SelectedCharacter.PositionY;
-        System.Console.WriteLine($"[SpawnDebug] mapId={this.CurrentMap.Definition.Number} pos=({px},{py}) walk={terrain.WalkMap[px,py]} safe={terrain.SafezoneMap[px,py]}");
-        // 每次进入地图都使用 FindSpawnPoint 确保位置正确（不依赖 WalkMap 互补索引）
-        var spawnGate = this.CurrentMap.Definition.GetSafezoneGate();
-        var point = terrain.FindSpawnPoint(spawnGate);
-        if (point == null)
+        if (!terrain.WalkMap[posX, posY])
         {
-            spawnGate = this.CurrentMap.Definition.ExitGates?.FirstOrDefault(g => g.IsSpawnGate);
-            point = terrain.FindSpawnPoint(spawnGate);
-        }
-        if (point != null)
-        {
-            this.SelectedCharacter.PositionX = point.Value.X;
-            this.SelectedCharacter.PositionY = point.Value.Y;
+            // 当前位置不可行走 → 在附近找一个可行走的格子
+            bool found = false;
+            var rand = new Random();
+            for (int radius = 0; radius < 20 && !found; radius++)
+            {
+                for (int dx = -radius; dx <= radius && !found; dx++)
+                {
+                    for (int dy = -radius; dy <= radius && !found; dy++)
+                    {
+                        int tx = posX + dx;
+                        int ty = posY + dy;
+                        if (tx >= 0 && tx < 256 && ty >= 0 && ty < 256
+                            && terrain.WalkMap[tx, ty])
+                        {
+                            this.SelectedCharacter.PositionX = (byte)tx;
+                            this.SelectedCharacter.PositionY = (byte)ty;
+                            found = true;
+                        }
+                    }
+                }
+            }
+            if (!found)
+            {
+                // 全图扫描找任意可行走位置
+                for (int tx = 0; tx < 256 && !found; tx++)
+                for (int ty = 0; ty < 256 && !found; ty++)
+                    if (terrain.WalkMap[tx, ty])
+                    {
+                        this.SelectedCharacter.PositionX = (byte)tx;
+                        this.SelectedCharacter.PositionY = (byte)ty;
+                        found = true;
+                    }
+            }
         }
 
-        if (this.Summon?.Item1 is { IsAlive: true } summon)
+        if (this.Summon?.Item1 is { IsAlive: true } summon && this.CurrentMap is not null)
         {
             await this.CurrentMap.AddAsync(summon).ConfigureAwait(false);
             summon.OnSpawn();
@@ -1987,17 +2009,66 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
 
     private void PlaceAtGate(ExitGate gate)
     {
-        // 统一调用 FindSpawnPoint 确保出生坐标可行
-        var point = this.CurrentMap?.Terrain.FindSpawnPoint(gate);
-        if (point == null)
+        var x = (byte)Rand.NextInt(gate.X1, gate.X2);
+        var y = (byte)Rand.NextInt(gate.Y1, gate.Y2);
+
+        // 用地形数据验证（优先用当前地图，换图时用目标地图定义里的 TerrainData）
+        byte[]? terrainData = null;
+        if (this.CurrentMap?.Terrain is { } runtimeTerrain)
         {
-            // 出生门无安全区 → 回退到地图的 ExitGate.IsSpawnGate
-            var fallback = this.CurrentMap?.Definition.ExitGates?.FirstOrDefault(g => g.IsSpawnGate && g != gate);
-            point = fallback != null ? this.CurrentMap?.Terrain.FindSpawnPoint(fallback) : null;
+            terrainData = null; // use AIgrid below
         }
-        var pos = point ?? new Point(gate.X1, gate.Y1);
-        this.SelectedCharacter!.PositionX = pos.X;
-        this.SelectedCharacter.PositionY = pos.Y;
+        else if (gate.Map?.TerrainData is { Length: 65539 } td)
+        {
+            terrainData = td;
+        }
+
+        if (terrainData != null || this.CurrentMap?.Terrain is { })
+        {
+            bool IsWalkable(int px, int py) {
+                if (this.CurrentMap?.Terrain is { } rt)
+                    return (rt.AIgrid[px, py] & 1) == 1;
+                if (terrainData is { } td)
+                    return td[3 + px * 256 + py] != 0xFF && (td[3 + px * 256 + py] & 0x54) == 0;
+                return false;
+            }
+
+            // 先在门区域内多次尝试找可行走位置
+            bool found = IsWalkable(x, y);
+            for (int attempt = 0; attempt < 10 && !found; attempt++)
+            {
+                x = (byte)Rand.NextInt(gate.X1, gate.X2);
+                y = (byte)Rand.NextInt(gate.Y1, gate.Y2);
+                if (IsWalkable(x, y)) found = true;
+            }
+
+            // 扩大搜索
+            if (!found)
+            {
+                for (int radius = 1; radius <= 30 && !found; radius++)
+                {
+                    for (int dx = -radius; dx <= radius && !found; dx++)
+                    for (int dy = -radius; dy <= radius && !found; dy++)
+                    {
+                        int tx = x + dx, ty = y + dy;
+                        if (tx >= 0 && tx < 256 && ty >= 0 && ty < 256 && IsWalkable(tx, ty))
+                        { x = (byte)tx; y = (byte)ty; found = true; }
+                    }
+                }
+            }
+
+            // 全图兜底
+            if (!found)
+            {
+                for (int tx = 0; tx < 256 && !found; tx++)
+                for (int ty = 0; ty < 256 && !found; ty++)
+                    if (IsWalkable(tx, ty))
+                    { x = (byte)tx; y = (byte)ty; found = true; }
+            }
+        }
+
+        this.SelectedCharacter!.PositionX = x;
+        this.SelectedCharacter.PositionY = y;
         this.SelectedCharacter.CurrentMap = gate.Map;
         this.Rotation = gate.Direction;
 

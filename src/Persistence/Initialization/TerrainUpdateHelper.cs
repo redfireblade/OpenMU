@@ -70,7 +70,15 @@ internal static class TerrainUpdateHelper
             }
         }
 
-        // 没有找到地形文件：生成一个全可走的默认地形（修复 Map 0 洛伦西亚的不可移动BUG）
+        // Map 0(Lorencia) 没有 Terrain0.att，尝试 Terrain1.att（勇者大陆实际是 World1）
+        if (gameMapDefinition.Number == 0)
+        {
+            var fallback = $"{assembly.GetName().Name}.Resources.{terrainVersionPrefix}Terrain1{(gameMapDefinition.Discriminator > 0 ? ("_" + gameMapDefinition.Discriminator) : string.Empty)}.att";
+            if (resourceNames.Contains(fallback))
+                return fallback;
+        }
+
+        // 仍然没有找到地形文件：生成一个全可走的默认地形（修复 Map 0 洛伦西亚的不可移动BUG）
         var defaultTerrain = new byte[3 * ushort.MaxValue];
         for (int i = 0; i < defaultTerrain.Length; i++)
         {

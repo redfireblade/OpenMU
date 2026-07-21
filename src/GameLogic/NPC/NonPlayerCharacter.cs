@@ -225,9 +225,9 @@ public class NonPlayerCharacter : AsyncDisposable, IObservable, IRotatable, ILoc
     private bool IsValidSpawnPoint(Point spawnPoint)
     {
         var isSafezoneAllowed = this.CanSpawnInSafezone;
-        var isInSafezone = this.CurrentMap.Terrain.SafezoneMap[spawnPoint.X, spawnPoint.Y];
+        var isInSafezone = this.CurrentMap.Terrain.SafezoneMap[spawnPoint.Y, spawnPoint.X];
         var npcCanWalk = this.Definition.ObjectKind == NpcObjectKind.Monster || this.Definition.ObjectKind == NpcObjectKind.Guard;
-        var isWalkable = this.CurrentMap.Terrain.WalkMap[spawnPoint.X, spawnPoint.Y];
+        var isWalkable = this.CurrentMap.Terrain.WalkMap[spawnPoint.Y, spawnPoint.X];
         return (isSafezoneAllowed || !isInSafezone) && (!npcCanWalk || isWalkable);
     }
 }

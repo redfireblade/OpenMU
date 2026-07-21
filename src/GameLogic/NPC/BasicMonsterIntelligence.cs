@@ -85,7 +85,7 @@ public class BasicMonsterIntelligence : INpcIntelligence, IDisposable
     /// <inheritdoc/>
     public virtual bool CanWalkOn(Point target)
     {
-        return this.Monster.CurrentMap.Terrain.AIgrid[target.X, target.Y] == 1;
+        return this.Monster.CurrentMap.Terrain.AIgrid[target.Y, target.X] == 1;
     }
 
     /// <summary>

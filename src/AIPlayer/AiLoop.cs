@@ -57,10 +57,10 @@ public sealed class AiLoop
         {
             var rx = (byte)Math.Clamp(pos.X + rng.Next(-15, 16), 5, 250);
             var ry = (byte)Math.Clamp(pos.Y + rng.Next(-15, 16), 5, 250);
-            if (!map.Terrain.WalkMap[rx, ry]) continue;
+            if (!map.Terrain.WalkMap[ry, rx]) continue;
             if (Math.Abs(rx - pos.X) < 3 && Math.Abs(ry - pos.Y) < 3) continue;
 
-            await this._entity.WalkToAsync(new Point(rx, ry));
+            await this._entity.WalkTargetAsync(new Point(rx, ry));
             return;
         }
     }

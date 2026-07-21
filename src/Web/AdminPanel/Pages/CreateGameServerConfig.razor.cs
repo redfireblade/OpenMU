@@ -103,7 +103,7 @@ public partial class CreateGameServerConfig : ComponentBase, IAsyncDisposable
         var existingServerDefinitions = (await persistenceContext.GetAsync<GameServerDefinition>(cancellationToken).ConfigureAwait(false)).ToList();
 
         var nextServerId = 0;
-        var networkPort = 55901;
+        var networkPort = ServerConfigHelper.ReadInt("GameServer", "StartPort", 55901);
         if (existingServerDefinitions.Count > 0)
         {
             nextServerId = existingServerDefinitions.Max(s => s.ServerID) + 1;

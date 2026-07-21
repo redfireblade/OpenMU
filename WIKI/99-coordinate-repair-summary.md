@@ -1,6 +1,6 @@
 # 地形与坐标系统 — 问题记录与规范（含历史摘要）
 
-> **维护**: 2026-07-21
+> **维护**: 2026-07-22
 > **相关铁律**: `SERVERS/OPENMU/CLAUDE.md` → 坐标系统节 + 铁律节
 > **函数索引**: `WIKI/90-function-index.md`
 > **旧版全文**: `_archive/terrain-fix-v1.md`、`_archive/terrain-coord-system-v1.md`
@@ -113,7 +113,195 @@ safezone = (value & 0x01) != 0;
 
 ---
 
-## 五、归档说明
+## 五、2026-07-22 重大修复
+
+### 5.1 行走掩码错误 (0x5C → 0x54)
+- **症状**: 冰风谷/地下城等"不能动"，但地形数据100%匹配
+- **原因**: 掩码包含 NOGROUND(0x08)，客户端鼠标点击只检查 NOMOVE(0x04)
+- **修复**: `GameMapTerrain.ReadTerrainData` 掩码 → 0x54
+
+### 5.2 WalkMap 索引约定确认
+- WalkMap 存储 `[列,行]`，但所有代码访问用 `[X(row),Y(col)]`
+- AI 多次改成 `[Y,X]` 均导致正确变错误——禁止改动
+
+### 5.3 地形数据来源错误
+- DB 地形来自错误源（编辑器 vs 客户端运行时），Map N 应对应 World N+1
+- 修复: 直接从客户端 EncTerrain 解密写入 DB
+
+### 5.4 PlaceAtGate 跨地图传送
+- 换图时 `CurrentMap` 为 null，地形验证跳过 → 纯随机落点
+- 修复: 用 `gate.Map.TerrainData` 验证
+
+### 5.5 出生判断死循环
+- `ClientReadyAfterMapChangeAsync` 要求 SafeZone+WalkMap → 无安全区地图死循环
+- 修复: 只检查 WalkMap，找不到全图扫描兜底
+
+### 5.6 部分出生门 100% 不可行走
+- Kanturu1/Arena/IT 等事件地图门区域全墙
+- 已识别，需逐个修正门坐标
+
+---
+
+---
+
+## 六、三个工具的坐标变换对照表（2026-07-22 最终确认）
+
+### 核心事实
+
+服务端 DB 存储的 TerrainData 是 `.att` 格式原始数据（`index = row*256+col`）。三个工具各自用不同的坐标索引方式，最终都正确显示为匹配游戏画面的方向。
+
+### 1. 服务端代码（运行时坐标处理）
+
+**数据存储**：DB `TerrainData`（服务端格式）= 3B头 + 65536B 地形数据，已左转90度（2026-07-22旋转），与门坐标方向一致。
+
+#### `GameMapTerrain.ReadTerrainData` — 地形加载
+
+```csharp
+// .att 索引: i = row*256 + col
+// ReadTerrainData 存储: WalkMap[col, row]
+//   实际上: WalkMap[x=i&0xFF = 列, y=i>>8 = 行]
+byte x = (byte)(i & 0xFF);   // = 列
+byte y = (byte)((i >> 8) & 0xFF); // = 行
+WalkMap[x, y] = value != 0xFF && (value & 0x54) == 0;
+SafezoneMap[x, y] = (value & 0x01) != 0;
+```
+
+#### `WalkToAsync` — 行走判定（Player.cs:1410）
+
+```csharp
+// target 来自客户端发送的行走目标点
+// target.X = 行, target.Y = 列（MU协议约定）
+var canWalkToTarget = currentMap.Terrain.WalkMap[target.X, target.Y];
+//                                WalkMap[行, 列]
+//
+// 行=列：WalkMap 存储是 [列,行]，但这里用 [X(行),Y(列)] 访问。
+// 这是一个历史形成的互补约定——WalkMap 的列索引和 X(行) 恰好对应，
+// 行索引和 Y(列) 对应。实际上在 [列,行] 存储中查 [行,列] 是反的。
+// 但所有现存代码都用这个方式，改 [Y,X] 会导致全地图行走停止。
+// ⛔ 禁止改为 [target.Y, target.X]！
+```
+
+#### `PlaceAtGate` — 出生点定位（Player.cs:2013）
+
+```csharp
+// 从门区域随机取坐标
+x = (byte)Rand.NextInt(gate.X1, gate.X2);  // 行
+y = (byte)Rand.NextInt(gate.Y1, gate.Y2);  // 列
+
+// AIgrid 用 [列,行] 存储，访问时也用 [列,行]（和 WalkMap 互补约定一致）
+if ((terrain.AIgrid[x, y] & 1) != 1)  // AIgrid[行, 列]
+{
+    var safePoint = terrain.GetRandomCoordinate(new Point(x, y), 5);
+    if ((terrain.AIgrid[safePoint.X, safePoint.Y] & 1) == 1) // AIgrid[行,列]
+    { ... }
+}
+
+// 注意: 跨地图传送时 CurrentMap.Terrain 可能为 null，
+// 改用 gate.Map.TerrainData 读取目标地图的原始地形字节
+```
+
+#### `ClientReadyAfterMapChangeAsync` — 换图后位置修正（Player.cs:1165）
+
+```csharp
+posX = SelectedCharacter.PositionX;  // 行
+posY = SelectedCharacter.PositionY;  // 列
+
+// WalkMap / SafezoneMap 用 [X(row), Y(col)] 访问（与 WalkToAsync 一致）
+if (!terrain.WalkMap[posX, posY])     // WalkMap[行, 列]
+{
+    // 附近搜索可行走位置
+    for (int dx = -radius; dx <= radius; dx++)
+    for (int dy = -radius; dy <= radius; dy++)
+    {
+        int tx = posX + dx;  // 行
+        int ty = posY + dy;  // 列
+        if (terrain.WalkMap[tx, ty])  // WalkMap[行, 列]
+        {
+            SelectedCharacter.PositionX = (byte)tx;  // 行
+            SelectedCharacter.PositionY = (byte)ty;  // 列
+        }
+    }
+}
+```
+
+#### 总结：为什么存储 [列,行] 但访问 [行,列]？
+
+这是 `ReadTerrainData` 中一个意外的互补结果：
+```
+.att索引: i = row*256 + col
+WalkMap存储: WalkMap[i&0xFF, i>>8] = WalkMap[列, 行]
+WalkMap访问: WalkMap[X(行), Y(列)]
+```
+虽然看起来反了，但把所有 WalkMap 调用整理后，这个互补恰好使 Gate 坐标（`X1=行, Y1=列`）和外部 Point（`X=行, Y=列`）不需要任何额外转换就能直接用来查地形。**所有历史代码都遵循这个约定。**
+
+**2026-07-22 经验验证**：AI 三次尝试改为 `[Y,X]`（在逻辑上看起来更正确），每次导致全部地图"不能动"或"走几步就停"，回退后恢复正常。结论：**即使不理解也要保持现状。**
+
+### 2. 门编辑器 `_spawn/SpawnEditor`
+
+数据来源: `TerrainSourceA/World{N}/EncTerrain{N}.att`（解密后）
+
+```
+// 读取
+v = terrain[列 × 256 + 行]            // 交换索引 = 自然右转90度
+
+// 渲染 (SetPixel(x, y))
+x = 列(水平), y = 行(垂直)
+SetPixel(x × 像素格, y × 像素格, 颜色)
+
+// 门坐标 (来自 DB ExitGate: X1=行, Y1=列)
+sx = Y1(列) × 像素格                  // 水平位置 = 列
+sy = X1(行) × 像素格                  // 垂直位置 = 行
+width  = (Y2 - Y1 + 1) × 像素格
+height = (X2 - X1 + 1) × 像素格
+```
+
+结论: 地形读取时的 `[列,行]` 交换索引 + SetPixel(x=列,y=行) = 不旋转，直接显示游戏正确画面。
+
+### 3. 地形编辑器 `TerrainEditor`
+
+与门编辑器完全相同：
+
+```
+// 读取
+v = rawData[列 × TS + 行]
+
+// 渲染
+SetPixel(x=列, y=行, 颜色)
+
+// 门坐标
+sx = Y1(列) × 像素格, sy = X1(行) × 像素格
+```
+
+❗`rawData[列 × TS + 行]` 的交换索引使渲染无需额外旋转。
+
+### 4. HTML 地图门查看工具 `/tmp/terrain_compare`
+
+```
+// 直接读 DB TerrainData（服务端格式）
+v = td[3 + 行 × 256 + 列]
+
+// 左转90度渲染
+SetPixel(行 × 像素格, 列 × 像素格, 颜色)     // 行→水平, 列→垂直
+
+// 门坐标（匹配左转90度）
+sx = 行 × 像素格, sy = 列 × 像素格
+width = (X2-X1+1) × 像素格, height = (Y2-Y1+1) × 像素格
+```
+
+结论: 与 DB 原始索引 `[行,列]` 一致，通过左转90度渲染匹配游戏画面。
+
+### 5. DB 地形旋转（2026-07-22）
+
+之前 DB TerrainData = `.att` 原始方向 → 与门坐标左转90度错位。
+现在 DB TerrainData 已左转90度，与门坐标方向一致。
+
+```
+左转90度变换: dst[新列 × 256 + (255 - 新行)] = src[行 × 256 + 列]
+```
+
+---
+
+## 七、归档说明
 
 旧版完整文档已移到 `_archive/`：
 - `TERRAIN-FIX.md` (旧) → `_archive/terrain-fix-v1.md` — 早期修复记录（出生在水里、地图闪烁、Portal 回弹）

@@ -2556,7 +2556,7 @@ public sealed class ScriptExecutor
             var tx = Math.Clamp(this._patrolCenter.X + offsetX, 0, 255);
             var ty = Math.Clamp(this._patrolCenter.Y + offsetY, 0, 255);
 
-            if (!map.Terrain.WalkMap[tx, ty])
+            if (!map.Terrain.WalkMap[ty, tx])
             {
                 continue;
             }
@@ -2812,7 +2812,7 @@ public sealed class ScriptExecutor
 
                 var nx = Math.Clamp(pos.X + dx, 0, 255);
                 var ny = Math.Clamp(pos.Y + dy, 0, 255);
-                if (!map.Terrain.WalkMap[nx, ny])
+                if (!map.Terrain.WalkMap[ny, nx])
                 {
                     continue;
                 }
@@ -2860,7 +2860,7 @@ public sealed class ScriptExecutor
             var tx = Math.Clamp(pos.X + dx, 0, 255);
             var ty = Math.Clamp(pos.Y + dy, 0, 255);
 
-            if (!map.Terrain.WalkMap[tx, ty])
+            if (!map.Terrain.WalkMap[ty, tx])
             {
                 continue;
             }
@@ -3032,7 +3032,7 @@ public sealed class ScriptExecutor
         var startX = Math.Clamp((int)playerPos.X, 0, 255);
         var startY = Math.Clamp((int)playerPos.Y, 0, 255);
 
-        if (map.Terrain.WalkMap[startX, startY])
+        if (map.Terrain.WalkMap[startY, startX])
         {
             queue.Enqueue(new Point((byte)startX, (byte)startY));
             visited[startX, startY] = true;
@@ -3059,7 +3059,7 @@ public sealed class ScriptExecutor
                     }
 
                     visited[nx, ny] = true;
-                    if (!map.Terrain.WalkMap[nx, ny])
+                    if (!map.Terrain.WalkMap[ny, nx])
                     {
                         continue;
                     }
@@ -3085,7 +3085,7 @@ public sealed class ScriptExecutor
                     {
                         var tx = Math.Clamp(center.X + dx, 0, 255);
                         var ty = Math.Clamp(center.Y + dy, 0, 255);
-                        if (map.Terrain.WalkMap[tx, ty] && reachable[tx, ty])
+                        if (map.Terrain.WalkMap[ty, tx] && reachable[tx, ty])
                         {
                             return new Point((byte)tx, (byte)ty);
                         }
@@ -3107,7 +3107,7 @@ public sealed class ScriptExecutor
                     {
                         var tx = Math.Clamp(center.X + dx, 0, 255);
                         var ty = Math.Clamp(center.Y + dy, 0, 255);
-                        if (map.Terrain.WalkMap[tx, ty])
+                        if (map.Terrain.WalkMap[ty, tx])
                         {
                             this._logger.LogDebug(
                                 "[ScriptExec]" + this._charTag + " FindNearestWalkableTile: fallback to walkable-only tile ({Tx},{Ty}) near ({Cx},{Cy}) — not reachable from player ({Px},{Py}).",
@@ -3142,7 +3142,7 @@ public sealed class ScriptExecutor
             {
                 var tx = Math.Clamp(center.X + dx, 0, 255);
                 var ty = Math.Clamp(center.Y + dy, 0, 255);
-                if (map.Terrain.WalkMap[tx, ty])
+                if (map.Terrain.WalkMap[ty, tx])
                 {
                     count++;
                 }
@@ -3229,12 +3229,12 @@ public sealed class ScriptExecutor
                         continue;
                     }
 
-                    if (!map.Terrain.WalkMap[tx, ty])
+                    if (!map.Terrain.WalkMap[ty, tx])
                     {
                         continue;
                     }
 
-                    if (map.Terrain.SafezoneMap[tx, ty])
+                    if (map.Terrain.SafezoneMap[ty, tx])
                     {
                         continue; // 仍在安全区内
                     }
@@ -3273,7 +3273,7 @@ public sealed class ScriptExecutor
         awayY = Math.Clamp(awayY, 0, 255);
 
         // 检查目标是否可走且非安全区
-        if (map.Terrain.WalkMap[awayX, awayY] && !map.Terrain.SafezoneMap[awayX, awayY])
+        if (map.Terrain.WalkMap[awayY, awayX] && !map.Terrain.SafezoneMap[awayY, awayX])
         {
             // 使用 GameAdapter.WalkToAsync（不走 TryWalkToAsync，跳过 Monster Danger Filter）
             var result = await this._context.GameAdapter.WalkToAsync(new Point((byte)awayX, (byte)awayY), map).ConfigureAwait(false);
@@ -4589,7 +4589,7 @@ public sealed class ScriptExecutor
                         var ry = Random.Shared.Next(hd.Y1, hd.Y2 + 1);
                         var randomPt = new Point((byte)rx, (byte)ry);
                         // 如果随机点可走则用它，否则 fallback 到热点中心
-                        if (map.Terrain.WalkMap[rx, ry])
+                        if (map.Terrain.WalkMap[ry, rx])
                             targetPoint = randomPt;
                     }
                 }

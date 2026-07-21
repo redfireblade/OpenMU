@@ -540,7 +540,7 @@ public static class AttackableExtensions
             var newY = target.Position.Y + Rand.NextInt(-1, 2);
             var isNewXAllowed = newX is >= byte.MinValue and <= byte.MaxValue;
             var isNewYAllowed = newY is >= byte.MinValue and <= byte.MaxValue;
-            if (isNewXAllowed && isNewYAllowed && terrain.AIgrid[newX, newY] == 1)
+            if (isNewXAllowed && isNewYAllowed && terrain.AIgrid[newY, newX] == 1)
             {
                 await movable.MoveAsync(new Point((byte)newX, (byte)newY)).ConfigureAwait(false);
             }

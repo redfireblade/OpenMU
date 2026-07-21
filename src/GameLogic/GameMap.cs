@@ -28,7 +28,6 @@ public class GameMap
 
     private readonly IdGenerator _dropIdGenerator;
 
-    private readonly ExitGate? _safezoneSpawnGate;
 
     private int _playerCount;
 
@@ -49,7 +48,6 @@ public class GameMap
         this._objectIdGenerator = new IdGenerator(ViewExtensions.ConstantPlayerId + 1, 0x7FFF);
         this._dropIdGenerator = new IdGenerator(0, ViewExtensions.ConstantPlayerId - 1);
 
-        this._safezoneSpawnGate = this.Definition.GetSafezoneGate(this.Terrain);
     }
 
     /// <summary>
@@ -75,7 +73,7 @@ public class GameMap
     /// <summary>
     /// Gets the safe zone spawn gate.
     /// </summary>
-    public ExitGate? SafeZoneSpawnGate => this._safezoneSpawnGate;
+    public ExitGate? SafeZoneSpawnGate => this.Definition.GetSafezoneGate(this.Terrain);
 
     /// <summary>
     /// Gets the duration about how long drops are laying on the ground until they are disappearing.
@@ -277,7 +275,7 @@ public class GameMap
     {
         var drops = this._objectsInMap.Values
             .OfType<DroppedItem>()
-            .Where(d => !this.Terrain.WalkMap[d.Position.X, d.Position.Y])
+            .Where(d => !this.Terrain.WalkMap[d.Position.Y, d.Position.X])
             .ToList();
 
         foreach (var drop in drops)

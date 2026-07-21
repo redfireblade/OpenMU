@@ -1,4 +1,4 @@
-// <copyright file="GameMapTerrain.cs" company="MUnique">
+﻿// <copyright file="GameMapTerrain.cs" company="MUnique">
 // Licensed under the MIT License. See LICENSE file in the project root for full license information.
 // </copyright>
 
@@ -24,20 +24,16 @@ public class GameMapTerrain
     public GameMapTerrain(GameMapDefinition definition)
         : this(definition?.TerrainData)
     {
-        // 冰风谷硬编码安全区
-        if (definition?.Number == 2)
-            this.MarkSafeRect(220, 40, 235, 65);
-        else if (definition?.Number == 3)
-            this.MarkSafeRect(108, 171, 117, 177);
+        // 安全区由 .att 文件定义 (value & 0x01) != 0 判定，无需硬编码
     }
 
-    private void MarkSafeRect(int col1, int row1, int col2, int row2)
+    private void MarkSafeRectangle(int x1, int y1, int x2, int y2)
     {
-        for (int col = col1; col <= col2 && col < 256; col++)
-        for (int row = row1; row <= row2 && row < 256; row++)
+        for (int x = x1; x <= x2 && x < 256; x++)
+        for (int y = y1; y <= y2 && y < 256; y++)
         {
-            this.SafezoneMap[col, row] = true;
-            this.UpdateAiGridValue((byte)col, (byte)row);
+            this.SafezoneMap[x, y] = true;
+            this.UpdateAiGridValue((byte)x, (byte)y);
         }
     }
 
@@ -49,6 +45,8 @@ public class GameMapTerrain
     {
         if (terrainData is { })
         {
+            // .att 文件格式：3字节头 + 65536字节服务端地形 + 65536字节客户端纹理
+            // 只读取第一层（服务端地形），避免第二层客户端纹理数据覆盖安全区标记
             var firstLayerLength = Math.Min(terrainData.Length - 3, 65536);
             this.ReadTerrainData(terrainData.AsSpan(3, firstLayerLength));
         }
@@ -81,59 +79,40 @@ public class GameMapTerrain
     /// <returns>The random drop coordinate.</returns>
     public Point GetRandomCoordinate(Point point, byte maximumRadius)
     {
-        byte row = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
-        byte col = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
+        byte tempx = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
+        byte tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
         int i = 0;
-        while (!this.WalkMap[col, row] && i < 20)
+        while (!this.WalkMap[tempx, tempy] && i < 20)
         {
-            row = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
-            col = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
+            tempx = (byte)Rand.NextInt(Math.Max(0, point.X - maximumRadius), Math.Min(255, point.X + maximumRadius + 1));
+            tempy = (byte)Rand.NextInt(Math.Max(0, point.Y - maximumRadius), Math.Min(255, point.Y + maximumRadius + 1));
             i++;
         }
-        if (i == 20) return point;
-        return new Point(row, col);
+
+        if (i == 20)
+        {
+            return point;
+        }
+
+        return new Point(tempx, tempy);
     }
 
     /// <summary>
-    /// 找一个可行的出生坐标。
-    /// WalkMap/Gate 坐标约定与 OpenMU 原有逻辑一致。
-    /// 出生门内先找安全区，再无安全区则找可走格，仍然找不到返回 null。
+    /// Gets a random safezone coordinate near the specified point.
     /// </summary>
-    public Point? FindSpawnPoint(ExitGate? spawnGate)
+    public Point GetRandomSafezoneCoordinate(Point point, byte maximumRadius)
     {
-        if (spawnGate != null)
+        for (int r = 0; r <= maximumRadius; r++)
         {
-            System.Console.WriteLine($"[SpawnFind] Gate=({spawnGate.X1},{spawnGate.Y1})-({spawnGate.X2},{spawnGate.Y2})");
-            // 内部用 WalkMap[列,行]（和 ReadTerrainData 存储一致），返回 Point(行=posX, 列=posY)
-            for (int attempt = 0; attempt < 20; attempt++)
+            for (int attempt = 0; attempt < 30; attempt++)
             {
-                byte col = (byte)Rand.NextInt(spawnGate.Y1, spawnGate.Y2 + 1);
-                byte row = (byte)Rand.NextInt(spawnGate.X1, spawnGate.X2 + 1);
-                if (this.WalkMap[col, row] && this.SafezoneMap[col, row])
-                {
-                    System.Console.WriteLine($"[SpawnFind] safe+walk found at (row={row},col={col})");
-                    return new Point(row, col);
-                }
+                byte tx = (byte)Rand.NextInt(Math.Max(0, point.X - r), Math.Min(255, point.X + r + 1));
+                byte ty = (byte)Rand.NextInt(Math.Max(0, point.Y - r), Math.Min(255, point.Y + r + 1));
+                if (this.WalkMap[tx, ty] && this.SafezoneMap[tx, ty])
+                    return new Point(tx, ty);
             }
-            for (int attempt = 0; attempt < 20; attempt++)
-            {
-                byte col = (byte)Rand.NextInt(spawnGate.Y1, spawnGate.Y2 + 1);
-                byte row = (byte)Rand.NextInt(spawnGate.X1, spawnGate.X2 + 1);
-                if (this.WalkMap[col, row])
-                {
-                    System.Console.WriteLine($"[SpawnFind] walk-only found at (row={row},col={col})");
-                    return new Point(row, col);
-                }
-            }
-            System.Console.WriteLine($"[SpawnFind] no valid point found in gate");
-            return null;
         }
-
-        for (byte col = 0; col < 256; col++)
-        for (byte row = 0; row < 256; row++)
-            if (this.WalkMap[col, row])
-                return new Point(row, col);
-        return new Point(100, 100);
+        return point;
     }
 
     /// <summary>
@@ -158,7 +137,10 @@ public class GameMapTerrain
             byte x = (byte)(i & 0xFF);
             byte y = (byte)((i >> 8) & 0xFF);
             byte value = data[i];
-            this.WalkMap[x, y] = value != 0xFF && (value & 0x5C) == 0;
+            // 匹配客户端鼠标点击行走判定: 只检查 NOMOVE(0x04)，不检查 NOGROUND(0x08)
+            // NOGROUND 仅影响地面纹理渲染，不影响行走 (ZzzInterface.cpp:3342)
+            this.WalkMap[x, y] = value != 0xFF && (value & 0x54) == 0;
+            // 安全区: 客户端判定 (v & 0x01) != 0，值 1/3/5/7 等都算安全区
             this.SafezoneMap[x, y] = (value & 0x01) != 0;
             this.UpdateAiGridValue(x, y);
         }

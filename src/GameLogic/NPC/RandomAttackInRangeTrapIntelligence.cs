@@ -65,7 +65,7 @@ public class RandomAttackInRangeTrapIntelligence : TrapIntelligenceBase
 
         foreach (var target in tempObservers.OfType<IAttackable>())
         {
-            if (this.Map.Terrain.SafezoneMap[target.Position.X, target.Position.Y])
+            if (this.Map.Terrain.SafezoneMap[target.Position.Y, target.Position.X])
             {
                 continue;
             }

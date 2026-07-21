@@ -390,7 +390,7 @@ public sealed class Monster : AttackableNpcBase, IAttackable, IAttacker, ISuppor
 
         foreach (var step in steps.Span)
         {
-            if (this.CurrentMap.Terrain.AIgrid[step.To.X, step.To.Y] == 0)
+            if (this.CurrentMap.Terrain.AIgrid[step.To.Y, step.To.X] == 0)
             {
                 Debugger.Break();
             }

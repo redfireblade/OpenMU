@@ -95,7 +95,7 @@ public partial class CreateConnectServerConfig : ComponentBase, IAsyncDisposable
         var existingServerDefinitions = (await persistenceContext.GetAsync<ConnectServerDefinition>(cancellationToken).ConfigureAwait(false)).ToList();
 
         var nextServerId = 0;
-        var networkPort = 55901;
+        var networkPort = ServerConfigHelper.ReadInt("ConnectServer", "StartPort", 44406);
         if (existingServerDefinitions.Count > 0)
         {
             nextServerId = existingServerDefinitions.Max(s => s.ServerId) + 1;

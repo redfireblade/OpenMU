@@ -113,7 +113,7 @@ public class SummonPartySkillPlugin : TargetedSkillPluginBase
                 var offsetY = Rand.NextInt(-2, 3);
                 Point testPoint = new((byte)(player.Position.X + offsetX), (byte)(player.Position.Y + offsetY));
 
-                if (player.CurrentMap!.Terrain.WalkMap[testPoint.X, testPoint.Y]
+                if (player.CurrentMap!.Terrain.WalkMap[testPoint.Y, testPoint.X]
                     && player.Position.EuclideanDistanceTo(targetPoint) < 6)
                 {
                     targetPoint = testPoint;

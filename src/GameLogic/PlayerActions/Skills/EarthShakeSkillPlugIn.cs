@@ -43,8 +43,8 @@ public class EarthShakeSkillPlugIn : IAreaSkillPlugIn
         for (int i = 0; i < 3; i++)
         {
             var nextTarget = currentTarget.CalculateTargetPoint(direction);
-            if (!currentMap.Terrain.WalkMap[nextTarget.X, nextTarget.Y]
-                || (target is NonPlayerCharacter && target.CurrentMap.Terrain.SafezoneMap[nextTarget.X, nextTarget.Y]))
+            if (!currentMap.Terrain.WalkMap[nextTarget.Y, nextTarget.X]
+                || (target is NonPlayerCharacter && target.CurrentMap.Terrain.SafezoneMap[nextTarget.Y, nextTarget.X]))
             {
                 // we don't want to push the target into a non-reachable area, through walls or monsters into the safe zone.
                 break;

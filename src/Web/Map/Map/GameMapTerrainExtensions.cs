@@ -26,11 +26,11 @@ public static class GameMapTerrainExtensions
             for (int x = 0; x < 0x100; x++)
             {
                 var color = Color.Black;
-                if (terrain.SafezoneMap[y, x])
+                if (terrain.SafezoneMap[x, y])
                 {
                     color = Color.Gray;
                 }
-                else if (terrain.WalkMap[y, x])
+                else if (terrain.WalkMap[x, y])
                 {
                     color = Color.SpringGreen;
                 }

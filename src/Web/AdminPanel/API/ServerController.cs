@@ -1,4 +1,5 @@
 ﻿using BCrypt.Net;
+using MUnique.OpenMU.Pathfinding;
 
 namespace MUnique.OpenMU.Web.API
 {
@@ -165,7 +166,6 @@ namespace MUnique.OpenMU.Web.API
                     spawnX = (byte)Random.Shared.Next(spawnGate.X1, spawnGate.X2 + 1);
                     spawnY = (byte)Random.Shared.Next(spawnGate.Y1, spawnGate.Y2 + 1);
                 }
-
                 character.PositionX = spawnX;
                 character.PositionY = spawnY;
             }
@@ -198,6 +198,26 @@ namespace MUnique.OpenMU.Web.API
             public string CharacterName { get; set; } = string.Empty;
             /// <summary>Character class number (0=DarkWizard, 4=DarkKnight, etc).</summary>
             public int CharacterClass { get; set; }
+        }
+
+        /// <summary>
+        /// Teleports a bot character to a specific position (for AI bot testing).
+        /// GET /api/bot/teleport?name=test3Dk&x=136&y=136
+        /// </summary>
+        [HttpGet]
+        [Route("bot/teleport")]
+        public async Task<IActionResult> TeleportBot([FromQuery] string name, [FromQuery] byte x = 136, [FromQuery] byte y = 136)
+        {
+            foreach (var server in this._gameServers.Values.OfType<GameServer>())
+            {
+                var player = server.Context.GetPlayerByCharacterName(name);
+                if (player is not null)
+                {
+                    await player.TeleportToMapAsync(player.CurrentMap!, new Point(x, y));
+                    return Ok(new { message = $"Teleported {name} to ({x},{y})" });
+                }
+            }
+            return NotFound(new { error = $"Player {name} not found" });
         }
 
         /// <summary>

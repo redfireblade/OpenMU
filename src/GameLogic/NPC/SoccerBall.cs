@@ -108,7 +108,7 @@ public sealed class SoccerBall : NonPlayerCharacter, IAttackable, IMovable
         for (int i = 0; i < range; i++)
         {
             var target = finalTarget.CalculateTargetPoint(direction);
-            if (terrain.AIgrid[target.X, target.Y] == 1)
+            if (terrain.AIgrid[target.Y, target.X] == 1)
             {
                 finalTarget = target;
             }

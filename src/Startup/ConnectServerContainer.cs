@@ -107,7 +107,9 @@ public class ConnectServerContainer : ServerContainerBase, IEnumerable<IConnectS
     protected override async Task StartInnerAsync(CancellationToken cancellationToken)
     {
         using var persistenceContext = this._persistenceContextProvider.CreateNewConfigurationContext();
-        foreach (var connectServerDefinition in await persistenceContext.GetAsync<ConnectServerDefinition>(cancellationToken).ConfigureAwait(false))
+        var definitions = (await persistenceContext.GetAsync<ConnectServerDefinition>(cancellationToken).ConfigureAwait(false)).ToList();
+
+        foreach (var connectServerDefinition in definitions)
         {
             this.InitializeConnectServer(connectServerDefinition);
         }

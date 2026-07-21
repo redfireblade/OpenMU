@@ -53,7 +53,7 @@ public sealed class LostMapDroppedPlugIn : IItemDropPlugIn
         }
 
         var gatePosition = target;
-        if (player.IsAtSafezone() || player.CurrentMap?.Terrain.SafezoneMap[gatePosition.X, gatePosition.Y] is true)
+        if (player.IsAtSafezone() || player.CurrentMap?.Terrain.SafezoneMap[gatePosition.Y, gatePosition.X] is true)
         {
             await player.ShowLocalizedBlueMessageAsync(nameof(PlayerMessage.NoKalimaGateInSafezone)).ConfigureAwait(false);
             return;
