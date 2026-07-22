@@ -36,8 +36,8 @@ public class WizardTeleportAction
         if (!player.IsAtSafezone()
             && player.IsActive()
             && player.SkillList?.GetSkill(TeleportSkillId) is { Skill: { } skill }
-            && player.CurrentMap!.Terrain.WalkMap[target.Y, target.X]
-            && !player.CurrentMap.Terrain.SafezoneMap[target.Y, target.X]
+            && player.CurrentMap!.Terrain.WalkMap[target.X, target.Y]
+            && !player.CurrentMap.Terrain.SafezoneMap[target.X, target.Y]
             && player.IsInRange(target, skill.Range)
             && CanPlayerBeTeleported(player)
             && await player.TryConsumeForSkillAsync(skill).ConfigureAwait(false))
@@ -62,8 +62,8 @@ public class WizardTeleportAction
             && player.IsActive()
             && player.SkillList?.GetSkill(TeleportTargetSkillId) is { Skill: { } skill }
             && player.Party is not null
-            && player.CurrentMap!.Terrain.WalkMap[target.Y, target.X]
-            && !player.CurrentMap.Terrain.SafezoneMap[target.Y, target.X]
+            && player.CurrentMap!.Terrain.WalkMap[target.X, target.Y]
+            && !player.CurrentMap.Terrain.SafezoneMap[target.X, target.Y]
             && await player.GetObservingPlayerWithIdAsync(targetId).ConfigureAwait(false) is { } targetPlayer
             && targetPlayer.Party == player.Party
             && targetPlayer.IsActive()

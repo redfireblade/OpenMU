@@ -1076,8 +1076,8 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
             return;
         }
 
+        this.CurrentMap = null; // Clear before PlaceAtGate so it uses gate.Map.TerrainData, not old map
         this.PlaceAtGate(gate);
-        this.CurrentMap = null; // Will be set again, when the client acknowledged the map change by F3 12 packet.
 
         if (!this.PlayerState.CurrentState.IsDisconnectedOrFinished())
         {
@@ -1163,7 +1163,10 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
         var posX = this.SelectedCharacter.PositionX;
         var posY = this.SelectedCharacter.PositionY;
         var terrain = this.CurrentMap.Terrain;
-        if (!terrain.WalkMap[posX, posY])
+        bool walkOk = terrain.WalkMap[posX, posY];
+        this.Logger.LogWarning("[READY] map={0} pos=({1},{2}) WalkMap={3}",
+            this.SelectedCharacter.CurrentMap?.Number ?? -1, posX, posY, walkOk);
+        if (!walkOk)
         {
             // 当前位置不可行走 → 在附近找一个可行走的格子
             bool found = false;
@@ -2012,6 +2015,11 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
         var x = (byte)Rand.NextInt(gate.X1, gate.X2);
         var y = (byte)Rand.NextInt(gate.Y1, gate.Y2);
 
+        // 保存旧位置，用于彻底失败时回退
+        var prevMap = this.CurrentMap?.Definition;
+        var prevX = this.SelectedCharacter?.PositionX ?? 0;
+        var prevY = this.SelectedCharacter?.PositionY ?? 0;
+
         // 用地形数据验证（优先用当前地图，换图时用目标地图定义里的 TerrainData）
         byte[]? terrainData = null;
         if (this.CurrentMap?.Terrain is { } runtimeTerrain)
@@ -2042,10 +2050,10 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
                 if (IsWalkable(x, y)) found = true;
             }
 
-            // 扩大搜索
+            // 扩大3圈
             if (!found)
             {
-                for (int radius = 1; radius <= 30 && !found; radius++)
+                for (int radius = 1; radius <= 3 && !found; radius++)
                 {
                     for (int dx = -radius; dx <= radius && !found; dx++)
                     for (int dy = -radius; dy <= radius && !found; dy++)
@@ -2057,13 +2065,39 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
                 }
             }
 
-            // 全图兜底
+            // 全图随机10次兜底
+            if (!found)
+            {
+                for (int attempt = 0; attempt < 10 && !found; attempt++)
+                {
+                    byte rx = (byte)Rand.NextInt(0, 256);
+                    byte ry = (byte)Rand.NextInt(0, 256);
+                    if (IsWalkable(rx, ry)) { x = rx; y = ry; found = true; }
+                }
+            }
+
+            // 全图扫描最终兜底
             if (!found)
             {
                 for (int tx = 0; tx < 256 && !found; tx++)
                 for (int ty = 0; ty < 256 && !found; ty++)
                     if (IsWalkable(tx, ty))
                     { x = (byte)tx; y = (byte)ty; found = true; }
+            }
+
+            // 彻底失败：回到上一个地图和坐标
+            if (!found)
+            {
+                this.Logger.LogWarning("[PLACEAT] FAIL: gate({0},{1})-({2},{3}) map={4}, returning to prev map",
+                    gate.X1, gate.Y1, gate.X2, gate.Y2, gate.Map?.Number ?? -1);
+                if (prevMap != null)
+                {
+                    this.SelectedCharacter!.PositionX = prevX;
+                    this.SelectedCharacter.PositionY = prevY;
+                    this.SelectedCharacter.CurrentMap = prevMap;
+                    this.Rotation = Direction.SouthWest;
+                    return;
+                }
             }
         }
 

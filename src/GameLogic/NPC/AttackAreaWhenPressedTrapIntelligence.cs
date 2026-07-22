@@ -37,7 +37,7 @@ public class AttackAreaWhenPressedTrapIntelligence : TrapIntelligenceBase
 
         var targetsInRange = this.PossibleTargets
             .Where(target => this.Trap.IsInRange(target.Position, this.Trap.Definition.AttackRange))
-            .Where(target => !this.Map.Terrain.SafezoneMap[target.Position.Y, target.Position.X]);
+            .Where(target => !this.Map.Terrain.SafezoneMap[target.Position.X, target.Position.Y]);
 
         if (this.Trap.Definition.AttackSkill is { } attackSkill)
         {

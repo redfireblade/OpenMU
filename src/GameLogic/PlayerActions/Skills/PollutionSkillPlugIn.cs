@@ -44,8 +44,8 @@ public class PollutionSkillPlugIn : IAreaSkillPlugIn
         for (int i = 0; i < 2; i++)
         {
             var nextTarget = currentTarget.CalculateTargetPoint(direction);
-            if (!currentMap.Terrain.WalkMap[nextTarget.Y, nextTarget.X]
-                || (target is NonPlayerCharacter && target.CurrentMap.Terrain.SafezoneMap[nextTarget.Y, nextTarget.X]))
+            if (!currentMap.Terrain.WalkMap[nextTarget.X, nextTarget.Y]
+                || (target is NonPlayerCharacter && target.CurrentMap.Terrain.SafezoneMap[nextTarget.X, nextTarget.Y]))
             {
                 // we don't want to push the target into a non-reachable area, through walls or monsters into the safe zone.
                 break;

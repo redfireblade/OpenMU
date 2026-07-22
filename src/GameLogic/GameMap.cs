@@ -275,7 +275,7 @@ public class GameMap
     {
         var drops = this._objectsInMap.Values
             .OfType<DroppedItem>()
-            .Where(d => !this.Terrain.WalkMap[d.Position.Y, d.Position.X])
+            .Where(d => !this.Terrain.WalkMap[d.Position.X, d.Position.Y])
             .ToList();
 
         foreach (var drop in drops)

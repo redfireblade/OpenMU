@@ -41,32 +41,22 @@
 
 ---
 
-## ⭐ 坐标系统 — 从 `COORD-SYSTEM.md` 精简
+## ⭐ 坐标系统 (2026-07-23 统一版)
 
-> ⚠️ **坐标系统是历史最大痛点，AI 反复在此出错。**
-> **完整详解请读** `SERVERS/OPENMU/COORD-SYSTEM.md`（必读）
+> **完整规范**: `SERVERS/OPENMU/COORD-SYSTEM.md`
 
-### 会话必知
+### 核心约定（统一版）
 
 ```
-ReadTerrainData:      WalkMap[列=i&0xFF, 行=i>>8]
-WalkMap/AIgrid 访问:  [X(row), Y(col)]         ← 禁止改为[Y,X]
-行走掩码:             0x54 (排除NOGROUND-0x08)
-DB TerrainData:       已左转90度(2026-07-22)
-编辑器读取:           terrain[列*256+行] 交换索引
+全系统统一: WalkMap[X(row), Y(col)]
+  - ReadTerrainData 存储: WalkMap[y=row, x=col]
+  - WalkToAsync 访问:     WalkMap[target.X=row, target.Y=col]
+  - 存储和访问一致，不再有"互补"系统
+Point 语义:  X = 行(north-south), Y = 列(east-west)
+Gate 语义:   X1/X2 = 行范围, Y1/Y2 = 列范围
+行走掩码:    0x54 (NOMOVE|WATER|HEIGHT, 不含NOGROUND)
+禁止写法:    WalkMap[Y,X] / SafezoneMap[Y,X] / AIgrid[Y,X]
 ```
-
-### 三大关键函数坐标访问方式
-
-| 函数 | 功能 | 坐标来源 | 地图访问 |
-|------|------|----------|----------|
-| `WalkToAsync` | 行走判定 | `Point(target.X=行, target.Y=列)` | `WalkMap[X(行), Y(列)]` |
-| `PlaceAtGate` | 出生点定位 | `Gate.X1=行, Gate.Y1=列` | `AIgrid[X(行), Y(列)]` |
-| `ClientReadyAfterMapChangeAsync` | 换图修正 | `PositionX=行, PositionY=列` | `WalkMap[X(行), Y(列)]` |
-
-### 常见错误
-
-- ❌ WalkMap 改为 `[Y,X]` → 全地图停走
 - ❌ PlaceAtGate 用 `CurrentMap.Terrain` 替代 `gate.Map.TerrainData` → 换图无验证
 - ❌ 修改 ReadTerrainData 索引 → 整个系统崩溃
 - ❌ 不要修改 Network/Packets/ 中的协议生成文件（由 XML + XSLT 控制）

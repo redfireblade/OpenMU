@@ -1,214 +1,126 @@
-# 坐标系统完整规范
+# 坐标系统完整规范 (v2.0)
 
-> **地位**: 本文档取代 CLAUDE.md 中坐标系统节的所有旧内容
-> **维护**: 2026-07-22
-> **核心事实**: WalkMap[X(row), Y(col)] 是经反复验证的正确约定，禁止改动
+> **维护**: 2026-07-23
+> **核心约定**: 全系统统一 `WalkMap[X(row), Y(col)]` — 存储和访问一致，不再互补
 
-## 一、存储格式
+---
 
-### 1.1 文件与 DB 存储统一标准
+## 一、统一约定
 
-所有持久化地形数据使用**相同的格式**（称为"服务端格式"或".att 原始格式"）：
+**2026-07-23 重大修正**: 将 ReadTerrainData 的存储从 `WalkMap[col, row]` 改为 `WalkMap[row, col]`，与所有外部代码的 `WalkMap[X=row, Y=col]` 访问约定一致。
+
+**旧版本（S32）**: 存储 `[col, row]`，访问 `[row, col]` → 互补但易出错  
+**新版本（S33）**: 存储和访问都是 `[row, col]` → 统一
+
+---
+
+## 二、存储格式
+
+### 2.1 TerrainData (DB / .att 文件)
 
 ```
 3字节头 [0x00, 0xFF, 0xFF] + 65536字节地形属性值
-i = 行 * 256 + 列（线性索引）
-TerrainData[i+3] = 属性值          // 偏移3跳过头
+i = 行 * 256 + 列（.att 文件线性索引）
 ```
 
-地形属性值含义：
+### 2.2 地形属性值
 
 | 值 | 含义 |
 |----|------|
 | 0x00 | 空地（可走、非安全区） |
 | 0x01 | 安全区（可走、安全区） |
 | 0x04 | NOMOVE（不可走，墙） |
-| 0x08 | NOGROUND（不可走，无地面纹理） |
-| 0x0C | NOMOVE+NOGROUND |
+| 0x08 | NOGROUND（无地面纹理，但可走） |
 | 0xFF | 地图外 |
 
-### 1.2 行走性判定规则（服务端 & 客户端一致）
+### 2.3 行走性判定
 
 ```csharp
 walkable = value != 0xFF && (value & 0x54) == 0;
 // 0x54 = NOMOVE(0x04) | WATER(0x10) | HEIGHT(0x40)
-// 不包含 NOGROUND(0x08) — 客户端鼠标点击行走也只查 NOMOVE
+// 不含 NOGROUND(0x08) — 匹配客户端鼠标点击行走判定
 safezone = (value & 0x01) != 0;
 ```
 
-### 1.3 DB 存储（2026-07-22 后）
-
-DB `config."GameMapDefinition"."TerrainData"` 中的地形数据已 **左转90度**（相对于原始 `.att` 文件），以匹配 ExitGate 坐标的方向：
-
-```
-左转90度变换:
-  dst[新列 * 256 + (255 - 新行)] = src[行 * 256 + 列]
-```
-
-这意味着 DB 地形数据可以直接用门坐标（行大门，Y=列）渲染无需额外旋转。
-
-## 二、四类程序的坐标处理方式
-
-### 2.1 服务端运行时（GameLogic）
-
-#### 启动流程
-
-```
-- Startup/Program.cs — 启动时从嵌入资源读取 .att 文件
-- TerrainUpdateHelper — 读 Terrain{N}.att（服务端格式）
-       → 设置 GameMapDefinition.TerrainData（DB 也存这份数据）
-- GameMapTerrain(definition) 构造 — 读 TerrainData → 执行 ReadTerrainData
-```
-
-#### `GameMapTerrain.ReadTerrainData` — 地形加载
+### 2.4 ReadTerrainData（统一存储）
 
 ```csharp
-// 输入: terrainData 字节流（服务端格式，i = row*256 + col）
-// 转换:
-byte x = (byte)(i & 0xFF);          // x = 列 (col)
-byte y = (byte)((i >> 8) & 0xFF);   // y = 行 (row)
-
-// 存储: WalkMap[列, 行], SafezoneMap[列, 行], AIgrid[列, 行]
-this.WalkMap[x, y] = value != 0xFF && (value & 0x54) == 0;
-this.SafezoneMap[x, y] = (value & 0x01) != 0;
-this.UpdateAiGridValue(x, y);  // AIgrid[x, y]
+for (int i = 0; i < data.Length; i++)
+{
+    byte x = (byte)(i & 0xFF);  // col
+    byte y = (byte)((i >> 8) & 0xFF); // row
+    // 存储为 [y=row, x=col] 以匹配所有外部代码的 WalkMap[row, col] 访问
+    this.WalkMap[y, x] = value != 0xFF && (value & 0x54) == 0;
+    this.SafezoneMap[y, x] = (value & 0x01) != 0;
+    this.UpdateAiGridValue(y, x);
+}
 ```
 
-这里形成了**第一层互补**：`WalkMap[列, 行]` 的存储形式——因为 `x=i&0xFF=列，y=i>>8=行`——等价于 `WalkMap[col, row]`。
+---
 
-#### `WalkToAsync`
-- 玩家点击行走，客户端发送 `(X=行, Y=列)`，服务端构造 `Point{ X=行, Y=列 }`
-- 服务端用 **WalkMap[X(行), Y(列)]** 检查该点是否可行走
-- 虽然 WalkMap 存储是 `[列,行]`，但这里用 `[行,列]`——形成了**第二层互补**
-- 两层互补抵消后，数据访问恰好正确
+## 三、坐标约定
 
-#### `PlaceAtGate`
-- 在门区域内随机取坐标 `(X=行, Y=列)`（与 ExitGate 定义一致）
-- 用 `AIgrid[X(行), Y(列)]` 检查，AIgrid 存储也是 `[列,行]`——同样互补
-- 跨地图传送时，`CurrentMap` 可能为 null，改为读 `gate.Map.TerrainData` 的原始字节
+### 3.1 Point 语义
 
-#### `ClientReadyAfterMapChangeAsync`
-- 读角色存储的 `PositionX(行)`, `PositionY(列)`  
-- WalkMap[X(行), Y(列)] 验证
+```
+Point.X = 行 (row, north-south)
+Point.Y = 列 (col, east-west)
+```
 
-### 2.2 门编辑器（_spawn/SpawnEditor）
+### 3.2 WalkMap / SafezoneMap / AIgrid 访问
 
-#### 地形读取
+**全系统统一使用 `[X, Y]` 即 `[row, col]`**:
+
 ```csharp
-// 读取客户端加密文件并解密
-// 再用 [列, 行] 交换索引读取:
-v = terrain[列 * 256 + 行]
+WalkMap[target.X, target.Y]      // WalkToAsync — ✅ 统一
+SafezoneMap[pos.X, pos.Y]        // IsAtSafezone — ✅ 统一
+AIgrid[px, py]                   // PlaceAtGate — ✅ 统一
 ```
 
-#### 关键区别——交换索引
-
-服务端用 `i = 行*256 + 列` 读，再用 `x=i&0xFF=列, y=i>>8=行` 存为 `[列,行]`。  
-门编辑器直接用 `terrain[列 * 256 + 行]` 读——效果等价于把存储的 `[列,行]` 直接读取。
-
-#### 渲染
+**已禁止的旧写法**（2026-07-23 全部修复）:
 ```csharp
-// SetPixel(x=列(水平), y=行(垂直), 颜色)
-SetPixel(列 * 像素格 + dx, 行 * 像素格 + dy, 颜色)
+// ❌ WalkMap[target.Y, target.X] — 旧互补系统，已废弃
+// ❌ SafezoneMap[obj.Position.Y, obj.Position.X] — 已修复
+// ❌ AIgrid[step.To.Y, step.To.X] — 已修复
 ```
 
-`[列,行]` 的读取 + `SetPixel(x=列,y=行)` = **不旋转、不翻转换直接显示游戏正确画面**。
-
-这是因为客户端 EncTerrain 的数据方向本身就和服务端 `ReadTerrainData` 的 `[列,行]` 存储一致。
-
-#### 门坐标绘制
-```csharp
-// DB ExitGate: X1=行, Y1=列
-sx = Y1(列) * 像素格    // 水平 = 列
-sy = X1(行) * 像素格    // 垂直 = 行
-sw = (Y2-Y1+1) * 像素格
-sh = (X2-X1+1) * 像素格
-```
-
-门坐标用的是游戏视角的行列，和渲染用的 `[列,行]` 恰好匹配。
-
-### 2.3 HTML 门查看工具（/tmp/terrain_compare）
-
-#### 地形读取
-```csharp
-// 直接从 DB 读（DB 已左转90度）
-v = td[3 + 行 * 256 + 列]
-// 采用与 .att 相同的 i = 行*256 + 列 索引
-```
-
-#### 渲染
-```csharp
-// 左转90度渲染
-SetPixel(行 * 像素格, 列 * 像素格, 颜色)
-// 行→水平方向, 列→垂直方向
-```
-
-#### 门坐标
-```csharp
-sx = 行 * 像素格    // 水平 = 行
-sy = 列 * 像素格    // 垂直 = 列
-```
-
-这里没有互补——因为 DB 已左转90度，所以直接 `[行,列]` 索引 + 左转90度渲染 = 匹配游戏画面。
-
-### 2.4 客户端（C++ HeadlessClient）
-
-#### 加密地形加载
-```csharp
-// Decrypt EncTerrain → TerrainWall[65536]
-TerrainWall[i] = decrypted[4 + i];  // 跳过4B头
-// TerrainWall 是 WORD 数组，但属性值在低字节
-```
-
-#### 行走判定
-```csharp
-// 鼠标点击：
-if ((TerrainWall[i] & TW_NOMOVE) != TW_NOMOVE) // 只查 0x04
-    AllowWalk();
-// 不查 NOGROUND(0x08)、WATER(0x10)、HEIGHT(0x40)
-```
-
-#### 渲染
-```csharp
-// 地面纹理
-if ((TerrainWall[i] & TW_NOGROUND) == TW_NOGROUND) skip render;
-
-// 地形索引: TERRAIN_INDEX(x, y) = x + y * TERRAIN_SIZE
-// x = 水平(列), y = 垂直(行)
-```
-
-## 三、变换对照表
-
-| 程序 | 读取索引 | 存储/内存 | 渲染 | 门坐标映射 | 旋转 |
-|------|----------|-----------|------|-----------|------|
-| 服务端 `ReadTerrainData` | `i=row*256+col` | `[col, row]` | 不渲染 | `[X(row),Y(col)]` 互补访问 | 无 |
-| 服务端 `WalkToAsync` | — | `WalkMap[col,row]` | — | `WalkMap[X(row),Y(col)]` | 无 |
-| 门编辑器 | `[col*256+row]` 交换 | 直接显示 | `x=col, y=row` | `sx=col, sy=row` | 不旋转（交换索引抵消） |
-| HTML工具 | `[row*256+col]` | DB 已旋转 | `x=row, y=col` | `sx=row, sy=col` | 左转90度 |
-| 客户端 | `i` 线性 | `TerrainWall[i]` | `x, y` 游戏原生 | `TerrainWall[i]` | 游戏原生 |
-
-## 四、数据流与存储位置
+### 3.3 Gate 坐标
 
 ```
-EncTerrain{N}.att（客户端加密）
-  ↓ 解密
-TerrainSourceA/World{N}/（编辑器源文件，供编辑器使用）
-  ↓ 解密 + [列,行] 索引
-编辑器显示
-  ↓ 保存
-spawn_gates.json（编辑器配置，存储出生门坐标 [行, 列, 行, 列]）
-  ↓ + DB ExitGate
-游戏服务端运行时
-  ↓ ReadTerrainData → WalkMap[列,行]
-  ↓ WalkToAsync：WalkMap[X(行),Y(列)]
-玩家行走
-  ↑
-客户端 EncTerrain 解密 → TerrainWall[i] → NOMOVE 检查
+ExitGate: X1=行, Y1=列
+EnterGate: X1/X2=行, Y1/Y2=列
+PlaceAtGate: px=gate.X1(行), py=gate.Y1(列)
 ```
 
-## 五、核心规则摘要
+---
 
-1. ⛔ **WalkMap[X(row), Y(col)] 禁止改为 [Y,X]**
-2. ⛔ **服务端 `0x54` 掩码禁止改回 `0x5C`**
-3. ⛔ **DB TerrainData 已左转90度，禁止再旋转**
-4. ⛔ **门编辑器用 `[列,行]` 索引，HTML 用 `[行,列]`+左转90度，两者不等价**
-5. ⛔ **跨地图 PlaceAtGate 不能依赖 CurrentMap.Terrain，用 gate.Map.TerrainData**
+## 四、地形数据来源
+
+### 4.1 服务端嵌入资源
+
+`src/Persistence/Initialization/Resources/Terrain{N}.att`
+
+来源：客户端 EncTerrain 解密 → 转置 → 写入服务器格式
+
+### 4.2 DB 存储
+
+`config.GameMapDefinition.TerrainData` (bytea, 65539 字节)
+
+与嵌入资源一致。服务器启动时通过 `UpdateTerrainFromResources` 从嵌入资源加载。
+
+### 4.3 编辑器显示约定
+
+编辑器使用 `terrain[col * 256 + row]`（列优先），屏幕显示需要转置 `screen(row, col)`。
+
+---
+
+## 五、完整修复清单 (2026-07-23)
+
+| 类别 | 修复 | 文件数 |
+|------|------|:--:|
+| ReadTerrainData | `[x,y]→[y,x]`, 掩码 `0x5C→0x54` | 2 |
+| WalkMap/SafezoneMap | `[Y,X]→[X,Y]` 全系统 | 18 |
+| WarpToAsync | CurrentMap 提前清空 | 2 |
+| PlaceAtGate | 3圈+10随机+回退兜底 | 2 |
+| 地形来源 | EncTerrain 解密→DB+Resources | 51 地图 |
+| 075_ 删除 | 统一前缀+删文件 | 7 |

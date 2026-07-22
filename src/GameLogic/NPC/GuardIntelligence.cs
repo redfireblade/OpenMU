@@ -31,7 +31,7 @@ public sealed class GuardIntelligence : BasicMonsterIntelligence
     /// <inheritdoc/>
     public override bool CanWalkOn(Point target)
     {
-        return this.Monster.CurrentMap.Terrain.WalkMap[target.Y, target.X];
+        return this.Monster.CurrentMap.Terrain.WalkMap[target.X, target.Y];
     }
 
     /// <inheritdoc />

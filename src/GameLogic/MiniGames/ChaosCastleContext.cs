@@ -475,7 +475,7 @@ public sealed class ChaosCastleContext : MiniGameContext
     private async Task CheckPlayerPositionAsync(Player player)
     {
         var position = player.Position;
-        var terrainIsWalkable = this.Map.Terrain.WalkMap[position.Y, position.X];
+        var terrainIsWalkable = this.Map.Terrain.WalkMap[position.X, position.Y];
         if (terrainIsWalkable)
         {
             return;

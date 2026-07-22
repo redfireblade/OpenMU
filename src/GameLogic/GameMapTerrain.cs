@@ -139,10 +139,11 @@ public class GameMapTerrain
             byte value = data[i];
             // 匹配客户端鼠标点击行走判定: 只检查 NOMOVE(0x04)，不检查 NOGROUND(0x08)
             // NOGROUND 仅影响地面纹理渲染，不影响行走 (ZzzInterface.cpp:3342)
-            this.WalkMap[x, y] = value != 0xFF && (value & 0x54) == 0;
+            // 存储为 [row=y, col=x] 以匹配 WalkToAsync 等所有外部代码的 WalkMap[row, col] 访问约定
+            this.WalkMap[y, x] = value != 0xFF && (value & 0x54) == 0;
             // 安全区: 客户端判定 (v & 0x01) != 0，值 1/3/5/7 等都算安全区
-            this.SafezoneMap[x, y] = (value & 0x01) != 0;
-            this.UpdateAiGridValue(x, y);
+            this.SafezoneMap[y, x] = (value & 0x01) != 0;
+            this.UpdateAiGridValue(y, x);
         }
     }
 }
