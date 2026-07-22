@@ -1,126 +1,182 @@
-# 坐标系统完整规范 (v2.0)
+# 坐标系统完整规范 v2.0
 
 > **维护**: 2026-07-23
-> **核心约定**: 全系统统一 `WalkMap[X(row), Y(col)]` — 存储和访问一致，不再互补
+> **唯一真理**: 全系统统一 `WalkMap[row, col]`，存储和访问一致
 
 ---
 
-## 一、统一约定
+## 一、核心定义
 
-**2026-07-23 重大修正**: 将 ReadTerrainData 的存储从 `WalkMap[col, row]` 改为 `WalkMap[row, col]`，与所有外部代码的 `WalkMap[X=row, Y=col]` 访问约定一致。
+### 1.1 术语
 
-**旧版本（S32）**: 存储 `[col, row]`，访问 `[row, col]` → 互补但易出错  
-**新版本（S33）**: 存储和访问都是 `[row, col]` → 统一
+| 术语 | 含义 | 别名 |
+|------|------|------|
+| **row** | 南北方向 (north-south) | X, PositionX, gate.X1 |
+| **col** | 东西方向 (east-west) | Y, PositionY, gate.Y1 |
+
+### 1.2 Point
+
+```csharp
+Point(byte X, byte Y)   // X = row (行), Y = col (列)
+```
+
+**全系统统一**：`Point.X` 永远是 row，`Point.Y` 永远是 col。禁止混淆。
 
 ---
 
-## 二、存储格式
+## 二、地形存储
 
-### 2.1 TerrainData (DB / .att 文件)
+### 2.1 .att 文件格式
 
 ```
-3字节头 [0x00, 0xFF, 0xFF] + 65536字节地形属性值
-i = 行 * 256 + 列（.att 文件线性索引）
+3 字节头:  0x00 0xFF 0xFF
+65536 字节: 地形属性值，按 row-major 存储
+线性索引:  i = row * 256 + col
 ```
 
-### 2.2 地形属性值
+### 2.2 属性值
 
-| 值 | 含义 |
-|----|------|
-| 0x00 | 空地（可走、非安全区） |
-| 0x01 | 安全区（可走、安全区） |
-| 0x04 | NOMOVE（不可走，墙） |
-| 0x08 | NOGROUND（无地面纹理，但可走） |
-| 0xFF | 地图外 |
+| 值 | 位 | 含义 |
+|:--:|-----|------|
+| 0 | — | 空地，可走，非安全区 |
+| 1 | bit0 | 安全区，可走 |
+| 4 | bit2 | NOMOVE，不可走（墙） |
+| 5 | bit0+bit2 | 安全区内的墙 |
+| 8 | bit3 | NOGROUND，可走（无地面贴图） |
+| 12 | bit2+bit3 | NOMOVE+NOGROUND，不可走 |
+| 255 | — | 地图外 |
 
-### 2.3 行走性判定
+### 2.3 判定规则
 
 ```csharp
-walkable = value != 0xFF && (value & 0x54) == 0;
-// 0x54 = NOMOVE(0x04) | WATER(0x10) | HEIGHT(0x40)
-// 不含 NOGROUND(0x08) — 匹配客户端鼠标点击行走判定
-safezone = (value & 0x01) != 0;
+// 可走判定 — 匹配客户端鼠标点击行走
+// 只查 NOMOVE(0x04)、WATER(0x10)、HEIGHT(0x40)，不查 NOGROUND(0x08)
+bool walkable = value != 0xFF && (value & 0x54) == 0;
+
+// 安全区判定
+bool safezone = (value & 0x01) != 0;
 ```
 
-### 2.4 ReadTerrainData（统一存储）
+---
+
+## 三、内存结构（Run-Time）
+
+### 3.1 ReadTerrainData
 
 ```csharp
-for (int i = 0; i < data.Length; i++)
+// GameMapTerrain.cs
+private void ReadTerrainData(ReadOnlySpan<byte> data)
 {
-    byte x = (byte)(i & 0xFF);  // col
-    byte y = (byte)((i >> 8) & 0xFF); // row
-    // 存储为 [y=row, x=col] 以匹配所有外部代码的 WalkMap[row, col] 访问
-    this.WalkMap[y, x] = value != 0xFF && (value & 0x54) == 0;
-    this.SafezoneMap[y, x] = (value & 0x01) != 0;
-    this.UpdateAiGridValue(y, x);
+    for (int i = 0; i < data.Length; i++)
+    {
+        byte x = (byte)(i & 0xFF);         // col (0-255循环)
+        byte y = (byte)((i >> 8) & 0xFF);  // row (每256递增)
+        byte value = data[i];
+
+        // 存储为 [y=row, x=col] = [row, col]
+        this.WalkMap[y, x]     = value != 0xFF && (value & 0x54) == 0;
+        this.SafezoneMap[y, x] = (value & 0x01) != 0;
+        this.AIgrid[y, x]      = (byte)((WalkMap[y,x] ? 1 : 0) | (SafezoneMap[y,x] ? 0x80 : 0));
+    }
 }
 ```
 
----
+**结果**: `WalkMap[row, col]`, `SafezoneMap[row, col]`, `AIgrid[row, col]` — 三个数组统一为 `[row, col]` 维度。
 
-## 三、坐标约定
-
-### 3.1 Point 语义
+### 3.2 AIgrid 编码
 
 ```
-Point.X = 行 (row, north-south)
-Point.Y = 列 (col, east-west)
-```
-
-### 3.2 WalkMap / SafezoneMap / AIgrid 访问
-
-**全系统统一使用 `[X, Y]` 即 `[row, col]`**:
-
-```csharp
-WalkMap[target.X, target.Y]      // WalkToAsync — ✅ 统一
-SafezoneMap[pos.X, pos.Y]        // IsAtSafezone — ✅ 统一
-AIgrid[px, py]                   // PlaceAtGate — ✅ 统一
-```
-
-**已禁止的旧写法**（2026-07-23 全部修复）:
-```csharp
-// ❌ WalkMap[target.Y, target.X] — 旧互补系统，已废弃
-// ❌ SafezoneMap[obj.Position.Y, obj.Position.X] — 已修复
-// ❌ AIgrid[step.To.Y, step.To.X] — 已修复
-```
-
-### 3.3 Gate 坐标
-
-```
-ExitGate: X1=行, Y1=列
-EnterGate: X1/X2=行, Y1/Y2=列
-PlaceAtGate: px=gate.X1(行), py=gate.Y1(列)
+bit 0  = 可走 (1=walkable)
+bit 7  = 安全区 (0x80=safezone)
 ```
 
 ---
 
-## 四、地形数据来源
+## 四、所有坐标访问
 
-### 4.1 服务端嵌入资源
+### 4.1 服务端
 
-`src/Persistence/Initialization/Resources/Terrain{N}.att`
+| 函数 | 文件 | 访问方式 | 语义 |
+|------|------|----------|------|
+| WalkToAsync | Player.cs | `WalkMap[target.X, target.Y]` | `[row, col]` |
+| PlaceAtGate | Player.cs | `AIgrid[px, py]` | px=row, py=col |
+| ClientReadyAfterMapChangeAsync | Player.cs | `WalkMap[posX, posY]` | `[row, col]` |
+| IsAtSafezone | LocateableExtensions.cs | `SafezoneMap[p.X, p.Y]` | `[row, col]` |
+| CanWalkOn | GuardIntelligence.cs | `WalkMap[target.X, target.Y]` | `[row, col]` |
+| CanWalkOn | BasicMonsterIntelligence.cs | `AIgrid[target.X, target.Y]` | `[row, col]` |
+| IsValidSpawnPoint | NonPlayerCharacter.cs | `WalkMap[sp.X, sp.Y]` | `[row, col]` |
+| PathFinder | BaseGridNetwork.cs | `grid[newX, newY]` | `[row, col]` |
+| 所有技能 | *.cs | `WalkMap[next.X, next.Y]` | `[row, col]` |
 
-来源：客户端 EncTerrain 解密 → 转置 → 写入服务器格式
+### 4.2 Gate
 
-### 4.2 DB 存储
+| 字段 | 含义 |
+|------|------|
+| ExitGate.X1, X2 | row 范围 (127~131) |
+| ExitGate.Y1, Y2 | col 范围 (115~119) |
+| EnterGate.X1, X2 | row 范围（传送门在地图上的row位置） |
+| EnterGate.Y1, Y2 | col 范围（传送门在地图上的col位置） |
 
-`config.GameMapDefinition.TerrainData` (bytea, 65539 字节)
+### 4.3 客户端 (mu103)
 
-与嵌入资源一致。服务器启动时通过 `UpdateTerrainFromResources` 从嵌入资源加载。
+| 结构 | 索引方式 |
+|------|----------|
+| TerrainWall | `WORD[65536]`, 线性 `y*256 + x` (行优先) |
+| 行走判定 | `(TerrainWall[i] & TW_NOMOVE) != TW_NOMOVE` → 只查 0x04 |
 
-### 4.3 编辑器显示约定
+客户端完全独立，不读服务端 DB。有自己的 EncTerrain 文件和渲染管线。
 
-编辑器使用 `terrain[col * 256 + row]`（列优先），屏幕显示需要转置 `screen(row, col)`。
+### 4.4 AI 系统 (AiBotServer)
+
+| 组件 | 索引 |
+|------|------|
+| WalkValidator | `_walkMap[col, row]` — 自身闭合，与服务端 WalkMap 不同来源 |
+| AStarPathFinder | `pheromone[y*256 + x]` — 从 ai.pheromone_map 加载 |
+| ShadowMapRegistry | `GlobalTrail[row*256 + col]` — 行优先 |
+
+AI 系统读取自己的 `ai.pheromone_map`（TerrainEditor 写入），不经过服务端 ReadTerrainData。内部坐标系自洽。
 
 ---
 
-## 五、完整修复清单 (2026-07-23)
+## 五、数据流
 
-| 类别 | 修复 | 文件数 |
-|------|------|:--:|
-| ReadTerrainData | `[x,y]→[y,x]`, 掩码 `0x5C→0x54` | 2 |
-| WalkMap/SafezoneMap | `[Y,X]→[X,Y]` 全系统 | 18 |
-| WarpToAsync | CurrentMap 提前清空 | 2 |
-| PlaceAtGate | 3圈+10随机+回退兜底 | 2 |
-| 地形来源 | EncTerrain 解密→DB+Resources | 51 地图 |
-| 075_ 删除 | 统一前缀+删文件 | 7 |
+### 5.1 服务端启动
+
+```
+Terrain{N}.att (嵌入资源)
+    ↓ Assembly.GetManifestResourceStream
+GameMapDefinition.TerrainData (byte[65539])
+    ↓ EF Core persist
+PostgreSQL config."GameMapDefinition"."TerrainData" (bytea)
+    ↓ 启动时读取
+GameMapTerrain 构造函数 → ReadTerrainData
+    ↓
+WalkMap[256,256] + SafezoneMap[256,256] + AIgrid[256,256]
+```
+
+### 5.2 地形数据更新
+
+```
+EncTerrain{N}.att (客户端加密文件)
+    ↓ MapFileDecrypt + BuxConvert 解密
+editor[col*256 + row] (65536 字节, 列优先)
+    ↓ 转置: server[row*256 + col] = editor[col*256 + row]
+Terrain{N}.att (服务端格式, 行优先)
+```
+
+### 5.3 编辑器
+
+编辑器使用 `terrain[col * 256 + row]`（列优先索引）。显示时 `屏幕(row, col)` 实现正确的视觉效果。
+
+---
+
+## 六、禁止事项
+
+| ❌ 禁止 | 原因 |
+|---------|------|
+| `WalkMap[Y, X]` 或 `WalkMap[col, row]` | 与统一约定冲突 |
+| `SafezoneMap[obj.Position.Y, obj.Position.X]` | 同上 |
+| `AIgrid[target.Y, target.X]` | 同上 |
+| `ReadTerrainData` 改用 `[x, y]` | 破坏存储/访问一致性 |
+| 修改掩码 `0x54` | 已与客户端对齐 |
+| 使用 `075_` 地形前缀 | 已删除，统一标准文件 |
