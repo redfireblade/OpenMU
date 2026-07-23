@@ -4,7 +4,7 @@
     {
       "name": "openmu-proxy",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["E:/MU_AI/MU_VER_1/SERVERS/OPENMU/start-openmu.sh"],
+      "runtimeArgs": ["E:/MU_AI/MU_VER_2/SERVERS/OPENMU/start-openmu.sh"],
       "port": 55900
     }
   ]

@@ -278,7 +278,7 @@ graph.query("合成翅膀最优路径")
 
 ### 服务器运行命令
 ```bash
-cd /d E:\mu_ai\MU_VER_1\SERVERS\OPENMU
+cd /d E:\mu_ai\MU_VER_2\SERVERS\OPENMU
 dotnet run --project src/Startup/MUnique.OpenMU.Startup.csproj -p:ci=true -- --autostart -demo -resolveIP:local
 ```
 

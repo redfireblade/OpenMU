@@ -7,7 +7,6 @@ namespace MUnique.OpenMU.Startup;
 using System.Threading;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using MUnique.OpenMU.AIPlayer;
 using MUnique.OpenMU.DataModel.Configuration;
 using MUnique.OpenMU.GameLogic;
 using MUnique.OpenMU.GameServer;
@@ -21,7 +20,7 @@ using MUnique.OpenMU.Web.AdminPanel.Services;
 /// <summary>
 /// A container which keeps all <see cref="IGameServer"/>s in one <see cref="IHostedService"/>.
 /// </summary>
-public sealed class GameServerContainer : ServerContainerBase, IGameServerInstanceManager, IGameServerContextResolver, IDisposable
+public sealed class GameServerContainer : ServerContainerBase, IGameServerInstanceManager, IDisposable
 {
     private readonly ILogger<GameServerContainer> _logger;
     private readonly ILoggerFactory _loggerFactory;
@@ -81,20 +80,6 @@ public sealed class GameServerContainer : ServerContainerBase, IGameServerInstan
 
         this._logger = this._loggerFactory.CreateLogger<GameServerContainer>();
         this._eventPublisher = new InMemoryEventPublisher(this._gameServers, this._friendServer, this._guildServer);
-    }
-
-    /// <inheritdoc />
-    public IGameContext? ResolveContext()
-    {
-        foreach (var gameServer in this._gameServers.Values)
-        {
-            if (gameServer is IGameServerContextProvider provider)
-            {
-                return provider.Context;
-            }
-        }
-
-        return null;
     }
 
     /// <inheritdoc />
