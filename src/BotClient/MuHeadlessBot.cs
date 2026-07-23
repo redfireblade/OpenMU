@@ -897,6 +897,7 @@ public sealed class MuHeadlessBot : IDisposable
         }
 
         // Fire-and-forget to avoid blocking the combat tick
+        // 服务端会在 0xD4/ObjectWalked 中拒绝不可行走的步数
         _ = SendWalkAsync((byte)dir, steps, (byte)newX, (byte)newY);
     }
 

@@ -751,8 +751,28 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
         if (this._activePlayers.TryGetValue(playerId, out var p)
             && p.SelectedCharacter is { } c)
         {
-            c.PositionX = x;
-            c.PositionY = y;
+            // 地形校验：防止把角色放到不可行走坐标上
+            var mapDef = c.CurrentMap;
+            var terrainData = mapDef?.TerrainData;
+            if (terrainData is { Length: >= 65539 })
+            {
+                int idx = 3 + x * 256 + y;
+                bool walkable = idx < terrainData.Length
+                    && terrainData[idx] != 0xFF
+                    && (terrainData[idx] & 0x54) == 0;
+                if (walkable)
+                {
+                    c.PositionX = x;
+                    c.PositionY = y;
+                }
+                // 不可行走 → 静默拒绝，不修改坐标
+            }
+            else
+            {
+                // 无地形数据时允许设置（可能是测试/初始化阶段）
+                c.PositionX = x;
+                c.PositionY = y;
+            }
         }
 
         return ValueTask.CompletedTask;
@@ -935,7 +955,11 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
         account.LoginName = $"_{counter:X}{Guid.NewGuid():N}"[..10];
         account.State = AccountState.Normal;
         account.Vault = persistenceContext.CreateNew<ItemStorage>();
-        account.Vault?.Items.Add(persistenceContext.CreateNew<Item>());
+        var vaultItem = persistenceContext.CreateNew<Item>();
+        if (account.Vault?.Items is not null && vaultItem is not null)
+        {
+            account.Vault.Items.Add(vaultItem);
+        }
 
         var character = persistenceContext.CreateNew<Character>();
         if (character is null)
@@ -1010,8 +1034,8 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
                        ?? mapDefinition.ExitGates?.SelectRandom();
             if (gate is not null)
             {
-                byte spawnX = (byte)Random.Shared.Next(gate.X1, gate.X2 + 1);
-                byte spawnY = (byte)Random.Shared.Next(gate.Y1, gate.Y2 + 1);
+                byte spawnX = (byte)Random.Shared.Next(gate.X1, (int)gate.X2 + 1);
+                byte spawnY = (byte)Random.Shared.Next(gate.Y1, (int)gate.Y2 + 1);
 
                 // 地形校验：确保出生坐标可行走
                 var terrainData = gate.Map?.TerrainData ?? mapDefinition.TerrainData;
@@ -1026,8 +1050,8 @@ public sealed class AiPlayerManager : IAiService, IAiDebugService, IEventBroadca
                     bool found = IsWalkable(spawnX, spawnY);
                     for (int attempt = 0; attempt < 10 && !found; attempt++)
                     {
-                        spawnX = (byte)Random.Shared.Next(gate.X1, gate.X2 + 1);
-                        spawnY = (byte)Random.Shared.Next(gate.Y1, gate.Y2 + 1);
+                        spawnX = (byte)Random.Shared.Next(gate.X1, (int)gate.X2 + 1);
+                        spawnY = (byte)Random.Shared.Next(gate.Y1, (int)gate.Y2 + 1);
                         found = IsWalkable(spawnX, spawnY);
                     }
 
