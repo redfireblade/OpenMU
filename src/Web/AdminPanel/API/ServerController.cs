@@ -165,6 +165,58 @@ namespace MUnique.OpenMU.Web.API
                 {
                     spawnX = (byte)Random.Shared.Next(spawnGate.X1, spawnGate.X2 + 1);
                     spawnY = (byte)Random.Shared.Next(spawnGate.Y1, spawnGate.Y2 + 1);
+
+                    // 地形校验：确保出生坐标可行走
+                    var terrainData = spawnGate.Map?.TerrainData ?? character.CurrentMap.TerrainData;
+                    if (terrainData is { Length: >= 65539 })
+                    {
+                        bool IsWalkable(int px, int py)
+                        {
+                            int idx = 3 + px * 256 + py;
+                            return idx < terrainData.Length && terrainData[idx] != 0xFF && (terrainData[idx] & 0x54) == 0;
+                        }
+
+                        // 在门范围内重试 10 次
+                        bool found = IsWalkable(spawnX, spawnY);
+                        for (int attempt = 0; attempt < 10 && !found; attempt++)
+                        {
+                            spawnX = (byte)Random.Shared.Next(spawnGate.X1, spawnGate.X2 + 1);
+                            spawnY = (byte)Random.Shared.Next(spawnGate.Y1, spawnGate.Y2 + 1);
+                            found = IsWalkable(spawnX, spawnY);
+                        }
+
+                        // 门周围 3 圈搜索
+                        if (!found)
+                        {
+                            for (int radius = 1; radius <= 3 && !found; radius++)
+                            {
+                                for (int dx = -radius; dx <= radius && !found; dx++)
+                                for (int dy = -radius; dy <= radius && !found; dy++)
+                                {
+                                    int tx = spawnX + dx, ty = spawnY + dy;
+                                    if (tx >= spawnGate.X1 && tx <= spawnGate.X2
+                                        && ty >= spawnGate.Y1 && ty <= spawnGate.Y2
+                                        && IsWalkable(tx, ty))
+                                    { spawnX = (byte)tx; spawnY = (byte)ty; found = true; }
+                                }
+                            }
+                        }
+
+                        // 扩大搜索
+                        if (!found)
+                        {
+                            for (int radius = 4; radius <= 30 && !found; radius++)
+                            {
+                                for (int dx = -radius; dx <= radius && !found; dx++)
+                                for (int dy = -radius; dy <= radius && !found; dy++)
+                                {
+                                    int tx = spawnX + dx, ty = spawnY + dy;
+                                    if (tx >= 0 && tx < 256 && ty >= 0 && ty < 256 && IsWalkable(tx, ty))
+                                    { spawnX = (byte)tx; spawnY = (byte)ty; found = true; }
+                                }
+                            }
+                        }
+                    }
                 }
                 character.PositionX = spawnX;
                 character.PositionY = spawnY;
