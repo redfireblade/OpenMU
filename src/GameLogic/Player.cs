@@ -1163,7 +1163,20 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
         var posX = this.SelectedCharacter.PositionX;
         var posY = this.SelectedCharacter.PositionY;
         var terrain = this.CurrentMap.Terrain;
-        if (!terrain.WalkMap[posX, posY])
+
+        // 双重校验：WalkMap + TerrainData 原始字节，排除坐标索引混淆
+        var rawTerrainData = this.CurrentMap.Definition?.TerrainData;
+        bool isWalkable = terrain.WalkMap[posX, posY];
+        if (rawTerrainData is { Length: >= 65539 })
+        {
+            int rawIdx = 3 + posX * 256 + posY;
+            bool walkableFromRaw = rawIdx < rawTerrainData.Length
+                && rawTerrainData[rawIdx] != 0xFF
+                && (rawTerrainData[rawIdx] & 0x54) == 0;
+            isWalkable = isWalkable && walkableFromRaw;
+        }
+
+        if (!isWalkable)
         {
             // 当前位置不可行走 → 在附近找一个可行走的格子
             bool found = false;

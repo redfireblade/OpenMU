@@ -1,6 +1,44 @@
 # Session 总结 — AI 系统架构重建与基础生存实现
 
-**日期**：2026-06-24 | **状态**：Phase 1 进行中
+**日期**：2026-07-23 | **状态**：S33 完成
+
+## S33: 出生地形校验修复 (2026-07-23)
+
+### 问题：玩家角色出生在不可行走坐标
+
+**症状**：玩家/角色创建后出生在 Lorencia (148, 130) — 属性值 `0x05`（NOMOVE+安全区），是安全区内的墙壁。
+
+**根因**：角色创建时直接在门范围内随机取坐标，完全跳过地形校验。
+
+| 创建路径 | 文件 | 有校验？ |
+|----------|------|:--:|
+| Web API 创建角色 | `ServerController.cs` line 166-170 | 无 |
+| AI 创建角色 | `AiPlayerManager.cs` line 1013-1014 | 无 |
+| PlaceAtGate（换图/复活） | `Player.cs` line 2036-2067 | 有 |
+
+### 修复：三处统一加 TerrainData 原始字节校验
+
+**校验策略**：直接使用 `TerrainData` 原始字节（索引 `3 + row*256 + col`），避免 WalkMap/AIgrid 的 `[col, row]` vs `[row, col]` 索引混淆。
+
+**兜底链**：门内随机 → 重试 10 次 → 门内 3 圈搜索 → 全图 30 半径搜索
+
+| # | 文件 | 修改 |
+|:-:|------|------|
+| 1 | `src/Web/AdminPanel/API/ServerController.cs:169-219` | Web 创建角色加地形校验 |
+| 2 | `src/AIPlayer/AiPlayerManager.cs:1016-1063` | AI 创建角色加地形校验 |
+| 3 | `src/GameLogic/Player.cs:1167-1177` | 登录时双重校验（WalkMap AND TerrainData 原始字节） |
+
+**编译结果**：三项目全部 0 错误。
+
+### 经验教训
+
+1. **创建时校验比运行时修复重要**：DB 写入非法坐标后，运行时兜底依赖 WalkMap 索引正确性，不可靠。
+2. **TerrainData 原始字节是最可靠的校验源**：不受 ReadTerrainData 存储格式和访问格式的"互补"影响。
+3. **PlaceAtGate 有完整校验但它没有被所有入口调用**：初始角色创建绕过了它。
+
+---
+
+
 
 ---
 
@@ -102,7 +140,7 @@
 
 ```bash
 # 重启终端后首次部署
-cd /d E:\mu_ai\MU_VER_1\SERVERS\OPENMU
+cd /d E:\mu_ai\MU_VER_2\SERVERS\OPENMU
 dotnet run --project src/Startup/MUnique.OpenMU.Startup.csproj -p:ci=true -- --autostart -demo -resolveIP:local
 
 # 30秒后创建 3 职业 AI
